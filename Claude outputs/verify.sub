@@ -1,0 +1,70 @@
+# verify.sub: HTCondor submit file for Tier 1 (released-checkpoint evaluation)
+# on CHTC. Submit from this directory via ./submit.sh, which creates the log
+# and run directories and checks that the W&B key is exported first.
+#
+#   ./submit.sh                              full val, 4x and 8x
+#   ./submit.sh volume_limit=20              first 20 volumes (smoke run)
+#   ./submit.sh data=knee_multicoil_val_synthetic.tar request_disk=20GB
+#
+# Edit the two macros below before first use.
+
+netid      = CHANGE_ME
+image      = docker://CHANGE_ME/fastmri-verify:2026-09
+
+# --- what to run -----------------------------------------------------------
+tier            = tier1
+accelerations   = 4 8
+center_fractions = 0.08 0.04
+mask_type       = random
+volume_limit    = 0
+extra_args      =
+arguments       = $(tier) --accelerations $(accelerations) --center_fractions $(center_fractions) --mask_type $(mask_type) --volume_limit $(volume_limit) --run_name tier1-$(Cluster) $(extra_args)
+
+# --- container ---------------------------------------------------------------
+universe        = container
+container_image = $(image)
+executable      = run_verify.sh
+
+# --- input files -------------------------------------------------------------
+# Large inputs live in /staging and are transferred into the job scratch by
+# HTCondor, never read directly (execute nodes do not mount /staging).
+# osdf:// is the current CHTC recommendation for /staging inputs; the older
+# file:///staging/$(netid)/... spelling also works on ap2001.
+data            = osdf:///chtc/staging/$(netid)/fastmri/knee_multicoil_val.tar.xz
+ckpt            = osdf:///chtc/staging/$(netid)/fastmri/knee_leaderboard_state_dict.pt
+transfer_input_files = verify_varnet.py, $(ckpt), $(data)
+should_transfer_files    = YES
+when_to_transfer_output  = ON_EXIT_OR_EVICT
+
+# --- output files ------------------------------------------------------------
+# results/ (json report, per-volume CSVs, results.csv, offline W&B run if no key)
+transfer_output_files   = results
+transfer_output_remaps  = "results = runs/$(Cluster)"
+
+# --- secrets -----------------------------------------------------------------
+# Only these names are copied from the submitting shell, and only if set. The
+# key never appears in this file or in any committed file. It does appear in
+# the job ClassAd (condor_q -l), readable by you and CHTC admins only.
+getenv          = WANDB_API_KEY, WANDB_ENTITY, WANDB_PROJECT
+environment     = "WANDB_PROJECT=fastmri-varnet-verify"
+
+# --- resources ---------------------------------------------------------------
+# request_disk covers the 94 GB tarball plus the extracted volumes (~110 GB);
+# the tarball is deleted after extraction. Override for a subset tarball.
+request_cpus    = 4
+request_memory  = 32GB
+request_disk    = 230GB
+request_gpus    = 1
+gpus_minimum_memory     = 16000
+gpus_minimum_capability = 7.0
++WantGPULab     = true
++GPUJobLength   = "short"
+
+# --- logs ------------------------------------------------------------------
+log             = logs/$(tier)_$(Cluster).log
+output          = logs/$(tier)_$(Cluster)_$(Process).out
+error           = logs/$(tier)_$(Cluster)_$(Process).err
+stream_output   = True
+stream_error    = True
+
+queue 1
