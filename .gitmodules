@@ -1,0 +1,6 @@
+[submodule "fastMRI"]
+	path = fastMRI
+	url = https://github.com/facebookresearch/fastMRI.git
+[submodule "parameter_interpolation"]
+	path = parameter_interpolation
+	url = https://github.com/uw-cig/parameter_interpolation.git
