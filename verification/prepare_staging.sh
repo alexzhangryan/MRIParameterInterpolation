@@ -28,10 +28,13 @@
 #   - Do not scp a local copy up instead. The same shaping that motivated
 #     parallel_fetch applies to outbound traffic, so a 94 GB upload takes days
 #     where an S3-to-campus fetch takes hours.
-#   - Personal /staging quota defaults to 100 GB / 1000 items. The 93.8 GB
-#     tarball plus the ~120 MB checkpoint fits with about 5 GB to spare.
-#     multicoil_train (~931 GB unpacked) does not: that needs a quota increase
-#     or access to the kamilov_group staging directory.
+#   - /staging/a/apryan3 is capped at 100 GB (confirmed 2026-09-10). The
+#     tarball is 100,694,526,932 bytes: 93.8 GiB, or 100.7 GB decimal. It
+#     fits only if that quota is counted in binary units, and even then
+#     leaves ~6 GiB for the checkpoint, the manifest and nothing else.
+#     Establish which unit get_quotas uses before starting a long transfer.
+#     multicoil_train (~931 GB unpacked) needs a quota increase or access to
+#     the kamilov_group staging directory regardless.
 set -euo pipefail
 
 NETID="${NETID:-${USER:-unknown}}"

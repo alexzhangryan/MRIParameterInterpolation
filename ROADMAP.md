@@ -78,7 +78,7 @@ packed in `/staging` and HTCondor transfers it into job scratch, where
 - [ ] Do **not** scp the desktop copy up: that connection is per-flow shaped, so a 94 GB upload takes days where an S3-to-campus fetch takes hours
 - [ ] Verify against NYU's `SHA256` manifest — `prepare_staging.sh` does this automatically and is idempotent and resumable
 - [ ] Sanity-check that a handful of files load correctly with `h5py` before trusting the full set
-- [ ] **Gate on training data:** default staging quota is 100 GB / 1000 items. The val tarball fits with ~5 GB to spare; `multicoil_train` (~931 GB unpacked) does not. Before Phase 3, either request a quota increase or get access to the kamilov_group staging directory
+- [ ] **Quota gate — now the critical path, not just a Phase 3 concern:** `/staging/a/apryan3` is capped at 100 GB (confirmed 2026-09-10) and the val tarball is 100,694,526,932 bytes, i.e. 93.8 GiB or 100.7 GB decimal. It fits only under binary counting and leaves nothing over either way. Request an increase before the transfer; `multicoil_train` (~931 GB unpacked) needs one regardless, as does group-directory access if that comes through
 
 ## Phase 3 — Get training actually running
 
@@ -131,7 +131,7 @@ Rough plan to adapt it to VarNet:
 ## Known risks / things likely to slow this down
 
 - fastMRI approval timeline is undocumented — start Phase 0 today regardless of what else is ready
-- Dataset size vs the 100 GB `/staging` quota — the val split fits with ~5 GB to spare, the train split does not. Gates any from-scratch training run until there is a quota increase or group-directory access
+- Dataset size vs the 100 GB `/staging` quota — the val tarball is within a rounding error of the entire quota (93.8 GiB against 100 GB, unit-dependent) and the train split is nowhere close. Gates both a full Tier 1 run on CHTC and any from-scratch training until there is a quota increase or group-directory access
 - GPU queue times can be long for high-end tiers; a mid-tier GPU is fine for a first working run
 - Job runtime caps mean the real training run will not finish in one submission — expected, not a bug
 - Phase B has no existing reference implementation to check against — budget real time for getting the parameter-interpolation mechanics right before trusting any results from it
