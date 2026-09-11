@@ -214,6 +214,21 @@ def build_args():
     args = parser.parse_args()
     if args.data_path is None:
         parser.error("--data_path is required (directory containing multicoil_train/ and multicoil_val/)")
+
+    # FastMriDataModule.prepare_data() warms the metadata cache for all three
+    # splits -- train, val and test -- whenever use_dataset_cache_file is set,
+    # and that flag defaults to True. With test_path unset it looks for
+    # <data_path>/<challenge>_test and dies with FileNotFoundError before the
+    # first batch. We only ever stage train and val (see run_train.sh), and
+    # trainer.fit() never touches the test dataloader, so point test_path at
+    # the val split: prepare_data then caches val twice, which is cheap and
+    # harmless, instead of crashing.
+    #
+    # Note --use_dataset_cache_file cannot be used to avoid this from the CLI:
+    # upstream declares it type=bool, so `--use_dataset_cache_file False`
+    # evaluates bool("False") -> True.
+    if args.test_path is None:
+        args.test_path = args.data_path / f"{args.challenge}_val"
     return args
 
 
