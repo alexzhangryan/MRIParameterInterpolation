@@ -12,10 +12,12 @@
 #       so both PD and PDFS scans are represented.
 #
 #   make_subset.sh train
-#       Input:  FASTMRI_TRAIN_URL (env, the NYU presigned URL; via getenv)
+#       Input:  FASTMRI_TRAIN_URL (env, via getenv): the NYU presigned URL for
+#               knee_multicoil_train_batch_0.tar.xz (the split ships as five
+#               ~91 GB batches; batch 0 is the one used)
 #       Output: knee_multicoil_train_subset.tar.xz   multicoil_train/<every complete volume>
 #               train_subset_files.txt
-#       The full train tarball is never stored anywhere. The first
+#       The batch is never stored in full anywhere. The first
 #       TRAIN_PREFIX_GB (default 65) gigabytes of it are fetched with an HTTP
 #       range request and decoded on the fly; xz and tar are sequential, so a
 #       prefix of the archive yields a prefix of the volumes, complete except
@@ -97,7 +99,7 @@ case "$MODE" in
     : "${FASTMRI_TRAIN_URL:?FASTMRI_TRAIN_URL not set: export it (via .env + getenv) before submitting}"
     # TRAIN_PREFIX_BYTES exists for testing against a small local archive
     bytes="${TRAIN_PREFIX_BYTES:-$(( TRAIN_PREFIX_GB * 1000000000 ))}"
-    echo "[make_subset] streaming the first ${TRAIN_PREFIX_GB} GB of the train tarball from NYU"
+    echo "[make_subset] streaming the first ${TRAIN_PREFIX_GB} GB of the train archive from NYU: ${FASTMRI_TRAIN_URL%%\?*}"
     t0=$(date +%s)
     # xz reports "Unexpected end of input" and tar "Unexpected EOF" at the
     # cut: expected, the volumes written before it are complete. tar -v

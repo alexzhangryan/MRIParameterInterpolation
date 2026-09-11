@@ -7,8 +7,9 @@
 #   condor_submit subset_train.sub                      (first 65 GB of the archive)
 #   condor_submit subset_train.sub train_prefix_gb=50
 #
-# The full train tarball is never stored: make_subset.sh streams the first
-# train_prefix_gb gigabytes of it with an HTTP range request, keeps every
+# NYU ships the train split as five ~91 GB batches; FASTMRI_TRAIN_URL is the
+# presigned URL for batch_0. It is never stored in full: make_subset.sh streams
+# the first train_prefix_gb gigabytes of it with an HTTP range request, keeps every
 # complete volume, and re-packs them. Result is about train_prefix_gb again
 # (roughly 1.9 volumes per GB). Size it from what /staging has free after the
 # val repack: get_quotas /staging/a/apryan3.

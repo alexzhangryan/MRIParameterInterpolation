@@ -230,20 +230,20 @@ ls -la /staging/a/apryan3/fastmri/           # val tarball + checkpoint from ver
 
 `verification/prepare_staging.sh` fetches `knee_multicoil_val.tar.xz` from
 the NYU presigned URL and verifies it (see `verification/README.md` step 3).
-The training tarball (`knee_multicoil_train.tar.xz`, same URL pattern) goes in
+The training split ships as five batches (`knee_multicoil_train_batch_0..4.tar.xz`, ~91 GB each, same URL pattern); they would go in
 the same directory the same way once there is room for it.
 
 ### 3b. Repack /staging into subsets (what actually fits under the quota)
 
 `/staging/a/apryan3` is capped at 100 GB and the full val tarball alone is
-100.7 GB. The train split (~490 GB compressed, ~930 GB unpacked) cannot be
+100.7 GB. The train split (five ~91 GB batches, ~930 GB unpacked) cannot be
 staged at all without a quota increase, and that request is the last resort.
 So both splits are cut down to subsets that fit together:
 
 | File in `/staging/a/apryan3/fastmri/` | Built by | Size | Contents |
 |---|---|---|---|
 | `knee_multicoil_val_subset.tar` | `make subset-val` | ~20 GB | `multicoil_val/`, 20 of the 199 volumes, evenly spaced through the sorted list |
-| `knee_multicoil_train_subset.tar.xz` | `make subset-train` | ~65 GB | `multicoil_train/`, every complete volume in the first 65 GB of NYU's archive (~120 of 973) |
+| `knee_multicoil_train_subset.tar.xz` | `make subset-train` | ~65 GB | `multicoil_train/`, every complete volume in the first 65 GB of NYU's `train_batch_0` (~120 of 973) |
 
 `train.sub` defaults to these two names, so once they exist `make submit-model1`
 works with no overrides. Both jobs run `make_subset.sh` in the training image
@@ -283,7 +283,9 @@ used again any time before it expires (~2026-12-08) or re-requested.
 
 **Step 2: train subset (about an hour: streaming, decoding, re-packing).**
 
-Put the NYU presigned URL for `knee_multicoil_train.tar.xz` in `.env`
+NYU ships the train split as five batches. Put the presigned URL for
+`knee_multicoil_train_batch_0.tar.xz` (the line in the approval email ending
+in `--output knee_multicoil_train_batch_0.tar.xz`) in `.env`
 (`cp .env.example .env`, `chmod 600 .env`, paste it quoted). Then:
 
 ```bash
@@ -291,7 +293,7 @@ make subset-train                    # TRAIN_PREFIX_GB=50 to fit a smaller quota
 tail -f logs/subset_train_*.out
 ```
 
-The job fetches only the first `TRAIN_PREFIX_GB` gigabytes of NYU's archive
+The job fetches only the first `TRAIN_PREFIX_GB` gigabytes of that batch
 with an HTTP range request and decodes them on the fly; nothing compressed is
 ever stored. The archive is sequential, so that prefix is the same volumes
 every time. The truncated last volume is dropped, the rest are re-packed, and

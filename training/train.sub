@@ -43,7 +43,9 @@ executable      = run_train.sh
 # README section 3b (subset_val.sub / subset_train.sub), which is all that
 # fits under the 100 GB /staging quota. If the full splits are ever staged
 # (quota increase or group-directory access), override on the command line:
-#   ./submit.sh model1 train_data=file:///staging/.../knee_multicoil_train.tar.xz request_disk=1500GB
+#   ./submit.sh model1 train_data=file:///staging/.../knee_multicoil_train_batch_0.tar.xz request_disk=400GB
+# (NYU ships the train split as five ~91 GB batches; run_train.sh extracts
+# every knee_multicoil_*.tar(.xz) it is given, so several can be listed.)
 # CHTC's size rule: osdf:///chtc/staging/<path> for 1-30 GB inputs,
 # file:///staging/<path> from 30 GB up; file:// works for both.
 train_data      = file://$(staging)/knee_multicoil_train_subset.tar.xz
