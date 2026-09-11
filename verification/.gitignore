@@ -1,0 +1,24 @@
+# Secrets. .env holds the W&B key and the NYU presigned URLs; .env.example is
+# the committed template. See CLAUDE.md: a key from a prior project is already
+# in public git history, do not repeat that here.
+.env
+.env.local
+*.key
+
+# Build / run artifacts
+.make/
+results/
+synthetic/
+jobtest/
+logs/
+runs/
+*.log
+wandb/
+
+# Data and checkpoints. The fastMRI data is under a data use agreement and is
+# hundreds of GB; it lives in /staging on CHTC, never in the repo.
+*.tar
+*.tar.xz
+*.h5
+*.pt
+SHA256

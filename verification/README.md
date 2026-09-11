@@ -47,7 +47,7 @@ The reference values are for the fastMRI knee convention (`random` masks,
 | What | Where | Constraint |
 |---|---|---|
 | This repo, submit files, logs | `/home/apryan3` on `ap2001.chtc.wisc.edu` | 40 GB quota, code only |
-| `knee_multicoil_val.tar.xz` (93.8 GB), released checkpoint | `/staging/a/apryan3/fastmri/` | 100 GB / 1000 items by default |
+| `knee_multicoil_val.tar.xz` (93.8 GiB), released checkpoint | `/staging/a/apryan3/fastmri/` | 100 GB quota — the tarball alone is 100.7 GB decimal |
 | The container image | Docker Hub, pulled by the execute node | never stored on CHTC |
 
 Personal staging is sharded by the first letter of the netid:
@@ -61,10 +61,14 @@ into the job's scratch directory, which is why `verify.sub` asks for
 `HasCHTCStaging` slots and requests enough `request_disk` to hold the tarball
 and its extracted contents at the same time.
 
-The 100 GB quota is the binding constraint on what else can be staged: the
-validation tarball fits with about 5 GB to spare, and `multicoil_train`
-(~931 GB unpacked) does not. A from-scratch training run needs either a quota
-increase or access to the group directory.
+The 100 GB quota on `/staging/a/apryan3` (confirmed 2026-09-10) is the binding
+constraint, and it is tighter than it looks. The validation tarball is
+100,694,526,932 bytes — 93.8 GiB, or 100.7 GB decimal — so it fits only if
+`get_quotas` counts in binary units, and even then leaves about 6 GiB for
+everything else. Nothing of consequence can be staged alongside it, and
+`multicoil_train` (~931 GB unpacked) is out of reach entirely. A full Tier 1
+run and any from-scratch training both need a quota increase or access to the
+group directory.
 
 ## Step by step
 
@@ -117,10 +121,11 @@ It lands in `/staging/a/apryan3/fastmri/`, which is what `verify.sub`'s
 ISP's per-flow shaping; from campus to S3 a few flows are plenty.
 
 Check the quota first (`get_quotas /staging/a/apryan3` on the access point).
-The default is 100 GB / 1000 items and the tarball is 93.8 GB, so it fits with
-about 5 GB to spare and stays there. Under that quota the val set is the one
-file worth keeping: it is the only split with ground truth the harness can
-score.
+It is 100 GB, and the tarball is 100,694,526,932 bytes — 93.8 GiB or 100.7 GB
+depending on how that limit is counted, so it either just fits or just does
+not. Establish which before committing to a multi-hour transfer. Under a
+100 GB ceiling the val set is the one file worth keeping: it is the only split
+with ground truth the harness can score.
 
 Do not scp the local copy up from the desktop instead. The shaping that makes
 `PARALLEL=16` necessary applies to outbound traffic too, so a 94 GB upload

@@ -1,0 +1,84 @@
+# ---------------------------------------------------------------------------
+# Data. The fastMRI knee dataset is under NYU's data use agreement and is
+# hundreds of GB (93.8 GB for multicoil_val alone, ~931 GB unpacked for
+# multicoil_train). It lives on CHTC at /staging/a/apryan3/fastmri/ and is
+# pulled into job scratch via transfer_input_files. It must never enter git,
+# both for size and because the DUA forbids redistribution.
+# ---------------------------------------------------------------------------
+*.h5
+*.tar
+*.tar.gz
+*.tar.xz
+*.tgz
+*.xz
+*.zip
+*.npy
+*.npz
+*.mat
+*.nii
+*.nii.gz
+*.dcm
+
+# Common local landing spots for pulled/unpacked data.
+data/
+datasets/
+staging/
+multicoil_*/
+singlecoil_*/
+SHA256
+
+# ---------------------------------------------------------------------------
+# Model checkpoints and weights
+# ---------------------------------------------------------------------------
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+checkpoints/
+
+# ---------------------------------------------------------------------------
+# Run artifacts
+# ---------------------------------------------------------------------------
+results/
+runs/
+logs/
+outputs/
+wandb/
+jobtest/
+synthetic/
+.make/
+*.log
+*.out
+*.err
+condor_*.log
+
+# ---------------------------------------------------------------------------
+# Secrets. .env holds the W&B key and the NYU presigned URLs; .env.example is
+# the committed template. A key from a prior project is already in public git
+# history -- do not repeat that here.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials.json
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+.pytest_cache/
+
+# ---------------------------------------------------------------------------
+# OS / editor cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
