@@ -10,7 +10,7 @@ all.
 | `verify_varnet.py` | anywhere with the `fastmri` env | The harness. `tier0` and `tier1` subcommands. |
 | `make_synthetic_val.py` | laptop | Tiny fake `multicoil_val` for smoke-testing the harness and the CHTC job before the real data lands. |
 | `Dockerfile` | laptop (build), CHTC (run) | The environment: Lightning 1.9.5, torch 2.0.1+cu118, conda h5py, fastMRI at commit `91f2df4`. |
-| `prepare_staging.sh` | CHTC access point | Downloads `knee_multicoil_val.tar.xz` and the released checkpoint into `/staging`, verifies SHA256. |
+| `prepare_staging.sh` | CHTC transfer node | Downloads `knee_multicoil_val.tar.xz` and the released checkpoint into `/staging/a/apryan3/fastmri/`, verifies SHA256. |
 | `verify.sub`, `verify_tier0.sub` | CHTC access point | HTCondor submit files, container universe. |
 | `run_verify.sh` | inside the job | Job executable: extracts data, runs the harness, collects `results/`. |
 | `submit.sh` | CHTC access point | Wraps `condor_submit`, refuses to submit without a W&B key unless `OFFLINE=1`. |
@@ -41,6 +41,30 @@ check is pass or investigate, 1 means at least one fail.
 
 The reference values are for the fastMRI knee convention (`random` masks,
 0.08 / 0.04). Other mask types and rates are recorded but not judged.
+
+## Where things live on CHTC
+
+| What | Where | Constraint |
+|---|---|---|
+| This repo, submit files, logs | `/home/apryan3` on `ap2001.chtc.wisc.edu` | 40 GB quota, code only |
+| `knee_multicoil_val.tar.xz` (93.8 GB), released checkpoint | `/staging/a/apryan3/fastmri/` | 100 GB / 1000 items by default |
+| The container image | Docker Hub, pulled by the execute node | never stored on CHTC |
+
+Personal staging is sharded by the first letter of the netid:
+`/staging/a/apryan3`, **not** `/staging/apryan3`. The shared group directory
+`/staging/groups/kamilov_group/Kamilov-SciAI-datasets` is not readable by this
+account as of 2026-09-10. If that changes, the only edits needed are the
+`staging` macro in `verify.sub` and `STAGING_DIR` for `prepare_staging.sh`.
+
+A job never reads `/staging` directly. HTCondor transfers the listed inputs
+into the job's scratch directory, which is why `verify.sub` asks for
+`HasCHTCStaging` slots and requests enough `request_disk` to hold the tarball
+and its extracted contents at the same time.
+
+The 100 GB quota is the binding constraint on what else can be staged: the
+validation tarball fits with about 5 GB to spare, and `multicoil_train`
+(~931 GB unpacked) does not. A from-scratch training run needs either a quota
+increase or access to the group directory.
 
 ## Step by step
 
@@ -74,23 +98,33 @@ and the verdict logic all run. To smoke-test the CHTC job the same way:
 
 ```bash
 tar -cf knee_multicoil_val_synthetic.tar -C synthetic multicoil_val
-# copy to /staging/<netid>/fastmri/ then:
-./submit.sh data=osdf:///chtc/staging/<netid>/fastmri/knee_multicoil_val_synthetic.tar \
+# copy to /staging/a/apryan3/fastmri/ then:
+./submit.sh data=osdf:///chtc/staging/a/apryan3/fastmri/knee_multicoil_val_synthetic.tar \
             request_disk=20GB extra_args="--random_init --num_cascades 2 --chans 4 --sens_chans 4 --pools 2 --sens_pools 2 --num_workers 0"
 ```
 
-### 3. Stage the real data (access point, one to three hours)
+### 3. Stage the real data (transfer node, one to three hours)
 
 ```bash
+ssh apryan3@transfer.chtc.wisc.edu   # not the access point; this host is for bulk data
 export FASTMRI_VAL_URL='...knee_multicoil_val.tar.xz?AWSAccessKeyId=...'   # from the NYU email
 export FASTMRI_SHA_URL='...SHA256?AWSAccessKeyId=...'
-nohup ./prepare_staging.sh > prepare.log 2>&1 &
+PARALLEL=4 nohup ./prepare_staging.sh > prepare.log 2>&1 &
 ```
 
-Check your `/staging` quota first (`get_quotas /staging/<netid>` on the
-access point). The tarball is 94 GB and stays there. If quota is the
-constraint, the val set is the one file worth keeping: it is the only split
-with ground truth that the harness can score.
+It lands in `/staging/a/apryan3/fastmri/`, which is what `verify.sub`'s
+`staging` macro already points at. `PARALLEL` defaults to 16 to beat a dorm
+ISP's per-flow shaping; from campus to S3 a few flows are plenty.
+
+Check the quota first (`get_quotas /staging/a/apryan3` on the access point).
+The default is 100 GB / 1000 items and the tarball is 93.8 GB, so it fits with
+about 5 GB to spare and stays there. Under that quota the val set is the one
+file worth keeping: it is the only split with ground truth the harness can
+score.
+
+Do not scp the local copy up from the desktop instead. The shaping that makes
+`PARALLEL=16` necessary applies to outbound traffic too, so a 94 GB upload
+takes days where the S3-to-campus fetch takes hours.
 
 ### 3b. Files already present, or running on your own GPU
 
@@ -128,9 +162,23 @@ from it counts.
 ./submit.sh                            # full 199 volumes, 4x and 8x, ~2-4 h
 ```
 
-Extraction of the 94 GB `.xz` inside the job takes 20 to 40 minutes on
-4 cores and is the reason `request_disk` is 230 GB (tarball plus extracted
-volumes, the tarball is deleted once extracted). A one-off interactive job
+Extraction of the 94 GB `.xz` inside the job takes about 2 hours and is the
+reason `request_disk` is 320 GB. `run_verify.sh` deletes the tarball only
+after `xz | tar` finishes, so peak scratch holds both copies at once: 93.8 GB
+compressed plus ~192 GB extracted, about 290 GB, plus results. It prints
+nothing at all while it runs.
+
+More cores will not speed it up, but not for the reason you would guess:
+the archive is 8180 blocks and the image ships xz 5.8.3, so `-T0` can and
+does parallelise the decode. It is I/O bound. Measured locally, xz sits at
+~42% of a single core while output runs at ~24 MB/s -- an order of magnitude
+under what the filesystem sustains -- because it reads 93.8 GB and writes
+191.7 GiB across the same mount while creating 199 one-gigabyte files.
+Local rate was ~1.4 volumes/min. On CHTC, where the job runs against local
+scratch rather than a Docker bind mount, expect this to be faster; time it
+before trusting the 2 h figure for `request_disk` planning.
+
+A one-off interactive job
 (`condor_submit -i`) can extract once and re-tar a 20-volume subset as a
 plain `.tar` for fast reruns; point `data=` at it and drop `request_disk`.
 

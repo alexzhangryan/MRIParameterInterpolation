@@ -181,7 +181,20 @@ class WandB:
                     "(sync later with `wandb sync <output_dir>/wandb/offline-run-*`)")
         os.makedirs(args.output_dir, exist_ok=True)
         self.wandb = wandb
-        self.run = wandb.init(
+        # A verification run is expensive (the real tier1 is an hour of GPU
+        # time) and W&B is a convenience, not a result. Never let it take the
+        # run down with it: a bad key, an expired login or a network blip
+        # degrades to "no logging", not to a lost run.
+        try:
+            self.run = self._init(args, tier, run_name, config, mode)
+        except Exception as e:  # noqa: BLE001
+            log(f"wandb init failed ({e!r}); continuing without it")
+            self.run = None
+            self.enabled = False
+
+    def _init(self, args, tier, run_name, config, mode):
+        wandb = self.wandb
+        return wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity or None,
             name=run_name,
@@ -193,32 +206,44 @@ class WandB:
             reinit=True,
         )
 
+    def _guard(self, what, fn) -> None:
+        if self.run is None:
+            return
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            log(f"wandb {what} failed ({e!r}); disabling W&B for the rest of this run")
+            self.run = None
+            self.enabled = False
+
     def log(self, data: Dict, step: Optional[int] = None) -> None:
-        if self.run is not None:
-            self.run.log(data, step=step)
+        self._guard("log", lambda: self.run.log(data, step=step))
 
     def summary(self, data: Dict) -> None:
-        if self.run is not None:
+        def _do():
             for k, v in data.items():
                 self.run.summary[k] = v
+        self._guard("summary", _do)
 
     def table(self, name: str, columns: List[str], rows: List[List]) -> None:
-        if self.run is not None:
-            self.run.log({name: self.wandb.Table(columns=columns, data=rows)})
+        self._guard("table", lambda: self.run.log(
+            {name: self.wandb.Table(columns=columns, data=rows)}))
 
     def images(self, name: str, images: Dict[str, np.ndarray]) -> None:
-        if self.run is not None:
-            self.run.log({f"{name}/{k}": self.wandb.Image(v) for k, v in images.items()})
+        self._guard("images", lambda: self.run.log(
+            {f"{name}/{k}": self.wandb.Image(v) for k, v in images.items()}))
 
     def artifact_file(self, path: Path, name: str, type_: str) -> None:
-        if self.run is not None and path.exists():
+        if not path.exists():
+            return
+        def _do():
             art = self.wandb.Artifact(name=name, type=type_)
             art.add_file(str(path))
             self.run.log_artifact(art)
+        self._guard("artifact", _do)
 
     def finish(self) -> None:
-        if self.run is not None:
-            self.run.finish()
+        self._guard("finish", lambda: self.run.finish())
 
 
 # --------------------------------------------------------------------------
@@ -236,7 +261,11 @@ class Check:
 def tier0(args) -> int:
     checks: List[Check] = []
 
-    def add(name, status, detail="", **value):
+    # name/status/detail are positional-only: a check that wants to record a
+    # value called "name" (the GPU one does) would otherwise collide with the
+    # parameter and raise TypeError, which the outer except turns into a
+    # bogus framework_import failure.
+    def add(name, status, detail="", /, **value):
         checks.append(Check(name, status, detail, dict(value)))
         log(f"{status.upper():6s} {name}: {detail}")
 
@@ -255,7 +284,7 @@ def tier0(args) -> int:
             version=torch.__version__, cuda=torch.cuda.is_available())
         if torch.cuda.is_available():
             add("gpu", "pass", f"{torch.cuda.get_device_name(0)}, capability {torch.cuda.get_device_capability(0)}",
-                name=torch.cuda.get_device_name(0))
+                device=torch.cuda.get_device_name(0))
         else:
             add("gpu", "warn", "no CUDA device visible (fine for tier0, tier1 will be slow)")
     except Exception as e:  # noqa: BLE001
@@ -458,7 +487,12 @@ def run_volume(model, ds, indices: List[int], device, num_workers: int, zero_fil
             crop = tuple(int(c[0]) for c in batch.crop_size)
             mk = batch.masked_kspace.to(device)
             mask = batch.mask.to(device)
+            # num_low_frequencies must move too: SensitivityModel does
+            # `num_low_frequencies * torch.ones(..., device=mask.device)`, so a
+            # CPU value here raises a device mismatch on GPU. Invisible on CPU.
             nlf = batch.num_low_frequencies
+            if torch.is_tensor(nlf):
+                nlf = nlf.to(device)
             # Same call as VarNetModule.forward, the signature the model was trained under.
             out = model(mk, mask, nlf).cpu()
             if out.shape[-1] < crop[1]:  # brain FLAIR 203 special case, kept for parity
@@ -503,6 +537,34 @@ def compare_to_reference(mask_type: str, R: int, agg: Dict[str, float]) -> List[
         row["verdict"] = worst(vs)
         rows.append(row)
     return rows
+
+
+def log_reference_table(R: int, ref: Dict, agg: Dict) -> None:
+    """Measured vs published side by side.
+
+    The deltas alone are unreadable without knowing what the paper reported,
+    and the tolerance that turned a delta into a verdict is in THRESHOLDS,
+    three screens away. Print all four so a line can be judged on its own.
+    """
+    log("R{} vs {}: {}".format(R, ref["source"], ref["verdict"].upper()))
+    log("    {:<10} {:>11} {:>11} {:>13} {:>16} {:>9}".format(
+        "metric", "measured", "published", "difference", "tol pass/fail", "verdict"))
+    if "ref_ssim" in ref:
+        lo, hi = THRESHOLDS["ssim"]
+        log("    {:<10} {:>11.4f} {:>11.4f} {:>13.4f} {:>16} {:>9}".format(
+            "SSIM", agg["ssim_mean"], ref["ref_ssim"], ref["d_ssim"],
+            "{:g} / {:g}".format(lo, hi), ref["v_ssim"]))
+    if "ref_psnr" in ref:
+        lo, hi = THRESHOLDS["psnr"]
+        log("    {:<10} {:>11.2f} {:>11.2f} {:>13.2f} {:>16} {:>9}".format(
+            "PSNR (dB)", agg["psnr_mean"], ref["ref_psnr"], ref["d_psnr"],
+            "{:g} / {:g} dB".format(lo, hi), ref["v_psnr"]))
+    if "ref_nmse" in ref:
+        lo, hi = THRESHOLDS["nmse"]
+        log("    {:<10} {:>11.4f} {:>11.4f} {:>13} {:>16} {:>9}".format(
+            "NMSE", agg["nmse_mean"], ref["ref_nmse"],
+            "{:.1f}% rel".format(100 * ref["d_nmse_rel"]),
+            "{:g}% / {:g}%".format(100 * lo, 100 * hi), ref["v_nmse"]))
 
 
 def to_uint8_image(x: np.ndarray, vmax: float) -> np.ndarray:
@@ -615,18 +677,28 @@ def tier1(args) -> int:
         agg["n_slices"] = int(sum(r["n_slices"] for r in rows))
         agg["seconds"] = time.time() - t0
 
-        log(f"R{R}: SSIM {agg['ssim_mean']:.4f} +/- {agg['ssim_std']:.4f}  "
-            f"PSNR {agg['psnr_mean']:.2f}  NMSE {agg['nmse_mean']:.4f}  "
-            f"(zero-filled SSIM {agg['zf_ssim_mean']:.4f})  n={agg['n_volumes']} volumes")
+        log("R{} measured over {} volumes / {} slices in {:.0f}s".format(
+            R, agg["n_volumes"], agg["n_slices"], agg["seconds"]))
+        log("    {:<10} {:>11} {:>11} {:>11}".format("metric", "model", "zero-filled", "model std"))
+        log("    {:<10} {:>11.4f} {:>11.4f} {:>11.4f}".format(
+            "SSIM", agg["ssim_mean"], agg["zf_ssim_mean"], agg["ssim_std"]))
+        log("    {:<10} {:>11.2f} {:>11.2f} {:>11.2f}".format(
+            "PSNR (dB)", agg["psnr_mean"], agg["zf_psnr_mean"], agg["psnr_std"]))
+        log("    {:<10} {:>11.4f} {:>11.4f} {:>11.4f}".format(
+            "NMSE", agg["nmse_mean"], agg["zf_nmse_mean"], agg["nmse_std"]))
 
         # reference comparison
         refs = compare_to_reference(args.mask_type, R, agg)
         for ref in refs:
-            log(f"R{R} vs {ref['source']}: {ref['verdict'].upper()}  "
-                + "  ".join(f"{k}={v:.4f}" for k, v in ref.items() if k.startswith("d_")))
+            log_reference_table(R, ref, agg)
             all_verdicts.append(ref["verdict"])
+        if refs and args.volume_limit:
+            log("    NOTE: --volume_limit {} takes the FIRST N files by name, not a random".format(args.volume_limit))
+            log("          sample. knee val is 50/50 CORPD/CORPDFS overall but the sorted head")
+            log("          is not (the first 5 are 80% CORPDFS), and the two score differently,")
+            log("          so the comparison above is indicative only -- not a scored verdict.")
         if not refs:
-            log(f"R{R}: no reference values for ({args.mask_type}, {R}); recorded only")
+            log("R{}: no reference values for ({}, {}); recorded only".format(R, args.mask_type, R))
 
         # invariants for this rate
         if det_records:

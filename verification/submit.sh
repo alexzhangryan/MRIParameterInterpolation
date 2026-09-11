@@ -4,7 +4,7 @@
 #   ./submit.sh                       Tier 1, full val, 4x and 8x
 #   ./submit.sh tier0                 Tier 0 only
 #   ./submit.sh volume_limit=20       Tier 1 on the first 20 volumes
-#   ./submit.sh data=osdf:///chtc/staging/$USER/fastmri/knee_multicoil_val_synthetic.tar request_disk=20GB
+#   ./submit.sh data=osdf:///chtc/staging/a/apryan3/fastmri/knee_multicoil_val_synthetic.tar request_disk=20GB
 #   OFFLINE=1 ./submit.sh             skip the W&B key check, log offline
 #
 # Any name=value pairs are passed straight to condor_submit as macro overrides.
@@ -17,7 +17,7 @@ if [ "${1:-}" = "tier0" ]; then SUB=verify_tier0.sub; shift; fi
 mkdir -p logs runs
 
 if grep -q CHANGE_ME "$SUB"; then
-  echo "edit netid / image in $SUB before submitting" >&2
+  echo "edit the image macro in $SUB before submitting" >&2
   exit 1
 fi
 if [ ! -x run_verify.sh ]; then chmod +x run_verify.sh; fi
