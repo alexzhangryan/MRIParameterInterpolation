@@ -1,0 +1,21 @@
+# Everything in here is executed on Linux -- inside the container, on the CHTC
+# access point, or on an execute node -- so these files must keep LF endings
+# even when checked out on Windows with core.autocrlf=true.
+#
+# Without this, a Windows checkout gives run_train.sh CRLF endings and bash in
+# the container fails with:
+#     run_train.sh: line 19: $'\r': command not found
+# which is fatal in a real HTCondor job, not just locally.
+#
+# The Makefile matters for the same reason on the other side: a trailing \r
+# rides into every variable, so `PLATFORM ?= linux/amd64` becomes
+# "linux/amd64\r" and `docker build --platform ...` fails on Windows.
+#
+# HTCondor also parses .sub files line by line; a trailing \r would ride along
+# into macro values such as arguments and container_image.
+
+*.sh         text eol=lf
+*.sub        text eol=lf
+*.py         text eol=lf
+Makefile     text eol=lf
+Dockerfile   text eol=lf

@@ -6,9 +6,15 @@
 #
 #   make help            every target
 #
-# Requires GNU make. The laptop is Apple Silicon and CHTC is x86_64, so every
-# docker build here passes --platform linux/amd64; the smoke targets run that
-# image under emulation, which is slow but fine for tiny synthetic data.
+# Requires GNU make, Docker. On Windows run it from Git Bash or WSL.
+#
+# CHTC is x86_64, so every docker build and run here passes --platform
+# $(PLATFORM), default linux/amd64. On an Apple Silicon laptop that runs under
+# emulation: slow, but correct, and fine for tiny synthetic data. Override it
+# when you are building somewhere that matches the host, e.g. on a linux/arm64
+# box you only ever smoke-test on:
+#     make smoke PLATFORM=linux/arm64
+# Anything you `make push` for CHTC must stay linux/amd64.
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
@@ -44,8 +50,22 @@ SMOKE_RUN  ?= --limit_train_batches 4 --limit_val_batches 2 --num_workers 0 --no
 # --- host/docker plumbing ---------------------------------------------------
 # The repo root is mounted (not just this directory) so the smoke targets can
 # reuse ../verification/make_synthetic_val.py without copying it.
-REPO     := $(abspath $(CURDIR)/..)
-USERFLAG := --user $(shell id -u):$(shell id -g)
+#
+# Windows: Git Bash mangles both the host path and the container-side path.
+# `pwd -W` gives the C:/... form Docker Desktop wants (plain $(CURDIR) yields
+# /c/... , which Docker rejects as a bind mount source) and MSYS_NO_PATHCONV=1
+# stops Git Bash rewriting `-w /work/training` into a C:/Program Files/... path.
+# --user is dropped there too: Docker Desktop already maps the bind mount as
+# root, and a Git Bash uid (197609) does not exist inside the image.
+ifeq ($(OS),Windows_NT)
+  REPO     := $(shell cd .. && pwd -W 2>/dev/null || pwd)
+  DOCKER   := MSYS_NO_PATHCONV=1 docker
+  USERFLAG :=
+else
+  REPO     := $(abspath $(CURDIR)/..)
+  DOCKER   := docker
+  USERFLAG := --user $(shell id -u):$(shell id -g)
+endif
 ifeq ($(GPU),1)
   GPUFLAG := --gpus all
   GPUS    := 1
@@ -57,7 +77,7 @@ endif
 # either, so depending on one is a bug that would only show up on the cluster.
 ENVFLAGS := -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e MPLCONFIGDIR=/tmp/.cache/mpl \
             -e PYTHONUNBUFFERED=1 -e WANDB_MODE=offline
-RUN      := docker run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
+RUN      := $(DOCKER) run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
             -v "$(REPO)":/work -w /work/training $(IMAGE)
 
 STAMP := .make/image.$(subst :,_,$(subst /,_,$(IMAGE)))
@@ -87,6 +107,8 @@ help:
 	@echo "  make clean           remove smoke artefacts;  make distclean also drops logs/ runs/ and the image"
 	@echo
 	@echo "knobs: IMAGE= PLATFORM= MODEL= ARGS= CKPT= GPU= SHM= VOLUMES= SLICES= EXTRA='...'"
+	@echo "       PLATFORM defaults to linux/amd64 (what CHTC runs); pass e.g."
+	@echo "       PLATFORM=linux/arm64 to build natively for local smoke tests only."
 
 # --- image ------------------------------------------------------------------
 .PHONY: build rebuild push
@@ -94,12 +116,12 @@ build: $(STAMP)
 
 $(STAMP): Dockerfile
 	@mkdir -p .make
-	docker build --platform $(PLATFORM) --build-arg IMAGE_TAG=$(IMAGE) -t $(IMAGE) .
+	$(DOCKER) build --platform $(PLATFORM) --build-arg IMAGE_TAG=$(IMAGE) -t $(IMAGE) .
 	@touch $@
 
 rebuild:
 	@mkdir -p .make
-	docker build --no-cache --platform $(PLATFORM) --build-arg IMAGE_TAG=$(IMAGE) -t $(IMAGE) .
+	$(DOCKER) build --no-cache --platform $(PLATFORM) --build-arg IMAGE_TAG=$(IMAGE) -t $(IMAGE) .
 	@touch $(STAMP)
 
 push: build
@@ -108,16 +130,22 @@ push: build
 	@case "$(IMAGE)" in *:latest) \
 	  echo "refusing :latest -- a rebuild would silently change what a checkpoint was produced with" >&2; \
 	  exit 1;; esac
-	docker push $(IMAGE)
+	$(DOCKER) push $(IMAGE)
 	@echo
 	@echo "now set in train.sub:   image = docker://$(IMAGE)"
 
 # --- line endings -----------------------------------------------------------
 # These files execute on Linux; a stray CRLF makes bash fail on "\r".
+#
+# The Makefile and Dockerfile are checked too, because they fail differently
+# and much less obviously: make keeps the \r in every variable, so a CRLF
+# Makefile turns `PLATFORM ?= linux/amd64` into "linux/amd64\r" and every
+# `docker build --platform ...` dies on an invalid platform. .gitattributes
+# pins eol=lf so a Windows checkout cannot reintroduce it.
 .PHONY: check-eol
 check-eol:
 	@bad=""; \
-	for f in run_train.sh submit.sh train.sub train_wandb.py; do \
+	for f in Makefile Dockerfile run_train.sh submit.sh train.sub train_wandb.py; do \
 	  if LC_ALL=C grep -qU "$$(printf '\r')" "$$f" 2>/dev/null; then bad="$$bad $$f"; fi; \
 	done; \
 	if [ -n "$$bad" ]; then \
@@ -168,14 +196,14 @@ smoke: build check-eol synthetic
 job-smoke: build check-eol knee_multicoil_train_synthetic.tar
 	rm -rf jobtest && mkdir -p jobtest
 	cp train_wandb.py run_train.sh knee_multicoil_*_synthetic.tar jobtest/
-	docker run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) -e KEEP_TARBALL=1 \
+	$(DOCKER) run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) -e KEEP_TARBALL=1 \
 	    -v "$(REPO)":/work -w /work/training/jobtest $(IMAGE) \
 	    bash run_train.sh --run_name job-smoke --accelerations 4 --center_fractions 0.08 \
 	        --gpus $(GPUS) --max_epochs 1 $(SMOKE_ARCH) $(SMOKE_RUN) $(EXTRA)
 	@test -s jobtest/output/checkpoints/last.ckpt || { echo "FAILED: run_train.sh produced no output/checkpoints/last.ckpt" >&2; exit 1; }
 	@echo "--- first job done. Second run in the same sandbox (= after an eviction): must resume ---"
 	rm -rf jobtest/data
-	docker run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) -e KEEP_TARBALL=1 \
+	$(DOCKER) run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) -e KEEP_TARBALL=1 \
 	    -v "$(REPO)":/work -w /work/training/jobtest $(IMAGE) \
 	    bash run_train.sh --run_name job-smoke --accelerations 4 --center_fractions 0.08 \
 	        --gpus $(GPUS) --max_epochs 2 $(SMOKE_ARCH) $(SMOKE_RUN) $(EXTRA) 2>&1 | tee jobtest/resume.log
@@ -210,7 +238,7 @@ logs:
 # --- misc -------------------------------------------------------------------
 .PHONY: shell
 shell: build
-	docker run --rm -it --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
+	$(DOCKER) run --rm -it --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
 	    -v "$(REPO)":/work -w /work/training $(IMAGE) bash
 
 .PHONY: clean distclean
@@ -219,4 +247,4 @@ clean:
 
 distclean: clean
 	rm -rf .make logs runs
-	-docker rmi $(IMAGE)
+	-$(DOCKER) rmi $(IMAGE)
