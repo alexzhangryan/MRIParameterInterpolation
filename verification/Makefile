@@ -83,6 +83,10 @@ endif
 # either, so depending on one is a bug that would only show up on the cluster.
 ENVFLAGS := -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e MPLCONFIGDIR=/tmp/.cache/mpl \
             -e PYTHONUNBUFFERED=1
+# Defined before RUN on purpose: RUN uses := , so a SHMFLAG assigned further
+# down would expand to nothing here and silently drop --shm-size.
+SHM      ?= 8g
+SHMFLAG  := --shm-size=$(SHM)
 RUN      := $(DOCKER) run --rm --platform $(PLATFORM) $(SHMFLAG) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
             -v "$(HOSTPWD)":/work -w /work $(IMAGE)
 
@@ -108,8 +112,6 @@ else
   WANDBENV  := -e WANDB_MODE=offline
 endif
 
-SHM      ?= 8g
-SHMFLAG  := --shm-size=$(SHM)
 
 STAMP := .make/image.$(subst :,_,$(subst /,_,$(IMAGE)))
 
