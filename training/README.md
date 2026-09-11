@@ -118,12 +118,12 @@ is the only thing to repoint.
   new key. It is only ever exported in a shell, never written to a file in
   this repo.
 - **Training data is the gate.** `train.sub` expects
-  `/staging/a/apryan3/fastmri/knee_multicoil_train.tar.xz` and
-  `knee_multicoil_val.tar.xz`. The val tarball (93.8 GB) fits the 100 GB
-  personal staging quota; `multicoil_train` (~931 GB unpacked) does not.
-  Until a quota increase or group-directory access comes through, the only
-  runnable configuration is a **subset** training tarball (section 3b).
-  Every other step can be done now.
+  `/staging/a/apryan3/fastmri/knee_multicoil_train_subset.tar.xz` and
+  `knee_multicoil_val_subset.tar`, built once by section 3b from the full
+  val tarball already staged and a streamed prefix of NYU's train tarball.
+  The full splits do not fit the 100 GB personal staging quota (val alone is
+  100.7 GB; `multicoil_train` is ~490 GB compressed). A quota increase or
+  group-directory access is the only way to train on all of it.
 - Docker Desktop running on the laptop, logged in to Docker Hub
   (`docker login`).
 
@@ -172,7 +172,8 @@ before a single GPU slot is used.
 ## 3. Copy to the access point (the "VM")
 
 Only this directory is needed on CHTC. Neither submodule is: the image
-carries its own copy of fastMRI at the pinned commit.
+carries its own copy of fastMRI at the pinned commit. Cloning the whole repo
+on the access point (without `--recurse-submodules`) is the simplest way.
 
 What goes up:
 
@@ -183,6 +184,7 @@ What goes up:
 | `run_train.sh` | the job executable (transferred to the execute node by HTCondor) |
 | `train_wandb.py` | the driver (listed in `transfer_input_files`) |
 | `Makefile` | for `make submit-model1` etc. Optional; `./submit.sh` works alone. |
+| `make_subset.sh`, `subset_val.sub`, `subset_train.sub`, `.env.example` | the one-off staging repack in 3b |
 
 What must not go up: `synthetic/`, `jobtest/`, `output/`, `*.tar`, `*.ckpt`,
 `.env`, `.make/`. They are laptop smoke-test leftovers. A `.ckpt` in the
@@ -231,24 +233,86 @@ the NYU presigned URL and verifies it (see `verification/README.md` step 3).
 The training tarball (`knee_multicoil_train.tar.xz`, same URL pattern) goes in
 the same directory the same way once there is room for it.
 
-### 3b. Subset tarballs (the only thing that runs under the default quota)
+### 3b. Repack /staging into subsets (what actually fits under the quota)
 
-Build a plain `.tar` containing a `multicoil_train/` directory with as many
-volumes as fit, put it in `/staging/a/apryan3/fastmri/`, and point the job at
-it. A one-off interactive job (`condor_submit -i`) that extracts the val
-tarball once and re-tars a subset is the fastest way to make one. Then:
+`/staging/a/apryan3` is capped at 100 GB and the full val tarball alone is
+100.7 GB. The train split (~490 GB compressed, ~930 GB unpacked) cannot be
+staged at all without a quota increase, and that request is the last resort.
+So both splits are cut down to subsets that fit together:
+
+| File in `/staging/a/apryan3/fastmri/` | Built by | Size | Contents |
+|---|---|---|---|
+| `knee_multicoil_val_subset.tar` | `make subset-val` | ~20 GB | `multicoil_val/`, 20 of the 199 volumes, evenly spaced through the sorted list |
+| `knee_multicoil_train_subset.tar.xz` | `make subset-train` | ~65 GB | `multicoil_train/`, every complete volume in the first 65 GB of NYU's archive (~120 of 973) |
+
+`train.sub` defaults to these two names, so once they exist `make submit-model1`
+works with no overrides. Both jobs run `make_subset.sh` in the training image
+on a CPU slot, validate every kept `.h5` by reading it fully, and write a
+`*_subset_files.txt` next to the tarball listing exactly which volumes went in
+(plus the archive's sha256). Keep those two text files in the repo directory;
+they are the definition of the subset every model in Phase A and B trains on.
+
+**The order matters.** Staging is full, so the val subset has to come back to
+home first, the original val tarball is deleted by hand, and only then can
+the train subset be written into staging.
+
+**Step 1: val subset (about an hour, mostly extraction).**
 
 ```bash
-./submit.sh model1 \
-    train_data=osdf:///chtc/staging/a/apryan3/fastmri/knee_multicoil_train_subset.tar \
-    val_data=osdf:///chtc/staging/a/apryan3/fastmri/knee_multicoil_val_subset.tar \
-    request_disk=60GB
+cd ~/Fall26Research/training
+make subset-val                      # N_VAL=30 for more volumes; ~1 GB each, home is 40 GB
+condor_q -nobatch                    # < = transferring the 101 GB input, R = running
+tail -f logs/subset_val_*.out
 ```
 
-CHTC's rule: `osdf:///chtc/staging/<path>` for 1-30 GB inputs,
-`file:///staging/<path>` from 30 GB up. `run_train.sh` accepts `.tar` and
-`.tar.xz` and finds the split directories at any depth inside them. Do not
-stage the synthetic phantoms as a "subset"; they only exist for `make smoke`.
+When it finishes, `knee_multicoil_val_subset.tar` and `val_subset_files.txt`
+are in this directory. Check, then swap:
+
+```bash
+tail -3 val_subset_files.txt                      # sha256 and byte count
+tar -tf knee_multicoil_val_subset.tar | head -3   # multicoil_val/file...h5
+rm /staging/a/apryan3/fastmri/knee_multicoil_val.tar.xz      # the full val split; see below
+mv knee_multicoil_val_subset.tar /staging/a/apryan3/fastmri/
+get_quotas /staging/a/apryan3                     # should now show ~80 GB free
+```
+
+Deleting the full val tarball means Tier 1 of `VERIFICATION.md` (the released
+checkpoint on all 199 val volumes) can no longer run without re-downloading
+it. Run Tier 1 first if you want that number; otherwise the NYU URL can be
+used again any time before it expires (~2026-12-08) or re-requested.
+
+**Step 2: train subset (about an hour: streaming, decoding, re-packing).**
+
+Put the NYU presigned URL for `knee_multicoil_train.tar.xz` in `.env`
+(`cp .env.example .env`, `chmod 600 .env`, paste it quoted). Then:
+
+```bash
+make subset-train                    # TRAIN_PREFIX_GB=50 to fit a smaller quota gap
+tail -f logs/subset_train_*.out
+```
+
+The job fetches only the first `TRAIN_PREFIX_GB` gigabytes of NYU's archive
+with an HTTP range request and decodes them on the fly; nothing compressed is
+ever stored. The archive is sequential, so that prefix is the same volumes
+every time. The truncated last volume is dropped, the rest are re-packed, and
+HTCondor writes the result straight into `/staging` via `transfer_output_remaps`.
+`train_subset_files.txt` lands in this directory. If the job goes on hold
+after finishing, the output transfer hit the quota: lower `TRAIN_PREFIX_GB`,
+or free space, then `condor_release` it.
+
+Then:
+
+```bash
+ls -la /staging/a/apryan3/fastmri/
+condor_submit -dry-run /dev/stdout train.sub | grep -iE "^(TransferInput|RequestDisk) "
+```
+
+**What this costs scientifically.** Model 1 trains on ~120 volumes instead
+of 973, so its numbers will not match the paper; see "Known deviations". For
+Phase B this is fine as long as model 1, model 2 and the DPI model all train
+and validate on the same two subsets, which the `*_subset_files.txt` lists
+pin down. If the full train split is ever staged, `train_data=` and
+`request_disk=` on the command line switch a run back to it.
 
 ## 4. Run the two models (access point)
 
@@ -257,7 +321,9 @@ Every submission starts the same way:
 ```bash
 ssh apryan3@ap2001.chtc.wisc.edu
 cd ~/Fall26Research/training
-export WANDB_API_KEY=...          # freshly rotated; never written to a file
+# either export them, or put them in .env (cp .env.example .env; chmod 600 .env);
+# submit.sh sources .env itself.
+export WANDB_API_KEY=...          # freshly rotated
 export WANDB_ENTITY=...           # optional
 ```
 
@@ -422,6 +488,11 @@ Read these before comparing any number to the paper (CLAUDE.md, ROADMAP.md):
   the network in either model.
 - Validation here is the `multicoil_val` split; the paper's Table 3 numbers
   are on a test split with no public ground truth and cannot be reproduced.
+- Under the default `/staging` quota both models train on the section-3b
+  subsets: ~120 of the 973 train volumes and 20 of the 199 val volumes. At
+  the same 50-epoch schedule that is ~8x fewer optimiser steps than the
+  paper. Every Phase A/B comparison must use the same two subsets
+  (`*_subset_files.txt`); absolute numbers are not comparable to the paper.
 
 ## Without Docker
 

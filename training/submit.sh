@@ -12,6 +12,16 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# .env (gitignored, see .env.example) holds the W&B key and the NYU URL.
+# The file wins over the shell: leave a line out of .env if you would rather
+# export that variable by hand.
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+
 MODEL="${1:-}"
 case "$MODEL" in
   model1) shift; PRESET=(model=model1 accelerations="4"       center_fractions="0.08") ;;

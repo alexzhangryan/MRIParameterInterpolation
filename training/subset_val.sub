@@ -1,0 +1,41 @@
+# subset_val.sub: one-off CPU job that turns the full knee_multicoil_val.tar.xz
+# in /staging into a small plain-tar subset. Step 1 of README section 3b.
+#
+#   condor_submit subset_val.sub              (20 volumes)
+#   condor_submit subset_val.sub n_val=30
+#
+# The subset comes back to THIS directory (home), not to /staging, because
+# /staging is full until the original tarball is deleted. Once the job is
+# done and the file looks right, you delete the original and mv the subset
+# into /staging by hand (see the README). Home has a 40 GB quota, so keep
+# n_val * ~1 GB comfortably under that.
+
+staging = /staging/a/apryan3/fastmri
+image   = docker://genjigod/fastmri-train:2026-09
+n_val   = 20
+
+universe        = container
+container_image = $(image)
+executable      = make_subset.sh
+arguments       = val
+environment     = "N_VAL=$(n_val)"
+
+transfer_input_files    = file://$(staging)/knee_multicoil_val.tar.xz
+transfer_output_files   = knee_multicoil_val_subset.tar, val_subset_files.txt
+should_transfer_files   = YES
+when_to_transfer_output = ON_EXIT
+
+# peak scratch: 101 GB tarball + ~192 GB extracted coexist until the tarball
+# is deleted, then the subset tar is written on top of the extracted tree
+requirements   = (Target.HasCHTCStaging == true)
+request_cpus   = 8
+request_memory = 16GB
+request_disk   = 330GB
+
+log    = logs/subset_val_$(Cluster).log
+output = logs/subset_val_$(Cluster).out
+error  = logs/subset_val_$(Cluster).err
+stream_output = True
+stream_error  = True
+
+queue 1

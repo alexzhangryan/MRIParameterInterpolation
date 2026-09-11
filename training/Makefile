@@ -97,6 +97,8 @@ help:
 	@echo "  make shell           interactive shell in the image, repo mounted at /work"
 	@echo
 	@echo "  ACCESS POINT (ap2001.chtc.wisc.edu, WANDB_API_KEY exported):"
+	@echo "  make subset-val      one-off: val subset from the staged tarball (README 3b, step 1)"
+	@echo "  make subset-train    one-off: train subset streamed from NYU into /staging (step 2)"
 	@echo "  make submit-model1   train on acceleration 4 only"
 	@echo "  make submit-model2   train on accelerations 2 4 6 8, one drawn per sample"
 	@echo "  make submit MODEL=model2 ARGS='max_epochs=2'"
@@ -145,7 +147,7 @@ push: build
 .PHONY: check-eol
 check-eol:
 	@bad=""; \
-	for f in Makefile Dockerfile run_train.sh submit.sh train.sub train_wandb.py; do \
+	for f in Makefile Dockerfile run_train.sh submit.sh make_subset.sh train.sub subset_val.sub subset_train.sub train_wandb.py; do \
 	  if LC_ALL=C grep -qU "$$(printf '\r')" "$$f" 2>/dev/null; then bad="$$bad $$f"; fi; \
 	done; \
 	if [ -n "$$bad" ]; then \
@@ -213,7 +215,22 @@ job-smoke: build check-eol knee_multicoil_train_synthetic.tar
 	@echo "job-smoke passed: extraction, split discovery, output/ contract, and resume-after-eviction."
 
 # --- CHTC access point ------------------------------------------------------
-.PHONY: submit submit-model1 submit-model2 resume status logs
+.PHONY: submit submit-model1 submit-model2 resume status logs subset-val subset-train
+# README section 3b: build the subset tarballs that fit under the /staging
+# quota. subset-val brings ~N_VAL GB back to this directory; subset-train
+# needs FASTMRI_TRAIN_URL (from .env) and writes straight into /staging.
+N_VAL           ?= 20
+TRAIN_PREFIX_GB ?= 65
+subset-val:
+	@mkdir -p logs
+	condor_submit subset_val.sub n_val=$(N_VAL)
+
+subset-train:
+	@mkdir -p logs
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	test -n "$$FASTMRI_TRAIN_URL" || { echo "FASTMRI_TRAIN_URL is empty: put the NYU presigned URL in .env (see .env.example)" >&2; exit 1; }; \
+	condor_submit subset_train.sub train_prefix_gb=$(TRAIN_PREFIX_GB)
+
 submit-model1:
 	./submit.sh model1 $(ARGS)
 

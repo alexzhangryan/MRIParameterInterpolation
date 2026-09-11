@@ -1,0 +1,48 @@
+# subset_train.sub: one-off CPU job that builds knee_multicoil_train_subset.tar.xz
+# directly from NYU and writes it into /staging. Step 2 of README section 3b;
+# run it only AFTER the full val tarball has been deleted from /staging,
+# otherwise the output transfer exceeds the quota and the job goes on hold.
+#
+#   set -a; source .env; set +a          # exports FASTMRI_TRAIN_URL
+#   condor_submit subset_train.sub                      (first 65 GB of the archive)
+#   condor_submit subset_train.sub train_prefix_gb=50
+#
+# The full train tarball is never stored: make_subset.sh streams the first
+# train_prefix_gb gigabytes of it with an HTTP range request, keeps every
+# complete volume, and re-packs them. Result is about train_prefix_gb again
+# (roughly 1.9 volumes per GB). Size it from what /staging has free after the
+# val repack: get_quotas /staging/a/apryan3.
+#
+# The presigned URL is a credential. It reaches the job through getenv from
+# your shell, never from this file, and is visible in the job ClassAd only to
+# you and CHTC admins.
+
+staging         = /staging/a/apryan3/fastmri
+image           = docker://genjigod/fastmri-train:2026-09
+train_prefix_gb = 65
+
+universe        = container
+container_image = $(image)
+executable      = make_subset.sh
+arguments       = train
+environment     = "TRAIN_PREFIX_GB=$(train_prefix_gb)"
+getenv          = FASTMRI_TRAIN_URL
+
+transfer_output_files   = knee_multicoil_train_subset.tar.xz, train_subset_files.txt
+transfer_output_remaps  = "knee_multicoil_train_subset.tar.xz = file://$(staging)/knee_multicoil_train_subset.tar.xz"
+should_transfer_files   = YES
+when_to_transfer_output = ON_EXIT
+
+# peak scratch: ~1.9x train_prefix_gb extracted plus the re-packed archive
+requirements   = (Target.HasCHTCStaging == true)
+request_cpus   = 8
+request_memory = 16GB
+request_disk   = 220GB
+
+log    = logs/subset_train_$(Cluster).log
+output = logs/subset_train_$(Cluster).out
+error  = logs/subset_train_$(Cluster).err
+stream_output = True
+stream_error  = True
+
+queue 1

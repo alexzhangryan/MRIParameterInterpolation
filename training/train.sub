@@ -39,11 +39,15 @@ executable      = run_train.sh
 
 # --- input files -------------------------------------------------------------
 # Large inputs live in /staging and are transferred into the job scratch by
-# HTCondor, never read directly. CHTC's size rule: osdf:///chtc/staging/<path>
-# for 1-30 GB, file:///staging/<path> for 30 GB and up. Override for subsets:
-#   ./submit.sh model1 train_data=osdf:///chtc/staging/a/apryan3/fastmri/knee_multicoil_train_subset.tar
-train_data      = file://$(staging)/knee_multicoil_train.tar.xz
-val_data        = file://$(staging)/knee_multicoil_val.tar.xz
+# HTCondor, never read directly. The defaults are the subset tarballs built by
+# README section 3b (subset_val.sub / subset_train.sub), which is all that
+# fits under the 100 GB /staging quota. If the full splits are ever staged
+# (quota increase or group-directory access), override on the command line:
+#   ./submit.sh model1 train_data=file:///staging/.../knee_multicoil_train.tar.xz request_disk=1500GB
+# CHTC's size rule: osdf:///chtc/staging/<path> for 1-30 GB inputs,
+# file:///staging/<path> from 30 GB up; file:// works for both.
+train_data      = file://$(staging)/knee_multicoil_train_subset.tar.xz
+val_data        = file://$(staging)/knee_multicoil_val_subset.tar
 # `resume` is only defined when passed on the command line (see submit.sh).
 if defined resume
   transfer_input_files = train_wandb.py, $(train_data), $(val_data), $(resume)
@@ -72,8 +76,9 @@ environment     = "WANDB_PROJECT=fastmri-varnet-train"
 # --- resources ---------------------------------------------------------------
 # request_disk covers peak scratch during extraction: run_train.sh deletes a
 # tarball only after `xz | tar` finishes, so compressed + extracted coexist.
-# The val split alone is 93.8 GB compressed, ~192 GB extracted. Size this from
-# the tarballs actually staged (du -sh on /staging) and override on the
+# With the section-3b subsets (65 GB train .tar.xz -> ~125 GB, 20 GB val .tar
+# -> 20 GB) peak is ~210 GB. Size this from the tarballs actually staged
+# (du -sh on /staging; a .tar.xz extracts to ~1.9x) and override on the
 # command line: ./submit.sh model1 request_disk=600GB
 #
 # request_cpus: DataLoader workers (--num_workers, default 4) plus the main
@@ -81,7 +86,7 @@ environment     = "WANDB_PROJECT=fastmri-varnet-train"
 requirements    = (Target.HasCHTCStaging == true)
 request_cpus    = 8
 request_memory  = 48GB
-request_disk    = 350GB
+request_disk    = 260GB
 request_gpus    = 1
 gpus_minimum_memory     = 24000
 gpus_minimum_capability = 7.0
