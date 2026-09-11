@@ -72,9 +72,20 @@ increase or access to the group directory.
 
 ```bash
 cd verification
-docker build --build-arg IMAGE_TAG=<you>/fastmri-verify:2026-09 -t <you>/fastmri-verify:2026-09 .
+make build push IMAGE=<you>/fastmri-verify:2026-09
+# equivalent by hand:
+docker build --platform linux/amd64 --build-arg IMAGE_TAG=<you>/fastmri-verify:2026-09 -t <you>/fastmri-verify:2026-09 .
 docker push <you>/fastmri-verify:2026-09
 ```
+
+The image must be `linux/amd64`: CHTC is x86_64, the cu118 torch wheels only
+exist for x86_64, and the pinned conda `hdf5` build string is a linux-64
+build. This laptop is Apple Silicon, so a bare `docker build` used to produce
+an arm64 image and die in the conda layer with
+`hdf5 1.10.6 nompi_h6a2412b_1114 does not exist`. The `FROM` line now pins
+the platform and `make build` passes `--platform` too, so either route works.
+Every local `docker run` of this image on the Mac goes through emulation:
+slow, but correct for the synthetic smoke tests.
 
 Use a dated tag, never `:latest`, so a later rebuild cannot change what an
 old result was produced with. The build ends with a self-check that prints the
@@ -83,7 +94,7 @@ installed versions and asserts Lightning is 1.x.
 ### 2. Smoke-test the harness locally, no real data (laptop, minutes)
 
 ```bash
-docker run --rm -it -v "$PWD":/work -w /work <you>/fastmri-verify:2026-09 bash
+docker run --rm -it --platform linux/amd64 -v "$PWD":/work -w /work <you>/fastmri-verify:2026-09 bash
 python make_synthetic_val.py --out synthetic/multicoil_val --volumes 3 --slices 4
 python verify_varnet.py tier0 --fastmri_repo /opt/fastMRI --run_pytest --no_wandb
 python verify_varnet.py tier1 --data_path synthetic/multicoil_val --random_init \
@@ -227,11 +238,24 @@ pip install --no-deps -e ../fastMRI
 `torch` must be installed first for your platform. The Lightning 1.x
 requirement is the one that cannot be relaxed.
 
-## Not covered here
+## Training is not here: see `../training/`
 
-Tier 2 (Table 2 reproduction) and Tier 3 (seed variance) are training runs
-and use `fastmri_examples/varnet/train_varnet_demo.py` from the repo, not
-this harness. Their commands are in `VERIFICATION.md` Sections 5 and 6. The
-per-volume CSV writer here is the piece Tier 3 needs for paired comparisons;
-`volume_metrics()` and `crop_like_evaluate()` in `verify_varnet.py` can be
-imported for that.
+This directory only evaluates the released checkpoint. Training the two
+models from scratch lives in `../training/` and has its own runbook,
+`../training/README.md`:
+
+| Model | `accelerations` | `center_fractions` | Submit with |
+|---|---|---|---|
+| model1 | `4` | `0.08` | `make submit-model1` |
+| model2 | `2 4 6 8` (one drawn at random per sample) | `0.16 0.08 0.0533 0.04` | `make submit-model2` |
+
+Both use the `train_varnet_demo.py` defaults for everything else (8
+cascades, 18 channels, Adam lr 1e-3, batch 1, 50 epochs,
+`equispaced_fraction` masks). The training image is a separate
+`Dockerfile` in `training/` with the same pins as this one.
+
+Tier 2 (Table 2 reproduction) and Tier 3 (seed variance) from
+`VERIFICATION.md` Sections 5 and 6 are also training runs and would go
+through `training/`, not this harness. The per-volume CSV writer here is the
+piece Tier 3 needs for paired comparisons; `volume_metrics()` and
+`crop_like_evaluate()` in `verify_varnet.py` can be imported for that.

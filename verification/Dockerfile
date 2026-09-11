@@ -27,13 +27,21 @@
 #   - fastMRI pinned to the exact commit of the local checkout and installed
 #     with --no-deps so pip cannot pull Lightning 2.x in through setup.cfg.
 #
-# Build and push (from this directory):
-#   docker build -t <dockerhub_user>/fastmri-verify:2026-09 .
+#   - linux/amd64 only. CHTC execute nodes are x86_64, the cu118 torch wheels
+#     exist only for x86_64, and the pinned hdf5 build string above is a
+#     linux-64 build (conda-forge's linux-aarch64 1.10.6 builds have different
+#     hashes). This laptop is Apple Silicon, so without the platform pin
+#     Docker builds an arm64 image and the conda solve fails with
+#     "hdf5 1.10.6 nompi_h6a2412b_1114 does not exist". The FROM line pins it,
+#     and `make build` passes --platform as well, so both routes work.
+#
+# Build and push (laptop, from this directory):
+#   docker build --platform linux/amd64 -t <dockerhub_user>/fastmri-verify:2026-09 .
 #   docker push  <dockerhub_user>/fastmri-verify:2026-09
 # then set container_image in verify.sub. Use a dated tag, not :latest, so a
 # rebuild never silently changes what a past result was produced with.
 
-FROM mambaorg/micromamba:1.5.8-jammy
+FROM --platform=linux/amd64 mambaorg/micromamba:1.5.8-jammy
 
 USER root
 RUN apt-get update \

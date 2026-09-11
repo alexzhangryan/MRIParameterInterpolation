@@ -20,6 +20,10 @@ SHELL := /bin/bash
 #
 # IMAGE: use a dated tag (fastmri-verify:2026-09) for anything you push.
 IMAGE    ?= fastmri-verify:local
+# PLATFORM: CHTC is x86_64 and the torch cu118 wheels / pinned hdf5 build only
+# exist there. On an Apple Silicon laptop this makes docker build and run use
+# emulation (slow, but correct); without it the conda solve fails outright.
+PLATFORM ?= linux/amd64
 RESULTS  ?= results
 SYNTH    ?= synthetic
 # synthetic volumes, and slices per volume
@@ -79,7 +83,7 @@ endif
 # either, so depending on one is a bug that would only show up on the cluster.
 ENVFLAGS := -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e MPLCONFIGDIR=/tmp/.cache/mpl \
             -e PYTHONUNBUFFERED=1
-RUN      := $(DOCKER) run --rm $(SHMFLAG) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
+RUN      := $(DOCKER) run --rm --platform $(PLATFORM) $(SHMFLAG) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
             -v "$(HOSTPWD)":/work -w /work $(IMAGE)
 
 # PyTorch DataLoader workers hand samples to the parent process through
@@ -150,12 +154,12 @@ build: $(STAMP)
 
 $(STAMP): Dockerfile
 	@mkdir -p .make
-	$(DOCKER) build --build-arg IMAGE_TAG=$(IMAGE) -t $(IMAGE) .
+	$(DOCKER) build --platform $(PLATFORM) --build-arg IMAGE_TAG=$(IMAGE) -t $(IMAGE) .
 	@touch $@
 
 rebuild:
 	@mkdir -p .make
-	$(DOCKER) build --no-cache --build-arg IMAGE_TAG=$(IMAGE) -t $(IMAGE) .
+	$(DOCKER) build --no-cache --platform $(PLATFORM) --build-arg IMAGE_TAG=$(IMAGE) -t $(IMAGE) .
 	@touch $(STAMP)
 
 push:
@@ -236,7 +240,7 @@ check-eol:
 job-smoke: build check-eol knee_multicoil_val_synthetic.tar
 	rm -rf jobtest && mkdir -p jobtest
 	cp verify_varnet.py run_verify.sh knee_multicoil_val_synthetic.tar jobtest/
-	-$(DOCKER) run --rm $(SHMFLAG) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) -e KEEP_TARBALL=1 \
+	-$(DOCKER) run --rm --platform $(PLATFORM) $(SHMFLAG) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) -e KEEP_TARBALL=1 \
 	    -v "$(HOSTPWD)":/work -w /work/jobtest $(IMAGE) \
 	    bash run_verify.sh tier1 --random_init $(SMOKE_ARCH) \
 	        --accelerations $(ACCEL) --center_fractions $(CF) \
@@ -281,7 +285,7 @@ CHUNK_MB ?= 16
 define in_data_container
 D=$$(mkdir -p "$(DATA_DIR)" && cd "$(DATA_DIR)" && { pwd -W 2>/dev/null || pwd; }); \
 echo "[make] DATA_DIR -> $$D"; \
-$(DOCKER) run --rm $(SHMFLAG) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS)
+$(DOCKER) run --rm --platform $(PLATFORM) $(SHMFLAG) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS)
 endef
 
 # Download the real val set + released checkpoint, and verify the SHA256.

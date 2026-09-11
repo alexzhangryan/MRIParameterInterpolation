@@ -1,0 +1,14 @@
+# job artefacts (CHTC access point)
+logs/
+runs/
+# local smoke-test artefacts (laptop)
+.make/
+synthetic/
+jobtest/
+output/
+wandb/
+lightning_logs/
+*.tar
+*.tar.xz
+*.ckpt
+.env

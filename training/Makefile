@@ -1,0 +1,222 @@
+# Makefile: driver for VarNet training on CHTC.
+#
+# Two kinds of targets, run in two places:
+#   laptop (needs Docker):        make build push smoke job-smoke
+#   ap2001.chtc.wisc.edu:         make submit-model1 submit-model2 resume status logs
+#
+#   make help            every target
+#
+# Requires GNU make. The laptop is Apple Silicon and CHTC is x86_64, so every
+# docker build here passes --platform linux/amd64; the smoke targets run that
+# image under emulation, which is slow but fine for tiny synthetic data.
+
+SHELL := /bin/bash
+.DEFAULT_GOAL := help
+
+# --- knobs ------------------------------------------------------------------
+# Comments go above the assignments, never after them: make keeps the trailing
+# whitespace, which turns `ifeq ($(GPU),1)` into a silent false.
+#
+# IMAGE: use a dated tag (<user>/fastmri-train:2026-09) for anything you push.
+IMAGE    ?= fastmri-train:local
+PLATFORM ?= linux/amd64
+# model preset for `make submit` / `make resume`: model1 | model2
+MODEL    ?= model1
+# extra name=value macro overrides for condor_submit, e.g.
+#   make submit-model2 ARGS='max_epochs=2 extra_args="--limit_train_batches 20"'
+ARGS     ?=
+# checkpoint for `make resume`
+CKPT     ?=
+# synthetic volumes for the smoke tests
+VOLUMES  ?= 3
+SLICES   ?= 4
+# GPU: 1 uses the host GPU, 0 forces CPU. Auto-detected from nvidia-smi.
+GPU      ?= $(if $(shell nvidia-smi -L 2>/dev/null),1,0)
+SHM      ?= 8g
+# extra args appended to train_wandb.py in the smoke targets
+EXTRA    ?=
+
+# Tiny architecture for the smoke tests: the point is exercising the data
+# path, the checkpoint/resume logic and the job executable, not the model.
+SMOKE_ARCH ?= --num_cascades 2 --chans 4 --sens_chans 4 --pools 2 --sens_pools 2
+SMOKE_RUN  ?= --limit_train_batches 4 --limit_val_batches 2 --num_workers 0 --no_wandb
+
+# --- host/docker plumbing ---------------------------------------------------
+# The repo root is mounted (not just this directory) so the smoke targets can
+# reuse ../verification/make_synthetic_val.py without copying it.
+REPO     := $(abspath $(CURDIR)/..)
+USERFLAG := --user $(shell id -u):$(shell id -g)
+ifeq ($(GPU),1)
+  GPUFLAG := --gpus all
+  GPUS    := 1
+else
+  GPUFLAG :=
+  GPUS    := 0
+endif
+# HOME and the cache dirs go to /tmp: the CHTC container has no writable home
+# either, so depending on one is a bug that would only show up on the cluster.
+ENVFLAGS := -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e MPLCONFIGDIR=/tmp/.cache/mpl \
+            -e PYTHONUNBUFFERED=1 -e WANDB_MODE=offline
+RUN      := docker run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
+            -v "$(REPO)":/work -w /work/training $(IMAGE)
+
+STAMP := .make/image.$(subst :,_,$(subst /,_,$(IMAGE)))
+SYNTH := synthetic/knee
+
+# ============================================================================
+
+.PHONY: help
+help:
+	@echo "VarNet training on CHTC (IMAGE=$(IMAGE))"
+	@echo
+	@echo "  LAPTOP (Docker):"
+	@echo "  make build           build the image for $(PLATFORM) (cached)"
+	@echo "  make push IMAGE=<user>/fastmri-train:2026-09   publish for CHTC"
+	@echo "  make smoke           train_wandb.py on synthetic data, then resume from last.ckpt"
+	@echo "  make job-smoke       run_train.sh the way HTCondor will, twice (fresh + evicted)"
+	@echo "  make shell           interactive shell in the image, repo mounted at /work"
+	@echo
+	@echo "  ACCESS POINT (ap2001.chtc.wisc.edu, WANDB_API_KEY exported):"
+	@echo "  make submit-model1   train on acceleration 4 only"
+	@echo "  make submit-model2   train on accelerations 2 4 6 8, one drawn per sample"
+	@echo "  make submit MODEL=model2 ARGS='max_epochs=2'"
+	@echo "  make resume MODEL=model1 CKPT=runs/<model>/<Cluster>/checkpoints/last.ckpt"
+	@echo "  make status          condor_q for your jobs"
+	@echo "  make logs            tail the newest job .out"
+	@echo
+	@echo "  make clean           remove smoke artefacts;  make distclean also drops logs/ runs/ and the image"
+	@echo
+	@echo "knobs: IMAGE= PLATFORM= MODEL= ARGS= CKPT= GPU= SHM= VOLUMES= SLICES= EXTRA='...'"
+
+# --- image ------------------------------------------------------------------
+.PHONY: build rebuild push
+build: $(STAMP)
+
+$(STAMP): Dockerfile
+	@mkdir -p .make
+	docker build --platform $(PLATFORM) --build-arg IMAGE_TAG=$(IMAGE) -t $(IMAGE) .
+	@touch $@
+
+rebuild:
+	@mkdir -p .make
+	docker build --no-cache --platform $(PLATFORM) --build-arg IMAGE_TAG=$(IMAGE) -t $(IMAGE) .
+	@touch $(STAMP)
+
+push: build
+	@case "$(IMAGE)" in */*:*) ;; *) \
+	  echo "IMAGE must be <dockerhub_user>/<name>:<dated-tag>, got '$(IMAGE)'" >&2; exit 1;; esac
+	@case "$(IMAGE)" in *:latest) \
+	  echo "refusing :latest -- a rebuild would silently change what a checkpoint was produced with" >&2; \
+	  exit 1;; esac
+	docker push $(IMAGE)
+	@echo
+	@echo "now set in train.sub:   image = docker://$(IMAGE)"
+
+# --- line endings -----------------------------------------------------------
+# These files execute on Linux; a stray CRLF makes bash fail on "\r".
+.PHONY: check-eol
+check-eol:
+	@bad=""; \
+	for f in run_train.sh submit.sh train.sub train_wandb.py; do \
+	  if LC_ALL=C grep -qU "$$(printf '\r')" "$$f" 2>/dev/null; then bad="$$bad $$f"; fi; \
+	done; \
+	if [ -n "$$bad" ]; then \
+	  echo "CRLF line endings found in:$$bad  (fix: dos2unix, or sed -i 's/\r$$//')" >&2; exit 1; \
+	fi
+
+# --- synthetic data ---------------------------------------------------------
+# Phantoms with the real on-disk layout, one directory per split. Numbers
+# trained on this are meaningless; it only exercises the pipeline.
+.PHONY: synthetic
+synthetic: $(SYNTH)/multicoil_val
+
+$(SYNTH)/multicoil_val: ../verification/make_synthetic_val.py | build
+	$(RUN) python ../verification/make_synthetic_val.py --out $(SYNTH)/multicoil_train \
+	    --volumes $(VOLUMES) --slices $(SLICES) --seed 1
+	$(RUN) python ../verification/make_synthetic_val.py --out $(SYNTH)/multicoil_val \
+	    --volumes 2 --slices $(SLICES) --seed 2
+	@touch $@
+
+knee_multicoil_train_synthetic.tar knee_multicoil_val_synthetic.tar: $(SYNTH)/multicoil_val
+	tar -cf knee_multicoil_train_synthetic.tar -C $(SYNTH) multicoil_train
+	tar -cf knee_multicoil_val_synthetic.tar   -C $(SYNTH) multicoil_val
+
+# --- smoke: the driver ------------------------------------------------------
+# Epoch 1 from scratch, then epoch 2 must start from output/checkpoints/last.ckpt.
+.PHONY: smoke
+smoke: build check-eol synthetic
+	rm -rf output
+	$(RUN) python train_wandb.py --data_path $(SYNTH) --default_root_dir output \
+	    --run_name smoke --accelerations 2 4 6 8 --center_fractions 0.16 0.08 0.0533 0.04 \
+	    --gpus $(GPUS) --max_epochs 1 $(SMOKE_ARCH) $(SMOKE_RUN) $(EXTRA)
+	@test -s output/checkpoints/last.ckpt || { echo "FAILED: no output/checkpoints/last.ckpt after epoch 1" >&2; exit 1; }
+	@echo "--- epoch 1 done, checkpoint written. Re-running with --max_epochs 2: must resume ---"
+	$(RUN) python train_wandb.py --data_path $(SYNTH) --default_root_dir output \
+	    --run_name smoke --accelerations 2 4 6 8 --center_fractions 0.16 0.08 0.0533 0.04 \
+	    --gpus $(GPUS) --max_epochs 2 $(SMOKE_ARCH) $(SMOKE_RUN) $(EXTRA) 2>&1 | tee output/resume.log
+	@grep -q "resume from: output/checkpoints/last.ckpt" output/resume.log || { \
+	  echo "FAILED: second run did not resume from last.ckpt" >&2; exit 1; }
+	@echo
+	@echo "smoke passed: training runs, last.ckpt is written, and a rerun resumes from it."
+
+# --- smoke: the job executable ----------------------------------------------
+# run_train.sh does what the driver does not: tarball extraction, split
+# discovery, the output/ contract, checkpoint seeding. Run it twice in the same
+# scratch dir: the second run sees output/ exactly as HTCondor would deliver it
+# after an eviction and must resume rather than restart.
+.PHONY: job-smoke
+job-smoke: build check-eol knee_multicoil_train_synthetic.tar
+	rm -rf jobtest && mkdir -p jobtest
+	cp train_wandb.py run_train.sh knee_multicoil_*_synthetic.tar jobtest/
+	docker run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) -e KEEP_TARBALL=1 \
+	    -v "$(REPO)":/work -w /work/training/jobtest $(IMAGE) \
+	    bash run_train.sh --run_name job-smoke --accelerations 4 --center_fractions 0.08 \
+	        --gpus $(GPUS) --max_epochs 1 $(SMOKE_ARCH) $(SMOKE_RUN) $(EXTRA)
+	@test -s jobtest/output/checkpoints/last.ckpt || { echo "FAILED: run_train.sh produced no output/checkpoints/last.ckpt" >&2; exit 1; }
+	@echo "--- first job done. Second run in the same sandbox (= after an eviction): must resume ---"
+	rm -rf jobtest/data
+	docker run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) -e KEEP_TARBALL=1 \
+	    -v "$(REPO)":/work -w /work/training/jobtest $(IMAGE) \
+	    bash run_train.sh --run_name job-smoke --accelerations 4 --center_fractions 0.08 \
+	        --gpus $(GPUS) --max_epochs 2 $(SMOKE_ARCH) $(SMOKE_RUN) $(EXTRA) 2>&1 | tee jobtest/resume.log
+	@grep -q "resume from: output/checkpoints/last.ckpt" jobtest/resume.log || { \
+	  echo "FAILED: evicted-job rerun did not resume from last.ckpt" >&2; exit 1; }
+	@echo
+	@echo "job-smoke passed: extraction, split discovery, output/ contract, and resume-after-eviction."
+
+# --- CHTC access point ------------------------------------------------------
+.PHONY: submit submit-model1 submit-model2 resume status logs
+submit-model1:
+	./submit.sh model1 $(ARGS)
+
+submit-model2:
+	./submit.sh model2 $(ARGS)
+
+submit:
+	./submit.sh $(MODEL) $(ARGS)
+
+resume:
+	@test -n "$(CKPT)" || { echo "usage: make resume MODEL=model1 CKPT=runs/<model>/<Cluster>/checkpoints/last.ckpt" >&2; exit 1; }
+	./submit.sh $(MODEL) resume=$(CKPT) $(ARGS)
+
+status:
+	condor_q -nobatch
+
+logs:
+	@f=$$(ls -t logs/*.out 2>/dev/null | head -1); \
+	test -n "$$f" || { echo "no logs/*.out yet" >&2; exit 1; }; \
+	echo "== $$f"; tail -f "$$f"
+
+# --- misc -------------------------------------------------------------------
+.PHONY: shell
+shell: build
+	docker run --rm -it --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
+	    -v "$(REPO)":/work -w /work/training $(IMAGE) bash
+
+.PHONY: clean distclean
+clean:
+	rm -rf output synthetic jobtest knee_multicoil_*_synthetic.tar
+
+distclean: clean
+	rm -rf .make logs runs
+	-docker rmi $(IMAGE)

@@ -1,0 +1,100 @@
+# train.sub: HTCondor submit file for E2E VarNet training on CHTC.
+# Submit from this directory via ./submit.sh (or `make submit-model1`), which
+# creates the log/run directories, applies the per-model macros, and checks
+# that the W&B key is exported first.
+#
+#   ./submit.sh model1                     4x only
+#   ./submit.sh model2                     2x/4x/6x/8x, one rate drawn per sample
+#   ./submit.sh model1 resume=runs/model1/123/checkpoints/last.ckpt
+#   ./submit.sh model2 max_epochs=2 extra_args="--limit_train_batches 20"
+#
+# Edit `image` below before first use. `staging` is this account's personal
+# /staging directory on ap2001 (confirmed writable 2026-09-10). If access to
+# /staging/groups/kamilov_group/Kamilov-SciAI-datasets is granted later, this
+# one macro is the only thing to repoint.
+
+staging    = /staging/a/apryan3/fastmri
+image      = docker://genjigod/fastmri-train:2026-09
+
+# --- what to train -----------------------------------------------------------
+# The two lists are paired elementwise (fastmri.data.subsample.MaskFunc) and
+# one pair is drawn uniformly per training sample. Defaults are model 1;
+# submit.sh overrides them for model 2. center_fractions follow the fastMRI
+# convention 0.32 / R (0.08 at 4x, 0.04 at 8x).
+model            = model1
+accelerations    = 4
+center_fractions = 0.08
+mask_type        = equispaced_fraction
+max_epochs       = 50
+# Same run_name across resubmissions of one run keeps a single W&B run;
+# change it (run_name=varnet-model1-seed7) for a genuinely new run.
+run_name         = varnet-$(model)
+extra_args       =
+arguments        = --run_name $(run_name) --accelerations $(accelerations) --center_fractions $(center_fractions) --mask_type $(mask_type) --max_epochs $(max_epochs) --gpus 1 $(extra_args)
+
+# --- container ---------------------------------------------------------------
+universe        = container
+container_image = $(image)
+executable      = run_train.sh
+
+# --- input files -------------------------------------------------------------
+# Large inputs live in /staging and are transferred into the job scratch by
+# HTCondor, never read directly. CHTC's size rule: osdf:///chtc/staging/<path>
+# for 1-30 GB, file:///staging/<path> for 30 GB and up. Override for subsets:
+#   ./submit.sh model1 train_data=osdf:///chtc/staging/a/apryan3/fastmri/knee_multicoil_train_subset.tar
+train_data      = file://$(staging)/knee_multicoil_train.tar.xz
+val_data        = file://$(staging)/knee_multicoil_val.tar.xz
+# `resume` is only defined when passed on the command line (see submit.sh).
+if defined resume
+  transfer_input_files = train_wandb.py, $(train_data), $(val_data), $(resume)
+else
+  transfer_input_files = train_wandb.py, $(train_data), $(val_data)
+endif
+should_transfer_files    = YES
+# ON_EXIT_OR_EVICT: when the job is evicted, output/ is transferred back to
+# the spool and delivered into the sandbox again when the job restarts, so
+# run_train.sh finds output/checkpoints/last.ckpt and training resumes.
+when_to_transfer_output  = ON_EXIT_OR_EVICT
+
+# --- output files ------------------------------------------------------------
+# output/checkpoints/{last.ckpt, epoch=*.ckpt}, output/wandb/ (offline run if
+# no key), output/lightning_logs/ (TensorBoard when W&B is disabled)
+transfer_output_files   = output
+transfer_output_remaps  = "output = runs/$(model)/$(Cluster)"
+
+# --- secrets -----------------------------------------------------------------
+# Only these names are copied from the submitting shell, and only if set. The
+# key never appears in this file or in any committed file. It does appear in
+# the job ClassAd (condor_q -l), readable by you and CHTC admins only.
+getenv          = WANDB_API_KEY, WANDB_ENTITY, WANDB_PROJECT
+environment     = "WANDB_PROJECT=fastmri-varnet-train"
+
+# --- resources ---------------------------------------------------------------
+# request_disk covers peak scratch during extraction: run_train.sh deletes a
+# tarball only after `xz | tar` finishes, so compressed + extracted coexist.
+# The val split alone is 93.8 GB compressed, ~192 GB extracted. Size this from
+# the tarballs actually staged (du -sh on /staging) and override on the
+# command line: ./submit.sh model1 request_disk=600GB
+#
+# request_cpus: DataLoader workers (--num_workers, default 4) plus the main
+# process. HasCHTCStaging selects slots that can read /staging inputs.
+requirements    = (Target.HasCHTCStaging == true)
+request_cpus    = 8
+request_memory  = 48GB
+request_disk    = 350GB
+request_gpus    = 1
+gpus_minimum_memory     = 24000
+gpus_minimum_capability = 7.0
++WantGPULab     = true
+# "long" is the multi-day GPU Lab class. A 50-epoch multicoil run will still
+# outlast it; see README "Resuming" for what to do when the job is removed.
++GPUJobLength   = "long"
+
+# --- logs ------------------------------------------------------------------
+log             = logs/$(model)_$(Cluster).log
+output          = logs/$(model)_$(Cluster)_$(Process).out
+error           = logs/$(model)_$(Cluster)_$(Process).err
+stream_output   = True
+stream_error    = True
+
+queue 1
