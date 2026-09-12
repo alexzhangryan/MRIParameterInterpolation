@@ -102,16 +102,57 @@ for split in multicoil_train multicoil_val; do
 done
 
 # ---- train ------------------------------------------------------------------
-# Forward SIGTERM (HTCondor's eviction notice) to Python so Lightning can stop
-# cleanly; the checkpoint on disk from the last validation epoch is what gets
-# resumed either way.
+# Eviction handling. HTCondor vacates a job by sending SIGTERM to the executable
+# and SIGKILLing the whole thing after MachineMaxVacateTime. Everything below
+# exists so the cleanup at the bottom -- the symlink sweep in particular --
+# always runs before that hard kill, because output transfer happens on eviction
+# too (when_to_transfer_output = ON_EXIT_OR_EVICT) and a surviving symlink holds
+# the job. `make job-evict` tests exactly this.
+#
+# Two facts drive the shape of it, both measured rather than assumed:
+#
+#  1. pytorch-lightning 1.9.5 installs NO SIGTERM handler here, so python takes
+#     the default disposition and dies at once; the observed exit code is 143
+#     (128 + SIGTERM), not a clean 0. The grace loop therefore almost always
+#     finishes in about a second. It is kept as a bounded safety net for an
+#     in-flight torch.save, and in case a future torch/Lightning does trap the
+#     signal -- never as an unbounded wait, which would run past the SIGKILL and
+#     skip the cleanup entirely.
+#  2. `wait` returns immediately with status >128 when a trapped signal arrives,
+#     WITHOUT reaping the child. A single bare `wait` would let this script exit
+#     while python was still running and writing into output/. Hence the re-wait
+#     loop below.
+#
+# Keeping python a CHILD of this script rather than the job executable is
+# load-bearing for (1): the kernel discards an unhandled signal sent to PID 1,
+# so a container running python directly would ignore the vacate notice and
+# train on until the SIGKILL. Verified both ways.
+#
+# Nothing is lost by python dying here: the checkpoint resumed from is the one
+# ModelCheckpoint wrote at the last completed validation epoch, already on disk.
+VACATE_GRACE="${VACATE_GRACE:-20}"
+PY=
+
+on_term() {
+  echo "[run_train] SIGTERM received (HTCondor eviction notice)"
+  [ -n "$PY" ] || return 0
+  kill -TERM "$PY" 2>/dev/null
+  local i=0
+  while [ "$i" -lt "$VACATE_GRACE" ]; do
+    kill -0 "$PY" 2>/dev/null || { echo "[run_train] python exited after ${i}s"; return 0; }
+    sleep 1
+    i=$(( i + 1 ))
+  done
+  echo "[run_train] python still running ${VACATE_GRACE}s after SIGTERM (expected: PL 1.9 ignores it), sending SIGKILL"
+  kill -KILL "$PY" 2>/dev/null
+}
+trap on_term TERM INT
+
 python train_wandb.py --data_path data/knee --default_root_dir output "$@" &
 PY=$!
-trap 'echo "[run_train] SIGTERM received, forwarding to python"; kill -TERM $PY 2>/dev/null' TERM INT
-wait $PY
-RC=$?
+wait "$PY"; RC=$?
+while [ "$RC" -gt 128 ] && kill -0 "$PY" 2>/dev/null; do wait "$PY"; RC=$?; done
 trap - TERM INT
-
 echo "[run_train] exit code $RC"
 # HTCondor cannot transfer a symlink to a directory and wandb creates
 # output/wandb/latest-run -> run-<id>, which holds the job on output

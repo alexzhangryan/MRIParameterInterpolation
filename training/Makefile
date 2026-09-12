@@ -95,6 +95,7 @@ help:
 	@echo "  make smoke           train_wandb.py on synthetic data, then resume from last.ckpt"
 	@echo "  make smoke-wandb     same, with the W&B logger attached (offline): covers log_image"
 	@echo "  make job-smoke       run_train.sh the way HTCondor will, twice (fresh + evicted)"
+	@echo "  make job-evict       SIGTERM a running job: eviction cleanup + last.ckpt survive"
 	@echo "  make shell           interactive shell in the image, repo mounted at /work"
 	@echo
 	@echo "  ACCESS POINT (ap2001.chtc.wisc.edu, WANDB_API_KEY exported):"
@@ -233,6 +234,57 @@ job-smoke: build check-eol knee_multicoil_train_synthetic.tar
 	@echo
 	@echo "job-smoke passed: extraction, split discovery, output/ contract, and resume-after-eviction."
 
+# --- smoke: the eviction path ------------------------------------------------
+# HTCondor vacates a multi-day GPU Lab job by sending SIGTERM to the executable
+# and SIGKILLing the whole job after MachineMaxVacateTime. Neither smoke target
+# above goes near that: both let training finish on its own. This one starts
+# run_train.sh with W&B attached, SIGTERMs it mid-training the way the startd
+# does, and checks the script actually stops and finishes its cleanup.
+#
+# It exists because the eviction path was never exercised and turned out to rest
+# on a wrong assumption: bash's `wait` returns without reaping the child as soon
+# as a trapped signal arrives, so the script was exiting while python was still
+# writing into output/. The obvious "just wait longer" fix is worse -- if python
+# ever does trap SIGTERM, an unbounded wait runs past HTCondor's SIGKILL and the
+# symlink sweep never happens, re-holding the job on output transfer. This test
+# pins down the behaviour either way. VACATE_GRACE is shortened here for speed.
+.PHONY: job-evict
+job-evict: build check-eol knee_multicoil_train_synthetic.tar
+	rm -rf evicttest && mkdir -p evicttest
+	cp train_wandb.py run_train.sh knee_multicoil_*_synthetic.tar evicttest/
+	-@$(DOCKER) rm -f fastmri-evict >/dev/null 2>&1 || true
+	$(DOCKER) run -d --name fastmri-evict --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) \
+	    $(ENVFLAGS) -e KEEP_TARBALL=1 -e VACATE_GRACE=5 \
+	    -v "$(REPO)":/work -w /work/training/evicttest $(IMAGE) \
+	    bash run_train.sh --run_name job-evict --accelerations 4 --center_fractions 0.08 \
+	        --gpus $(GPUS) --max_epochs 10000 $(SMOKE_ARCH) --num_workers 0 $(EXTRA)
+	@echo "--- waiting for training to start, then SIGTERM (what HTCondor sends on a vacate) ---"
+	@for i in $$(seq 1 150); do \
+	   $(DOCKER) logs fastmri-evict 2>&1 | tr '\r' '\n' | grep -q "^Epoch 1" && break; sleep 2; done
+	@$(DOCKER) logs fastmri-evict 2>&1 | tr '\r' '\n' | grep -q "^Epoch 1" || { \
+	   echo "FAILED: training never started, nothing to evict" >&2; \
+	   $(DOCKER) logs fastmri-evict 2>&1 | tail -20 >&2; $(DOCKER) rm -f fastmri-evict >/dev/null; exit 1; }
+	@$(DOCKER) kill -s TERM fastmri-evict >/dev/null
+	@t0=$$(date +%s); \
+	 while [ "$$($(DOCKER) inspect -f '{{.State.Running}}' fastmri-evict)" = "true" ]; do \
+	   if [ $$(( $$(date +%s) - t0 )) -gt 90 ]; then \
+	     echo "FAILED: run_train.sh did not exit within 90s of SIGTERM; on CHTC this is the" >&2; \
+	     echo "        SIGKILL case, where the cleanup below never runs." >&2; \
+	     $(DOCKER) rm -f fastmri-evict >/dev/null; exit 1; \
+	   fi; sleep 1; \
+	 done; echo "exited $$(( $$(date +%s) - t0 ))s after SIGTERM"
+	@$(DOCKER) logs fastmri-evict 2>&1 | tr '\r' '\n' | grep -E "^\[run_train\] (SIGTERM|python|exit code)"
+	@$(DOCKER) logs fastmri-evict 2>&1 | tr '\r' '\n' | grep -q "SIGTERM received" || { \
+	   echo "FAILED: the trap never fired" >&2; $(DOCKER) rm -f fastmri-evict >/dev/null; exit 1; }
+	@$(DOCKER) rm -f fastmri-evict >/dev/null
+	@l=$$(find evicttest/output -type l | tr '\n' ' '); \
+	 test -z "$$l" || { echo "FAILED: symlinks survived the cleanup, HTCondor would hold the" >&2; \
+	   echo "        job on output transfer: $$l" >&2; exit 1; }
+	@test -s evicttest/output/checkpoints/last.ckpt || { \
+	   echo "FAILED: no last.ckpt, the evicted run would restart from scratch" >&2; exit 1; }
+	@echo
+	@echo "job-evict passed: SIGTERM stops the job, the symlink sweep runs, last.ckpt survives."
+
 # --- CHTC access point ------------------------------------------------------
 .PHONY: submit submit-model1 submit-model2 resume status logs subset-val subset-train
 # README section 3b: build the subset tarballs that fit under the /staging
@@ -279,7 +331,7 @@ shell: build
 
 .PHONY: clean distclean
 clean:
-	rm -rf output synthetic jobtest knee_multicoil_*_synthetic.tar
+	rm -rf output synthetic jobtest evicttest knee_multicoil_*_synthetic.tar
 
 distclean: clean
 	rm -rf .make logs runs

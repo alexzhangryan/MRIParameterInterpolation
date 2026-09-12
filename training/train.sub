@@ -98,7 +98,7 @@ request_cpus    = 8
 request_memory  = 48GB
 request_disk    = 260GB
 request_gpus    = 1
-gpus_minimum_memory     = 24000
+gpus_minimum_memory     = 24000M
 gpus_minimum_capability = 7.0
 # Upper bound matters: this image's PyTorch ships kernels for sm_37..sm_90.
 # An sm_120 (Blackwell, Capability 12.0) slot matches happily and then dies

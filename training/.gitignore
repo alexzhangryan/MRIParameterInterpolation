@@ -12,3 +12,5 @@ lightning_logs/
 *.tar.xz
 *.ckpt
 .env
+evicttest/
+dataset_cache.pkl
