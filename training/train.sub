@@ -111,14 +111,21 @@ gpus_maximum_capability = 9.0
 +GPUJobLength   = "long"
 
 # --- transient node failures -------------------------------------------------
-# A hold with code 6 before the job produces anything is an execute-node
-# problem (docker daemon, NVIDIA container hook), not a bug in this run: the
-# same submission on the next slot usually just works. Release it a few times
-# so one bad node cannot end a multi-day run, and stop after that so a genuine
-# repeatable failure still surfaces as a hold instead of looping forever.
-# NumJobStarts does not count these (nothing started), hence the counter.
+# Two hold codes mean "the node, not this run" and are released automatically:
+#   6  execute-node problem before anything ran (docker daemon, NVIDIA
+#      container hook), e.g. gpu4003 on 2026-09-12.
+#   13 input transfer failed. 2026-09-12 gpu4000 pulled the 63 GiB train
+#      tarball from /staging fine, then curl_plugin gave up on the 19 GiB val
+#      tarball 8 GiB in ("Aborted due to lack of progress"): a stalled
+#      /staging read, nothing to do with the files, which were intact.
+# In both cases the same submission on the next attempt usually just works,
+# and nothing of ours has run yet, so a retry costs only the transfer time.
+# Release a few times so one bad node or one NFS stall cannot end a multi-day
+# run, and stop after that so a genuine repeatable failure (a missing staging
+# file also holds with code 13) still surfaces as a hold instead of looping.
+# NumJobStarts does not count these (nothing started), hence NumSystemHolds.
 max_retries     = 5
-periodic_release = (HoldReasonCode == 6) && (NumSystemHolds < 5) && ((time() - EnteredCurrentStatus) > 300)
+periodic_release = (HoldReasonCode == 6 || HoldReasonCode == 13) && (NumSystemHolds < 5) && ((time() - EnteredCurrentStatus) > 300)
 
 # --- logs ------------------------------------------------------------------
 log             = logs/$(model)_$(Cluster).log

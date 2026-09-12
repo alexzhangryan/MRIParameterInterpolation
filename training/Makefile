@@ -107,6 +107,7 @@ help:
 	@echo "  make resume MODEL=model1 CKPT=runs/<model>/<Cluster>/checkpoints/last.ckpt"
 	@echo "  make status          condor_q for your jobs"
 	@echo "  make logs            tail the newest job .out"
+	@echo "  make why JOB=<Cluster>   hold reason + log tails for a held job"
 	@echo
 	@echo "  make clean           remove smoke artefacts;  make distclean also drops logs/ runs/ and the image"
 	@echo
@@ -286,7 +287,7 @@ job-evict: build check-eol knee_multicoil_train_synthetic.tar
 	@echo "job-evict passed: SIGTERM stops the job, the symlink sweep runs, last.ckpt survives."
 
 # --- CHTC access point ------------------------------------------------------
-.PHONY: submit submit-model1 submit-model2 resume status logs subset-val subset-train
+.PHONY: submit submit-model1 submit-model2 resume status logs why subset-val subset-train
 # README section 3b: build the subset tarballs that fit under the /staging
 # quota. subset-val brings ~N_VAL GB back to this directory; subset-train
 # needs FASTMRI_TRAIN_URL (from .env) and writes straight into /staging.
@@ -317,6 +318,13 @@ resume:
 
 status:
 	condor_q -nobatch
+
+# make why JOB=<Cluster>[.<Proc>]   why a job is held, plus the tail of its logs
+why:
+	@test -n "$(JOB)" || { echo "usage: make why JOB=<Cluster>[.<Proc>]" >&2; exit 1; }
+	@echo "== hold"; condor_q $(JOB) -af:t HoldReasonCode HoldReasonSubCode NumJobStarts NumSystemHolds 	    LastRemoteHost RemoteWallClockTime MemoryUsage RequestMemory DiskUsage RequestDisk ExitCode ExitBySignal ExitSignal
+	@condor_q $(JOB) -af HoldReason
+	@c=$${JOB%%.*}; for f in logs/*_$$c.log logs/*_$$c_*.out logs/*_$$c_*.err; do 	    [ -f "$$f" ] || continue; echo "== $$f"; tail -n 60 "$$f"; done
 
 logs:
 	@f=$$(ls -t logs/*.out 2>/dev/null | head -1); \
