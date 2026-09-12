@@ -92,6 +92,11 @@ request_disk    = 260GB
 request_gpus    = 1
 gpus_minimum_memory     = 24000
 gpus_minimum_capability = 7.0
+# Upper bound matters: this image's PyTorch ships kernels for sm_37..sm_90.
+# An sm_120 (Blackwell, Capability 12.0) slot matches happily and then dies
+# with "no kernel image is available for execution on the device" as soon as
+# the first kernel launches. Raise this only with a PyTorch built for it.
+gpus_maximum_capability = 9.0
 +WantGPULab     = true
 # "long" is the multi-day GPU Lab class. A 50-epoch multicoil run will still
 # outlast it; see README "Resuming" for what to do when the job is removed.

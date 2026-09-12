@@ -113,6 +113,11 @@ RC=$?
 trap - TERM INT
 
 echo "[run_train] exit code $RC"
+# HTCondor cannot transfer a symlink to a directory and wandb creates
+# output/wandb/latest-run -> run-<id>, which holds the job on output
+# transfer (ON_EXIT_OR_EVICT, so on eviction too). Drop every symlink
+# under output/ before the sandbox goes back; the real run dir stays.
+find output -type l -delete
 ls -la output output/checkpoints
 # output/ must exist and be non-empty for transfer_output_files even on failure
 [ -n "$(ls -A output)" ] || echo "no output produced, rc=$RC" > output/EMPTY
