@@ -84,8 +84,16 @@ environment     = "WANDB_PROJECT=fastmri-varnet-train"
 # command line: ./submit.sh model1 request_disk=600GB
 #
 # request_cpus: DataLoader workers (--num_workers, default 4) plus the main
-# process. HasCHTCStaging selects slots that can read /staging inputs.
-requirements    = (Target.HasCHTCStaging == true)
+# process.
+#
+# HasCHTCStaging selects slots that can read /staging inputs. bad_nodes is the
+# escape hatch for an execute node whose GPU stack is broken in a way that is
+# not our problem to fix: 2026-09-12 gpu4003 held a job with code 6 because the
+# NVIDIA container hook failed to symlink libcuda.so ("bad file descriptor")
+# before any of our code ran. Add or clear names here, or override for one
+# submission:  ./submit.sh model1 bad_nodes='"gpu4003.chtc.wisc.edu"'
+bad_nodes       = "gpu4003.chtc.wisc.edu"
+requirements    = (Target.HasCHTCStaging == true) && !stringListMember(Target.Machine, $(bad_nodes))
 request_cpus    = 8
 request_memory  = 48GB
 request_disk    = 260GB
@@ -101,6 +109,16 @@ gpus_maximum_capability = 9.0
 # "long" is the multi-day GPU Lab class. A 50-epoch multicoil run will still
 # outlast it; see README "Resuming" for what to do when the job is removed.
 +GPUJobLength   = "long"
+
+# --- transient node failures -------------------------------------------------
+# A hold with code 6 before the job produces anything is an execute-node
+# problem (docker daemon, NVIDIA container hook), not a bug in this run: the
+# same submission on the next slot usually just works. Release it a few times
+# so one bad node cannot end a multi-day run, and stop after that so a genuine
+# repeatable failure still surfaces as a hold instead of looping forever.
+# NumJobStarts does not count these (nothing started), hence the counter.
+max_retries     = 5
+periodic_release = (HoldReasonCode == 6) && (NumSystemHolds < 5) && ((time() - EnteredCurrentStatus) > 300)
 
 # --- logs ------------------------------------------------------------------
 log             = logs/$(model)_$(Cluster).log
