@@ -93,6 +93,7 @@ help:
 	@echo "  make build           build the image for $(PLATFORM) (cached)"
 	@echo "  make push IMAGE=<user>/fastmri-train:2026-09   publish for CHTC"
 	@echo "  make smoke           train_wandb.py on synthetic data, then resume from last.ckpt"
+	@echo "  make smoke-wandb     same, with the W&B logger attached (offline): covers log_image"
 	@echo "  make job-smoke       run_train.sh the way HTCondor will, twice (fresh + evicted)"
 	@echo "  make shell           interactive shell in the image, repo mounted at /work"
 	@echo
@@ -188,6 +189,24 @@ smoke: build check-eol synthetic
 	  echo "FAILED: second run did not resume from last.ckpt" >&2; exit 1; }
 	@echo
 	@echo "smoke passed: training runs, last.ckpt is written, and a rerun resumes from it."
+
+# The W&B logger is the one the cluster actually uses, and SMOKE_RUN above
+# disables it -- so `make smoke` exercises TensorBoardLogger, whose experiment
+# object is the only one that really has add_image. Every W&B-specific path was
+# therefore untested, which is how an AttributeError in MriModule.log_image
+# reached CHTC and killed three jobs a full epoch in. This target is the same
+# smoke with W&B attached; ENVFLAGS already pins WANDB_MODE=offline, so it needs
+# no key and uploads nothing. Target-specific variables reach prerequisites, so
+# dropping --no_wandb from SMOKE_RUN here is the whole difference.
+.PHONY: smoke-wandb
+smoke-wandb: SMOKE_RUN := --limit_train_batches 4 --limit_val_batches 2 --num_workers 0
+smoke-wandb: smoke
+	@ls output/wandb/*/files/media/images/* >/dev/null 2>&1 || { \
+	  echo "FAILED: no media under output/wandb/*/files/media/images: validation never" >&2; \
+	  echo "        called log_image, so this proved nothing about the W&B path." >&2; \
+	  exit 1; }
+	@echo
+	@echo "smoke-wandb passed: validation images reached the W&B logger, not just TensorBoard."
 
 # --- smoke: the job executable ----------------------------------------------
 # run_train.sh does what the driver does not: tarball extraction, split

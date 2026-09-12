@@ -31,6 +31,7 @@ import pathlib
 from argparse import ArgumentParser
 from typing import Optional
 
+import numpy as np
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
@@ -38,6 +39,35 @@ from pytorch_lightning.loggers import WandbLogger
 from fastmri.data.subsample import create_mask_for_mask_type
 from fastmri.data.transforms import VarNetDataTransform
 from fastmri.pl_modules import FastMriDataModule, VarNetModule
+
+
+class WandbSafeVarNetModule(VarNetModule):
+    """VarNetModule whose validation image logging survives a non-TensorBoard logger.
+
+    fastmri.pl_modules.MriModule.log_image is written against TensorBoard:
+
+        self.logger.experiment.add_image(name, image, global_step=self.global_step)
+
+    Under WandbLogger, .experiment is a wandb Run, which has no add_image, so
+    validation_step_end raises AttributeError the first time it reaches a batch
+    in val_log_indices -- a few batches into the first validation pass, after a
+    full epoch of training and before ModelCheckpoint has written anything.
+    Overriding log_image is enough; every other MriModule hook is
+    logger-agnostic (self.log / log_dict).
+    """
+
+    def log_image(self, name, image):
+        logger = self.logger
+        if isinstance(logger, WandbLogger):
+            # MriModule passes (1, H, W) already normalised to [0, 1]. Convert
+            # to uint8 here rather than relying on wandb's float handling,
+            # which differs across wandb versions.
+            arr = image.detach().squeeze().cpu().numpy()
+            arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
+            logger.log_image(key=name, images=[arr], step=self.global_step)
+        elif hasattr(getattr(logger, "experiment", None), "add_image"):
+            super().log_image(name, image)
+        # any other logger (or none): drop the image rather than kill the run
 
 
 def latest_checkpoint(checkpoint_dir: pathlib.Path) -> Optional[str]:
@@ -104,7 +134,7 @@ def cli_main(args):
     # ------------
     # model
     # ------------
-    model = VarNetModule(
+    model = WandbSafeVarNetModule(
         num_cascades=args.num_cascades,
         pools=args.pools,
         chans=args.chans,
