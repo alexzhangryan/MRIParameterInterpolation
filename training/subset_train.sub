@@ -18,9 +18,19 @@
 # your shell, never from this file, and is visible in the job ClassAd only to
 # you and CHTC admins.
 
-staging         = /staging/a/apryan3/fastmri
-image           = docker://genjigod/fastmri-train:2026-09
-train_prefix_gb = 65
+# Defaults are guarded because condor_submit parses a command-line
+# `train_prefix_gb=50` as if it sat at the top of this file: an unguarded
+# assignment below would overwrite it and the override would silently do
+# nothing. See train.sub.
+if ! defined staging
+  staging = /staging/a/apryan3/fastmri
+endif
+if ! defined image
+  image = docker://genjigod/fastmri-train:2026-09
+endif
+if ! defined train_prefix_gb
+  train_prefix_gb = 65
+endif
 
 universe        = container
 container_image = $(image)

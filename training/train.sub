@@ -13,23 +13,63 @@
 # /staging/groups/kamilov_group/Kamilov-SciAI-datasets is granted later, this
 # one macro is the only thing to repoint.
 
-staging    = /staging/a/apryan3/fastmri
-image      = docker://genjigod/fastmri-train:2026-09
+# --- how the defaults in this file work --------------------------------------
+# Every macro below is a DEFAULT ONLY and is wrapped in `if ! defined`. That
+# guard is load-bearing, not style.
+#
+# condor_submit parses a command-line `name=value` "as if it was placed at the
+# beginning of the submit description file" (condor_submit man page). A plain
+# `model = model1` line here is therefore parsed AFTER it and silently
+# overwrites it. That bug shipped and cost a run: on 2026-09-13
+# `make submit-model2` submitted with model=model2 accelerations="2 4 6 8" and
+# HTCondor built the job ad with --run_name varnet-model1 --accelerations 4.
+# It trained model 1's schedule for three hours and, because --run_name is also
+# the W&B run id (train_wandb.py build_logger, resume="allow"), logged into the
+# existing varnet-model1 run instead of creating its own.
+#
+# So: any knob meant to be overridable from the command line gets the guard.
+# Verify after editing, on the access point, without submitting:
+#   condor_submit -dry-run /dev/stdout train.sub model=model2 \
+#       accelerations="2 4 6 8" center_fractions="0.16 0.08 0.0533 0.04" | grep Args
+# `-append name=value` is NOT an alternative here: appended lines land just
+# before `queue`, after the `if defined resume` test below has already run.
+if ! defined staging
+  staging = /staging/a/apryan3/fastmri
+endif
+if ! defined image
+  image = docker://genjigod/fastmri-train:2026-09
+endif
 
 # --- what to train -----------------------------------------------------------
 # The two lists are paired elementwise (fastmri.data.subsample.MaskFunc) and
 # one pair is drawn uniformly per training sample. Defaults are model 1;
 # submit.sh overrides them for model 2. center_fractions follow the fastMRI
 # convention 0.32 / R (0.08 at 4x, 0.04 at 8x).
-model            = model1
-accelerations    = 4
-center_fractions = 0.08
-mask_type        = equispaced_fraction
-max_epochs       = 50
-# Same run_name across resubmissions of one run keeps a single W&B run;
-# change it (run_name=varnet-model1-seed7) for a genuinely new run.
-run_name         = varnet-$(model)
-extra_args       =
+if ! defined model
+  model = model1
+endif
+if ! defined accelerations
+  accelerations = 4
+endif
+if ! defined center_fractions
+  center_fractions = 0.08
+endif
+if ! defined mask_type
+  mask_type = equispaced_fraction
+endif
+if ! defined max_epochs
+  max_epochs = 50
+endif
+# run_name is the W&B run NAME and the W&B run ID. Two trainings that share it
+# become one run in W&B; a resubmission of the same training must keep it.
+# Deriving it from $(model) is what keeps model 1 and model 2 apart, so it is
+# only correct as long as $(model) is.
+if ! defined run_name
+  run_name = varnet-$(model)
+endif
+if ! defined extra_args
+  extra_args =
+endif
 arguments        = --run_name $(run_name) --accelerations $(accelerations) --center_fractions $(center_fractions) --mask_type $(mask_type) --max_epochs $(max_epochs) --gpus 1 $(extra_args)
 
 # --- container ---------------------------------------------------------------
@@ -48,8 +88,12 @@ executable      = run_train.sh
 # every knee_multicoil_*.tar(.xz) it is given, so several can be listed.)
 # CHTC's size rule: osdf:///chtc/staging/<path> for 1-30 GB inputs,
 # file:///staging/<path> from 30 GB up; file:// works for both.
-train_data      = file://$(staging)/knee_multicoil_train_subset.tar.xz
-val_data        = file://$(staging)/knee_multicoil_val_subset.tar
+if ! defined train_data
+  train_data = file://$(staging)/knee_multicoil_train_subset.tar.xz
+endif
+if ! defined val_data
+  val_data = file://$(staging)/knee_multicoil_val_subset.tar
+endif
 # `resume` is only defined when passed on the command line (see submit.sh).
 if defined resume
   transfer_input_files = train_wandb.py, $(train_data), $(val_data), $(resume)
@@ -83,21 +127,44 @@ environment     = "WANDB_PROJECT=fastmri-varnet-train"
 # (du -sh on /staging; a .tar.xz extracts to ~1.9x) and override on the
 # command line: ./submit.sh model1 request_disk=600GB
 #
-# request_cpus: DataLoader workers (--num_workers, default 4) plus the main
-# process.
-#
 # HasCHTCStaging selects slots that can read /staging inputs. bad_nodes is the
 # escape hatch for an execute node whose GPU stack is broken in a way that is
 # not our problem to fix: 2026-09-12 gpu4003 held a job with code 6 because the
 # NVIDIA container hook failed to symlink libcuda.so ("bad file descriptor")
 # before any of our code ran. Add or clear names here, or override for one
 # submission:  ./submit.sh model1 bad_nodes='"gpu4003.chtc.wisc.edu"'
-bad_nodes       = "gpu4003.chtc.wisc.edu"
+if ! defined bad_nodes
+  bad_nodes = "gpu4003.chtc.wisc.edu"
+endif
 requirements    = (Target.HasCHTCStaging == true) && !stringListMember(Target.Machine, $(bad_nodes))
-request_cpus    = 8
-request_memory  = 48GB
-request_disk    = 260GB
-request_gpus    = 1
+# request_cpus and request_memory are the two exceptions to the `if ! defined`
+# rule: condor_submit seeds them into the macro table BEFORE reading this file
+# (they carry HTCondor's own defaults), so the guard never fires and the request
+# silently collapses to 1 CPU and an ImageSize-derived memory figure. Measured,
+# not assumed:
+#   condor_submit -dry-run /dev/stdout train.sub | grep -E 'RequestCpus|RequestMemory'
+# Hence the aliases. Override these two as cpus=16 / mem=64GB, not as
+# request_cpus= / request_memory=, which this file would overwrite.
+# request_disk and request_gpus are NOT pre-seeded, so they take the guard and
+# keep their own names. submit.sh prints all four from the dry-run ad before
+# submitting, so a future HTCondor that pre-seeds one more of them shows up
+# there instead of on the execute node.
+#
+# cpus: DataLoader workers (--num_workers, default 4) plus the main process.
+if ! defined cpus
+  cpus = 8
+endif
+if ! defined mem
+  mem = 48GB
+endif
+request_cpus    = $(cpus)
+request_memory  = $(mem)
+if ! defined request_disk
+  request_disk = 260GB
+endif
+if ! defined request_gpus
+  request_gpus = 1
+endif
 gpus_minimum_memory     = 24000M
 gpus_minimum_capability = 7.0
 # Upper bound matters: this image's PyTorch ships kernels for sm_37..sm_90.

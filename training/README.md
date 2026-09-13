@@ -379,7 +379,25 @@ accelerations="2 4 6 8" center_fractions="0.16 0.08 0.0533 0.04"` and no
 the same thing. Any `name=value` is a `condor_submit` macro override, so every
 knob in `train.sub` (`request_disk`, `max_epochs`, `run_name`, `train_data`,
 `val_data`, `mask_type`, `extra_args`, ...) can be set per submission without
-editing the file. `extra_args` is appended verbatim to `train_wandb.py`,
+editing the file.
+
+That last sentence is only true because every default in `train.sub` is
+wrapped in `if ! defined`. `condor_submit` parses a command-line `name=value`
+*as if it were the first line of the submit file*, so an unguarded
+`model = model1` further down overwrites it, silently. On 2026-09-13 that cost
+a run: `make submit-model2` produced a job ad reading
+`--run_name varnet-model1 --accelerations 4`, so it trained model 1's schedule
+and, because `--run_name` is also the W&B run id, logged into the existing
+`varnet-model1` run instead of its own. Any knob added to `train.sub` needs the
+same guard; `submit.sh` now dry-runs before every submission and refuses to
+submit if the preset did not reach the job ad.
+
+Two exceptions, both verified with `-dry-run`: `request_cpus` and
+`request_memory` are already in `condor_submit`'s macro table before the file
+is read, so `if ! defined` never fires for them and guarding them would drop
+the job to 1 CPU. Override those two as `cpus=16` / `mem=64GB`.
+
+`extra_args` is appended verbatim to `train_wandb.py`,
 which accepts every `pl.Trainer`, `FastMriDataModule` and `VarNetModule`
 argument (`--num_workers`, `--sample_rate`, `--lr`, `--deterministic false`,
 ...).

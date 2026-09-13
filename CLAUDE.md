@@ -18,6 +18,8 @@ Part of ongoing work with Prof. Kamilov's Computational Imaging Group.
 - Observability: PyTorch Lightning's `MriModule` already logs val loss/NMSE/SSIM/PSNR + sample images to TensorBoard by default with zero config; Weights & Biases can be wired in like the prior project if wanted (needs a freshly rotated API key, injected as an env var, never hardcoded in a `.sub` file)
 - Known VarNet reproduction caveats vs. the original paper: variable `center_fractions` instead of fixed center lines, joint 4x/8x acceleration training instead of separate models, no explicit acceleration-rate conditioning signal today (relevant directly to Phase B)
 
+**Git: NEVER commit or push code yourself.** Do not run `git commit`, `git push`, `git add`, or anything else that changes the repository state, under any circumstances, even if it seems implied by the task. The user commits and pushes by hand. When a change is ready, PROVIDE a ready-to-paste `git add`/`git commit -m "..."` command with a suggested message and stop there. Read-only git commands (`git status`, `git diff`, `git log`) are fine.
+
 **Security:** a prior CHTC project in this user's `Research/` folder has a Weights & Biases API key committed in git history (`inpainting.sub`) in a public repo. Never replicate that pattern here — no secrets in `.sub` files.
 
 **When helping with this project:**

@@ -62,6 +62,45 @@ EOF
   exit 1
 fi
 
+# --- preflight: prove the preset survived into the job ad --------------------
+# condor_submit parses `name=value` from the command line as if it were at the
+# TOP of the submit file, so any unguarded assignment in train.sub wins over
+# the preset above. That failure is silent and expensive: on 2026-09-13 a
+# `model2` submission trained acceleration 4 and logged into the varnet-model1
+# W&B run for three hours before anyone noticed. train.sub now guards its
+# defaults with `if ! defined`; this check is what keeps it that way.
+# -dry-run builds the job ad locally and never contacts the schedd.
+DRY="$(mktemp)"
+trap 'rm -f "$DRY"' EXIT
+condor_submit -dry-run "$DRY" "$SUB" "${PRESET[@]}" "$@" >/dev/null
+ARGS_LINE="$(grep -m1 -E '^(Args|Arguments) *=' "$DRY" || true)"
+echo "job args: ${ARGS_LINE#*=}"
+# Print the resource requests as HTCondor actually resolved them. request_cpus
+# and request_memory are pre-seeded in the macro table, so a mistake there does
+# not raise an error, it just quietly asks for 1 CPU (see train.sub).
+grep -E '^Request(Cpus|Memory|Disk|GPUs) *=' "$DRY" | tr '\n' ' '; echo
+
+# Only assert on knobs the caller did not override by hand.
+want_name="varnet-$MODEL"
+want_accel="$(printf '%s' "${PRESET[1]}" | sed 's/^accelerations=//')"
+fail=""
+case " $* " in *" run_name="*) ;; *)
+  case "$ARGS_LINE" in *"--run_name $want_name "*) ;; *) fail="$fail --run_name $want_name" ;; esac ;;
+esac
+case " $* " in *" accelerations="*) ;; *)
+  case "$ARGS_LINE" in *"--accelerations $want_accel "*) ;; *) fail="$fail --accelerations $want_accel" ;; esac ;;
+esac
+if [ -n "$fail" ]; then
+  cat >&2 <<EOF
+refusing to submit: the $MODEL preset did not reach the job ad.
+  expected:$fail
+  got:      ${ARGS_LINE#*=}
+A plain assignment in $SUB is overwriting the command-line macro. Wrap that
+line in 'if ! defined <name> / ... / endif' (every other default there is).
+EOF
+  exit 1
+fi
+
 echo "submitting $SUB ${PRESET[*]} $*"
 condor_submit "$SUB" "${PRESET[@]}" "$@"
 echo

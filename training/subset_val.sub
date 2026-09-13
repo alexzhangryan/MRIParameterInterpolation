@@ -10,9 +10,18 @@
 # into /staging by hand (see the README). Home has a 40 GB quota, so keep
 # n_val * ~1 GB comfortably under that.
 
-staging = /staging/a/apryan3/fastmri
-image   = docker://genjigod/fastmri-train:2026-09
-n_val   = 20
+# Defaults are guarded because condor_submit parses a command-line `n_val=30`
+# as if it sat at the top of this file: an unguarded `n_val = 20` below would
+# overwrite it and the override would silently do nothing. See train.sub.
+if ! defined staging
+  staging = /staging/a/apryan3/fastmri
+endif
+if ! defined image
+  image = docker://genjigod/fastmri-train:2026-09
+endif
+if ! defined n_val
+  n_val = 20
+endif
 
 universe        = container
 container_image = $(image)
