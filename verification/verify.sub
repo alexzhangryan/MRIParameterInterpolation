@@ -1,23 +1,24 @@
-# verify.sub: HTCondor submit file for Tier 1 (released-checkpoint evaluation)
-# on CHTC. Submit from this directory via ./submit.sh, which creates the log
-# and run directories and checks that the W&B key is exported first.
+# verify.sub: HTCondor submit file for E2E VarNet evaluation on CHTC.
+# Deliberately the same shape as ../training/train.sub: the same macros, the
+# same guards, the same model presets applied by submit.sh, the same logs/ and
+# runs/<model>/<Cluster>/ layout, the same resources. The only thing that
+# differs is what runs inside the job: verify_varnet.py scores a checkpoint
+# on multicoil_val instead of training one from scratch.
+# Submit from this directory via ./submit.sh (or `make submit-model1`), which
+# creates the log/run directories, applies the per-model macros, checks that
+# the W&B key is exported, and proves with -dry-run that the preset reached
+# the job ad.
 #
-#   ./submit.sh                              full val, 4x and 8x
-#   ./submit.sh model1                       released weights, 4x, on the val subset
-#   ./submit.sh model2                       released weights, 2x/4x/6x/8x, on the val subset
-#   ./submit.sh volume_limit=20              first 20 volumes (smoke run)
-#   ./submit.sh data=knee_multicoil_val_synthetic.tar request_disk=20GB
+#   ./submit.sh model1                     4x only, released weights, val subset
+#   ./submit.sh model2                     2x/4x/6x/8x, every rate scored over the val subset
+#   ./submit.sh model1 ckpt=../training/runs/model1/123/checkpoints/last.ckpt    score a checkpoint you trained
+#   ./submit.sh tier1                      the Claim A sweep: random masks 4x/8x, full 199-volume val
+#   ./submit.sh model1 volume_limit=5 extra_args="--num_workers 0"
 #
-# model1 / model2 are the released-checkpoint halves of the 2x2 in
-# README "Pretrained vs. from-scratch": same masks, same val subset and same
-# seed as training/submit.sh model1 / model2, but the NYU leaderboard weights
-# instead of weights trained here. Nothing is trained by this file.
-#
-# `image` and `staging` are both set below. `staging` is this
-# account's personal /staging directory on ap2001, confirmed writable
-# 2026-09-10. The shared group directory
-# /staging/groups/kamilov_group/Kamilov-SciAI-datasets is not readable by this
-# account; if that changes, this one macro is the only thing to repoint.
+# `staging` is this account's personal /staging directory on ap2001
+# (confirmed writable 2026-09-10). If access to
+# /staging/groups/kamilov_group/Kamilov-SciAI-datasets is granted later, this
+# one macro is the only thing to repoint.
 
 # --- how the defaults in this file work --------------------------------------
 # Every macro below is a DEFAULT ONLY and is wrapped in `if ! defined`. That
@@ -25,13 +26,12 @@
 #
 # condor_submit parses a command-line `name=value` "as if it was placed at the
 # beginning of the submit description file" (condor_submit man page). A plain
-# `mask_type = random` line here would therefore be parsed AFTER the preset
-# and silently overwrite it, so `./submit.sh model1` would evaluate the wrong
-# masks on the wrong data and say nothing about it. training/train.sub carries
-# the same guards after exactly that bug cost three hours on 2026-09-13 (see
-# the note in training/submit.sh); submit.sh re-checks the resolved job ad
-# with -dry-run before it submits.
-
+# `model = model1` line here is therefore parsed AFTER it and silently
+# overwrites it. That bug shipped on the training side and cost a run: on
+# 2026-09-13 `make submit-model2` trained model 1's schedule for three hours
+# and logged into the varnet-model1 W&B run (see train.sub). So: any knob
+# meant to be overridable from the command line gets the guard, and submit.sh
+# re-checks the resolved job ad with -dry-run before it submits.
 if ! defined staging
   staging = /staging/a/apryan3/fastmri
 endif
@@ -39,39 +39,39 @@ if ! defined image
   image = docker://genjigod/fastmri-verify:2026-09
 endif
 
-# --- what to run -----------------------------------------------------------
-# `model` names the run and keeps its logs and results apart from every other
-# run: `tier1` for the plain released-checkpoint sweep, `model1` / `model2`
-# for the two that pair with training. `tier` stays tier1 regardless -- it is
-# what run_verify.sh dispatches on, and these are all Tier 1 evaluations.
+# --- what to evaluate --------------------------------------------------------
+# The two lists are paired elementwise (fastmri.data.subsample.MaskFunc) and
+# are the same presets training uses. Training draws one pair per sample;
+# evaluation scores every pair over the whole val set, one pass per rate.
+# Defaults are model 1; submit.sh overrides them for model 2. center_fractions
+# follow the fastMRI convention 0.32 / R (0.08 at 4x, 0.04 at 8x).
 if ! defined model
-  model = tier1
-endif
-if ! defined tier
-  tier = tier1
+  model = model1
 endif
 if ! defined accelerations
-  accelerations = 4 8
+  accelerations = 4
 endif
 if ! defined center_fractions
-  center_fractions = 0.08 0.04
+  center_fractions = 0.08
 endif
 if ! defined mask_type
-  mask_type = random
+  mask_type = equispaced_fraction
 endif
 if ! defined volume_limit
   volume_limit = 0
 endif
-# run_name is the W&B run name and the run_id in results.csv. Deriving it from
-# $(model) is what keeps tier1 / model1 / model2 apart, so it is only correct
-# as long as $(model) is.
+# run_name is the W&B run NAME and the W&B run ID and the run_id in
+# results.csv. Two evaluations that share it become one run in W&B; a
+# resubmission of the same evaluation must keep it. Deriving it from $(model)
+# is what keeps the runs apart, so it is only correct as long as $(model) is.
+# Pass run_name=verify-model1-trained (with ckpt=) for a genuinely new run.
 if ! defined run_name
-  run_name = $(model)-$(Cluster)
+  run_name = verify-$(model)
 endif
 if ! defined extra_args
   extra_args =
 endif
-arguments       = $(tier) --accelerations $(accelerations) --center_fractions $(center_fractions) --mask_type $(mask_type) --volume_limit $(volume_limit) --run_name $(run_name) $(extra_args)
+arguments        = tier1 --run_name $(run_name) --accelerations $(accelerations) --center_fractions $(center_fractions) --mask_type $(mask_type) --volume_limit $(volume_limit) $(extra_args)
 
 # --- container ---------------------------------------------------------------
 universe        = container
@@ -80,39 +80,36 @@ executable      = run_verify.sh
 
 # --- input files -------------------------------------------------------------
 # Large inputs live in /staging and are transferred into the job scratch by
-# HTCondor, never read directly. Personal staging is sharded by the first
-# letter of the netid: /staging/a/apryan3, not /staging/apryan3.
+# HTCondor, never read directly. The default is the 20-volume val subset built
+# by ../training/README.md section 3b (subset_val.sub), the same file
+# train.sub validates against and all that fits under the 100 GB /staging
+# quota. The full 199-volume split, while it is still staged, is
+#   ./submit.sh tier1                    (preset: val_data=...knee_multicoil_val.tar.xz request_disk=320GB)
+# CHTC's size rule: osdf:///chtc/staging/<path> for 1-30 GB inputs,
+# file:///staging/<path> from 30 GB up; file:// works for both.
 #
-# CHTC's size rule for /staging inputs is osdf:///chtc/staging/<path> for
-# 1-30 GB and file:///staging/<path> for 30-100 GB. The val tarball is
-# 93.8 GB, so both inputs use file:// here. A small synthetic subset passed
-# as data=... on the submit.sh command line can use osdf:// instead.
-# The default is the full 199-volume split. The 20-volume subset is the one
-# built by training/subset_val.sub (training/README.md section 3b): it is what
-# model1 / model2 train against, so the presets select it with
-# val_file=knee_multicoil_val_subset.tar. `make subset-val` DELETES the full
-# tarball, so run the plain `./submit.sh` sweep first if the 199-volume
-# number is wanted.
-# `val_file` is just the basename inside $(staging), so a preset only has to
-# pass a plain string; `data` stays overridable wholesale for an osdf:// or
-# synthetic tarball.
-if ! defined val_file
-  val_file = knee_multicoil_val.tar.xz
-endif
-if ! defined data
-  data = file://$(staging)/$(val_file)
+# `ckpt` is the checkpoint to score: the released fastMRI knee model by
+# default, or a Lightning checkpoint from ../training
+# (ckpt=../training/runs/model1/<Cluster>/checkpoints/last.ckpt). run_verify.sh
+# picks up whatever *.pt / *.ckpt lands in the sandbox, and verify_varnet.py
+# reads the architecture (cascades, channels, pools) from the file itself.
+if ! defined val_data
+  val_data = file://$(staging)/knee_multicoil_val_subset.tar
 endif
 if ! defined ckpt
   ckpt = file://$(staging)/knee_leaderboard_state_dict.pt
 endif
-transfer_input_files = verify_varnet.py, $(ckpt), $(data)
+transfer_input_files = verify_varnet.py, $(val_data), $(ckpt)
 should_transfer_files    = YES
+# ON_EXIT_OR_EVICT: output/ (partial results, the W&B run) comes back even
+# when the job is evicted, the same as train.sub.
 when_to_transfer_output  = ON_EXIT_OR_EVICT
 
 # --- output files ------------------------------------------------------------
-# results/ (json report, per-volume CSVs, results.csv, offline W&B run if no key)
-transfer_output_files   = results
-transfer_output_remaps  = "results = runs/$(model)/$(Cluster)"
+# output/tier1_report.json, output/per_volume_R<N>.csv, output/results.csv,
+# output/wandb/ (offline run if no key)
+transfer_output_files   = output
+transfer_output_remaps  = "output = runs/$(model)/$(Cluster)"
 
 # --- secrets -----------------------------------------------------------------
 # Only these names are copied from the submitting shell, and only if set. The
@@ -122,41 +119,67 @@ getenv          = WANDB_API_KEY, WANDB_ENTITY, WANDB_PROJECT
 environment     = "WANDB_PROJECT=fastmri-varnet-verify"
 
 # --- resources ---------------------------------------------------------------
-# request_disk covers peak scratch, which is during extraction: run_verify.sh
-# deletes the tarball only after `xz | tar` finishes, so both copies exist at
-# once -- 93.8 GB compressed + ~192 GB extracted = ~290 GB, plus results.
-# Override for a subset tarball: the 20-volume val subset is a plain ~20 GB
-# .tar, so peak is ~40 GB and the model1 / model2 presets pass request_disk=60GB.
+# Same slot class as train.sub. request_disk covers peak scratch during
+# extraction: run_verify.sh deletes a tarball only after `xz | tar` finishes,
+# so compressed + extracted coexist. The 20 GB val subset is a plain .tar
+# (extracts to ~20 GB), so 60 GB is comfortable; the full .xz split needs
+# 93.8 GB + ~192 GB (the tier1 preset passes 320GB). Size it from the tarball
+# actually staged (du -sh on /staging) and override on the command line.
 #
-# HasCHTCStaging selects slots that can read /staging inputs.
-requirements    = (Target.HasCHTCStaging == true)
+# HasCHTCStaging selects slots that can read /staging inputs. bad_nodes is the
+# escape hatch for an execute node whose GPU stack is broken in a way that is
+# not our problem to fix (train.sub: gpu4003, 2026-09-12). Override for one
+# submission:  ./submit.sh model1 bad_nodes='"gpu4003.chtc.wisc.edu"'
+if ! defined bad_nodes
+  bad_nodes = "gpu4003.chtc.wisc.edu"
+endif
+requirements    = (Target.HasCHTCStaging == true) && !stringListMember(Target.Machine, $(bad_nodes))
 # request_cpus and request_memory are the two exceptions to the `if ! defined`
-# rule: condor_submit seeds them into the macro table BEFORE reading this file,
-# so the guard never fires and the request silently collapses to 1 CPU and an
-# ImageSize-derived memory figure. Hence the aliases -- override these two as
-# cpus=8 / mem=64GB, not as request_cpus= / request_memory=. request_disk and
-# request_gpus are not pre-seeded, so they keep their own names.
+# rule: condor_submit seeds them into the macro table BEFORE reading this file
+# (they carry HTCondor's own defaults), so the guard never fires and the request
+# silently collapses to 1 CPU and an ImageSize-derived memory figure. Hence the
+# aliases. Override these two as cpus=16 / mem=64GB, not as request_cpus= /
+# request_memory=, which this file would overwrite. submit.sh prints all four
+# from the dry-run ad before submitting.
+#
+# cpus: DataLoader workers (--num_workers, default 4) plus the main process.
 if ! defined cpus
-  cpus = 4
+  cpus = 8
 endif
 if ! defined mem
-  mem = 32GB
+  mem = 48GB
 endif
 request_cpus    = $(cpus)
 request_memory  = $(mem)
 if ! defined request_disk
-  request_disk = 320GB
+  request_disk = 60GB
 endif
 if ! defined request_gpus
   request_gpus = 1
 endif
-gpus_minimum_memory     = 16000
+gpus_minimum_memory     = 24000M
 gpus_minimum_capability = 7.0
+# Upper bound matters: this image's PyTorch ships kernels for sm_37..sm_90.
+# An sm_120 (Blackwell) slot matches happily and then dies with "no kernel
+# image is available for execution on the device" at the first kernel launch.
+gpus_maximum_capability = 9.0
 +WantGPULab     = true
+# Inference only: the val subset at four rates is minutes to an hour, the full
+# split a few hours, so "short" queues faster than training's "long".
 if ! defined gpu_job_length
   gpu_job_length = "short"
 endif
 +GPUJobLength   = $(gpu_job_length)
+
+# --- transient node failures -------------------------------------------------
+# Hold codes 6 (execute-node problem before anything ran: docker daemon,
+# NVIDIA container hook) and 13 (input transfer failed, e.g. a stalled
+# /staging read) mean "the node, not this run" and are released automatically
+# a few times; see train.sub for the two incidents behind this. A repeatable
+# failure (a missing staging file also holds with 13) still surfaces as a
+# hold after five tries instead of looping.
+max_retries     = 5
+periodic_release = (HoldReasonCode == 6 || HoldReasonCode == 13) && (NumSystemHolds < 5) && ((time() - EnteredCurrentStatus) > 300)
 
 # --- logs ------------------------------------------------------------------
 log             = logs/$(model)_$(Cluster).log

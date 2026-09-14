@@ -1,303 +1,381 @@
-# verification/
+# verification/ — scoring an E2E VarNet checkpoint on CHTC
 
-Self-contained harness for `VERIFICATION.md` Tiers 0 and 1. Nothing here
-modifies `fastMRI/`, `parameter_interpolation/`, or any file outside this
-directory. It imports the `fastmri` package and reads its data files, that is
-all.
+Runbook for evaluating a checkpoint on `multicoil_val`. It is the same
+setup as `../training/` on purpose: the same Docker recipe, the same
+`submit.sh model1|model2` presets, a `train.sub`-shaped submit file with the
+same guarded macros, the same `run_*.sh` job executable with the same
+eviction handling, the same `logs/` and `runs/<model>/<Cluster>/` layout,
+the same resources, the same shared `../.env`. The one difference is what
+runs inside the job: `verify_varnet.py` **loads a checkpoint and scores it**
+instead of training one from scratch. If you know `training/README.md`,
+sections 4 and 6 here are the new material.
 
-*Status 2026-09-11: written and green locally (`make local-run`, synthetic
-data). **No tier has been run on CHTC.** Two things block a real Tier 1: the
-`image` macro in `verify.sub` still says `CHANGE_ME`, and the val tarball is
-not confirmed to be in `/staging`. See "Run Tier 1 before the training repack"
-below — the window for a full-split Tier 1 is closing.*
+Nothing here modifies `fastMRI/`, `parameter_interpolation/`, or any file
+outside this directory. It imports the `fastmri` package as installed in the
+image and reads its data files, that is all.
 
-| File | Runs where | Purpose |
-|---|---|---|
-| `verify_varnet.py` | anywhere with the `fastmri` env | The harness. `tier0` and `tier1` subcommands. |
-| `make_synthetic_val.py` | laptop | Tiny fake `multicoil_val` for smoke-testing the harness and the CHTC job before the real data lands. |
-| `Dockerfile` | laptop (build), CHTC (run) | The environment: Lightning 1.9.5, torch 2.0.1+cu118, conda h5py, fastMRI at commit `91f2df4`. |
-| `prepare_staging.sh` | CHTC transfer node | Downloads `knee_multicoil_val.tar.xz` and the released checkpoint into `/staging/a/apryan3/fastmri/`, verifies SHA256. |
-| `verify.sub`, `verify_tier0.sub` | CHTC access point | HTCondor submit files, container universe. |
-| `run_verify.sh` | inside the job | Job executable: extracts data, runs the harness, collects `results/`. |
-| `submit.sh` | CHTC access point | Wraps `condor_submit`, refuses to submit without a W&B key unless `OFFLINE=1`. |
-| `Makefile` | laptop | The local driver: `make local-run` does build → synthetic data → tier0 → tier1 smoke → job-executable smoke in one go. Also `make data` / `make extract` / `make tier1` for a real run on your own GPU. `make help` lists everything. |
-| `../.env.example` | repo root | Template for the shared `../.env` (gitignored): `WANDB_API_KEY`, `WANDB_ENTITY`, `FASTMRI_VAL_URL`, `FASTMRI_SHA_URL`, `NETID`, and training's `FASTMRI_TRAIN_URL`. One file for both stages; `submit.sh` and the `make data` / `make tier1` targets source it themselves. Nothing in `make local-run` needs it. |
+*Status 2026-09-14: green locally (`make local-run`, synthetic data). On CHTC
+a `model1` job has run to completion once; its output transfer was held by
+the W&B symlink bug that `run_verify.sh` now fixes (section 5). No tier has
+produced a real number yet.*
 
-## What a run produces
+## The presets
 
-`results/` (transferred back to `runs/<model>/<Cluster>/`, where `<model>` is
-`tier1` by default and `model1` / `model2` for the paired runs below):
+| Preset | `accelerations` | `center_fractions` | `mask_type` | Data | What the job does |
+|---|---|---|---|---|---|
+| **model1** | `4` | `0.08` | `equispaced_fraction` | val subset (20 vol) | Score the checkpoint at 4x. Pairs with `training: make submit-model1`. |
+| **model2** | `2 4 6 8` | `0.16 0.08 0.0533 0.04` | `equispaced_fraction` | val subset (20 vol) | Score the checkpoint at each of the four rates, one full pass per rate. Pairs with `training: make submit-model2`. |
+| **tier1** | `4 8` | `0.08 0.04` | `random` | full val (199 vol) | The `VERIFICATION.md` Claim A sweep: the fastMRI knee convention the third-party reference values are keyed on. PASS / INVESTIGATE / FAIL verdicts. |
+| **tier0** | | | | none | Environment checks + the fastMRI test suite on a GPU node. Once per image tag. |
 
-- `tier0_report.json` or `tier1_report.json`: every check, its verdict, and the config
-- `per_volume_R<N>.csv`: SSIM / PSNR / NMSE / MSE per volume, model and zero-filled, one file per rate
-- `results.csv`: one row per (run, rate) in the `VERIFICATION.md` Section 8 schema, append-only
+model1 / model2 are training's lists, paired elementwise by
+`fastmri.data.subsample.MaskFunc`, under training's mask family and on the
+same 20-volume val subset training validates against. Where training draws
+one (acceleration, centre fraction) pair per sample, evaluation scores every
+pair separately, so a model 2 job reports four per-rate results plus the
+cross-rate invariant (SSIM must fall as the rate rises).
+
+**Which checkpoint.** By default the released fastMRI knee model
+(`knee_leaderboard_state_dict.pt`, 12 cascades) staged next to the data:
+that is "pretrained instead of trained from scratch", and it is the only
+thing with third-party reference numbers to be judged against. Pass
+`ckpt=../training/runs/model1/<Cluster>/checkpoints/last.ckpt` to score a
+checkpoint you trained instead (section 4.4). The harness reads the
+architecture (cascades, channels, pools) out of the file, so the 8-cascade
+training checkpoints and the 12-cascade released one load through the same
+path.
+
+## Files
+
+| File | Runs where | Purpose | Training counterpart |
+|---|---|---|---|
+| `verify_varnet.py` | inside the job (or any `fastmri` env) | The harness. `tier0` (environment checks) and `tier1` (score a checkpoint). | `train_wandb.py` |
+| `run_verify.sh` | inside the job | Job executable: extracts the tarball, finds the split, finds the checkpoint, runs the harness, survives a vacate, collects `output/`. | `run_train.sh` |
+| `verify.sub` | access point | HTCondor submit file, container universe, every default guarded with `if ! defined`. Model 1 defaults; the other presets via macros. | `train.sub` |
+| `verify_tier0.sub` | access point | Tier 0 on a GPU node, no data. | |
+| `submit.sh` | access point | `./submit.sh model1\|model2\|tier1\|tier0 [name=value ...]`. Sources `../.env`, refuses to submit without a W&B key unless `OFFLINE=1`, proves with `-dry-run` that the preset reached the job ad. | `submit.sh` |
+| `Makefile` | laptop + access point | `make build/push/tier0/smoke/job-smoke/job-evict` (Docker) and `make submit-*/status/logs/why` (condor). | `Makefile` |
+| `Dockerfile` | laptop (build), CHTC (run) | Same pins as training's: Lightning 1.9.5, torch 2.0.1+cu118, conda h5py, fastMRI at `91f2df4`, plus pytest for Tier 0. `linux/amd64`. | `Dockerfile` |
+| `make_synthetic_val.py` | laptop | Tiny fake `multicoil_val` for the smoke tests. Training's smoke tests use it too. | |
+| `prepare_staging.sh` | CHTC transfer node | Downloads `knee_multicoil_val.tar.xz` and the released checkpoint into `/staging/a/apryan3/fastmri/`, verifies SHA256. | |
+| `../.env.example` | repo root | Template for the shared `../.env` (gitignored): `WANDB_API_KEY`, `WANDB_ENTITY`, the NYU URLs, `NETID`. One file for both stages. | same file |
+
+The two images are kept separate (`fastmri-verify`, `fastmri-train`) so a
+training rebuild can never change what a verification result was produced
+with; their pins are identical.
+
+## Where things run, and the one ordering constraint
+
+Same machines as training (`training/README.md`, "Where things run").
+Personal staging is `/staging/a/apryan3` (sharded by the netid's first
+letter), 100 GB quota. The full val tarball is 93.8 GiB / 100.7 GB decimal,
+so it fits only under binary counting with nothing to spare, and the
+project's answer (decision 2026-09-11, `ROADMAP.md` Phase 2) is **not** a
+quota increase but `training/README.md` section 3b: repack both splits into
+subsets that fit together. `make subset-val` there builds
+`knee_multicoil_val_subset.tar` (20 volumes, ~20 GB) and then the full val
+tarball is deleted by hand.
+
+**Run `tier1` before the repack.** It is the only preset that needs all 199
+volumes, and once the full tarball is gone a full-split number means
+re-downloading 94 GB from the NYU URL (valid to roughly 2026-12-08). Claim A
+does not strictly need it: `./submit.sh tier1 val_data=file:///staging/a/apryan3/fastmri/knee_multicoil_val_subset.tar request_disk=60GB`
+still checks the metric code against someone else's measurement of the same
+weights, just on 20 volumes. What you lose is the ability to quote a
+full-split number later. `model1` / `model2` default to the subset and are
+unaffected.
+
+## 0. Before anything
+
+- **Rotate the W&B key** that is in the old `Research/inpainting.sub` git
+  history (ROADMAP.md security note). Put the new one in `../.env` (from
+  `../.env.example`, `chmod 600`); `submit.sh` and the `make data` /
+  `make tier1` targets source it. It is never written to a `.sub` file.
+- `verify.sub` expects `/staging/a/apryan3/fastmri/knee_multicoil_val_subset.tar`
+  (or the full `.tar.xz` for `tier1`) and `knee_leaderboard_state_dict.pt`
+  (section 3a).
+- Docker Desktop running on the laptop, logged in to Docker Hub.
+
+## 1. Laptop: build and push the image (once per tag)
+
+```bash
+cd verification
+make build push IMAGE=<dockerhub_user>/fastmri-verify:2026-09
+```
+
+`linux/amd64` for the same reasons as training (CHTC is x86_64, the cu118
+wheels and the pinned `hdf5` build only exist there); on an Apple Silicon
+laptop every local run goes through emulation, which is fine for synthetic
+data. Use a dated tag, never `:latest`. Then set the same line in both
+submit files and keep it that way in git:
+
+```
+  image = docker://<dockerhub_user>/fastmri-verify:2026-09
+```
+
+## 2. Laptop: smoke-test with no real data (minutes each)
+
+```bash
+make local-run    # = clean, build, tier0, smoke, job-smoke, job-evict
+```
+
+or one at a time:
+
+```bash
+make tier0        # environment + metric invariants + the fastMRI test suite; REAL verdicts, must pass
+make smoke        # verify_varnet.py on synthetic phantoms, model 2 rate list, random weights
+make job-smoke    # run_verify.sh exactly as HTCondor runs it, model 1 rate list, offline W&B
+make job-evict    # SIGTERM a running job: the cleanup must still run
+```
+
+`tier0` is the one whose verdicts count: a failure means the image is wrong
+and nothing produced from it can be trusted. `smoke` and `job-smoke` run a
+2-cascade random model on fake data, so their reference-comparison and
+`beats_zero_filled` lines are *expected* to say FAIL; what they prove is
+that parsing, masking, model I/O, the metric code, the CSV/JSON writers,
+tarball extraction, split and checkpoint discovery, and the `output/`
+contract all work. `job-smoke` runs W&B offline rather than disabled and
+then asserts that no symlink is left under `output/` (section 5).
+`job-evict` sends the SIGTERM HTCondor sends on a vacate and checks the
+script stops and still runs that cleanup.
+
+## 3. Copy to the access point
+
+Only this directory is needed on CHTC; neither submodule is. `git pull` a
+clone there, or scp:
+
+| Copy | Why |
+|---|---|
+| `verify.sub`, `verify_tier0.sub` | submit files, with your `image =` line edited |
+| `submit.sh` | wraps `condor_submit`, applies the presets, runs the preflight |
+| `run_verify.sh` | the job executable |
+| `verify_varnet.py` | the harness (listed in `transfer_input_files`) |
+| `Makefile` | for `make submit-model1` etc. Optional; `./submit.sh` works alone. |
+| `prepare_staging.sh` | only if the data still has to be staged (section 3a) |
+| `../.env.example` | to create `../.env` by hand on the access point |
+
+Not `synthetic/`, `jobtest/`, `evicttest/`, `output/`, `*.tar`, `.make/`,
+and not the laptop's `../.env`.
+
+```bash
+# laptop, from the repo root
+scp verification/verify.sub verification/verify_tier0.sub verification/submit.sh \
+    verification/run_verify.sh verification/verify_varnet.py verification/Makefile \
+    apryan3@ap2001.chtc.wisc.edu:~/Fall26Research/verification/
+scp .env.example apryan3@ap2001.chtc.wisc.edu:~/Fall26Research/
+```
+
+Then, one-time checks there:
+
+```bash
+cd ~/Fall26Research/verification
+chmod +x run_verify.sh submit.sh
+grep '^  image' verify.sub verify_tier0.sub    # must not say CHANGE_ME
+ls -la /staging/a/apryan3/fastmri/             # what is actually staged
+condor_submit -dry-run /dev/stdout verify.sub model=model2 accelerations="2 4 6 8" \
+    center_fractions="0.16 0.08 0.0533 0.04" \
+  | grep -iE "^(Arguments|TransferInput|RequestCpus|RequestMemory|RequestDisk|Requirements) "
+```
+
+The last line is what `submit.sh` does automatically before every submit:
+it proves the preset reached the job ad. `condor_submit` parses a
+command-line `name=value` as if it sat at the top of the file, so an
+unguarded assignment in the `.sub` would silently overwrite it; every
+default in `verify.sub` is therefore wrapped in `if ! defined`, and
+`request_cpus` / `request_memory` (pre-seeded by condor_submit, so the
+guard never fires) are overridden as `cpus=` / `mem=`. See `train.sub` for
+the three-hour incident behind this.
+
+### 3a. Stage the data (transfer node)
+
+```bash
+ssh apryan3@transfer.chtc.wisc.edu           # bulk data host, not the access point
+set -a; . ~/Fall26Research/.env; set +a      # FASTMRI_VAL_URL, FASTMRI_SHA_URL from the NYU email
+PARALLEL=4 nohup ./prepare_staging.sh > prepare.log 2>&1 &
+```
+
+It lands in `/staging/a/apryan3/fastmri/`, which is what the `staging`
+macro already points at, along with the released checkpoint, and verifies
+the SHA256. It is idempotent and resumable. Check `get_quotas
+/staging/a/apryan3` first; the tarball is within a rounding error of the
+whole quota. Do not scp a laptop copy up instead: the per-flow shaping that
+makes `PARALLEL` necessary applies outbound too.
+
+### 3b. The val subset
+
+`training/README.md` section 3b, step 1 (`cd ../training && make
+subset-val`) builds `knee_multicoil_val_subset.tar` from the staged full
+tarball and, after the swap, it is the file `verify.sub` defaults to.
+`run_verify.sh` accepts `.tar` and `.tar.xz` and finds `multicoil_val` at
+any depth inside. CHTC's rule: `osdf:///chtc/staging/<path>` for 1-30 GB
+inputs, `file:///staging/<path>` from 30 GB up; `file://` works for both.
+Do not stage the synthetic phantoms as a "subset"; they only exist for
+`make smoke`.
+
+## 4. Run (access point)
+
+Every submission starts the same way:
+
+```bash
+ssh apryan3@ap2001.chtc.wisc.edu
+cd ~/Fall26Research/verification            # ../.env holds WANDB_API_KEY; or export it
+```
+
+### 4.1 Tier 0 once per image tag (minutes)
+
+```bash
+make submit-tier0                 # ./submit.sh tier0
+```
+
+`runs/tier0/<Cluster>/tier0_report.json` must say `"overall": "pass"`.
+
+### 4.2 Short test job first (model 1, 5 volumes)
+
+```bash
+make submit-model1 ARGS='volume_limit=5'
+make logs                          # tail -f the newest logs/*.out
+```
+
+`submit.sh` first prints `job args: tier1 --run_name verify-model1
+--accelerations 4 ...` and the four resolved `Request*` values (8 CPUs,
+48 GB, 60 GB, 1 GPU), then submits. The `.out` must show
+`[run_verify] multicoil_val: 20 volumes`,
+`[run_verify] checkpoint: knee_leaderboard_state_dict.pt`, `loaded ...
+(29.9M params)` and per-volume progress lines with a running SSIM. When it
+finishes, `runs/model1/<Cluster>/tier1_report.json` must exist and
+`condor_q` must not show the job held (section 5). That `<Cluster>`
+directory is a throwaway.
+
+### 4.3 The presets
+
+```bash
+make submit-model1                 # accelerations="4"       center_fractions="0.08"                  mask_type=equispaced_fraction
+make submit-model2                 # accelerations="2 4 6 8" center_fractions="0.16 0.08 0.0533 0.04" mask_type=equispaced_fraction
+make submit-tier1                  # accelerations="4 8"     center_fractions="0.08 0.04"             mask_type=random, full val, request_disk=320GB
+```
+
+Run names and W&B runs: `verify-model1`, `verify-model2`, `verify-tier1`.
+Output lands in `runs/<preset>/<Cluster>/`. All three score the released
+checkpoint unless told otherwise.
+
+### 4.4 Scoring a checkpoint you trained
+
+The point of matching the training setup. When `../training/` has produced
+`runs/model1/<Cluster>/checkpoints/last.ckpt`, score it under the same rate
+list and val subset it was trained against:
+
+```bash
+make submit MODEL=model1 ARGS='ckpt=../training/runs/model1/<Cluster>/checkpoints/last.ckpt run_name=verify-model1-trained'
+make submit MODEL=model2 ARGS='ckpt=../training/runs/model2/<Cluster>/checkpoints/last.ckpt run_name=verify-model2-trained'
+```
+
+`submit.sh` checks the file exists, HTCondor transfers it into the sandbox,
+`run_verify.sh` hands whatever `*.pt` / `*.ckpt` it finds to the harness,
+and the harness prints `architecture read from last.ckpt: {'num_cascades':
+8, ...}` before loading. A trained checkpoint has no reference values, so
+its rates are "recorded only"; the invariants (determinism, beats
+zero-filled, volume count, SSIM monotone in R) still run. `run_name` is
+given explicitly so it does not continue the released-checkpoint W&B run.
+
+### 4.5 Overrides
+
+`make submit-model1 ARGS='...'` and `./submit.sh model1 name=value ...` are
+the same thing. Any `name=value` is a `condor_submit` macro override, so
+every knob in `verify.sub` (`val_data`, `ckpt`, `request_disk`,
+`volume_limit`, `run_name`, `mask_type`, `extra_args`, `cpus`, `mem`,
+`gpu_job_length`, `bad_nodes`, ...) can be set per submission without
+editing the file. `extra_args` is appended verbatim to `verify_varnet.py`
+(`--num_workers 0`, `--determinism_volumes 0`, `--image_volumes 5`,
+`--cpu`, ...). The preflight only asserts on knobs you did not override.
+
+Resources are the training ones (8 CPUs, 48 GB, a 24 GB GPU of capability
+7.0 to 9.0) so both jobs land on the same class of slot; `request_disk`
+defaults to 60 GB for the plain-tar subset and the `tier1` preset passes
+320 GB for the `.xz` full split (93.8 GB + ~192 GB extracted coexist).
+Inference needs less than training: `mem=32GB` widens the pool of matching
+slots if the queue is slow.
+
+## 5. Monitor
+
+```bash
+make status                       # condor_q -nobatch
+make logs                         # tail -f the newest logs/*.out
+make why JOB=<Cluster>            # hold reason + log tails
+```
+
+`stream_output = True` means the `.out` updates live: extraction, the volume
+count, then `R4 10/20 volumes, running SSIM 0.9xxx, 8.1s/volume` lines.
+
+W&B project `fastmri-varnet-verify`. As in training, the run id is the run
+name with `resume="allow"`, so a resubmitted job continues the same W&B run;
+pass a new `run_name` for a genuinely new one. Per-rate aggregates, the
+per-volume table, example target / reconstruction / zero-filled / error
+images, the reference comparison and every invariant land there. Without a
+key the run is written offline to `runs/<model>/<Cluster>/wandb/` and
+`wandb sync <that dir>/offline-run-*` uploads it later.
+
+**The symlink hold.** A job that finishes and then goes on hold with
+`Transfer output files failure ... Transfer of symlinks to directories is
+not supported` (job 10461449 on 2026-09-14) means a `wandb/latest-run`
+symlink was left in `output/`. `run_verify.sh` now deletes every symlink
+under `output/` before exit, on eviction too, and `make job-smoke` /
+`make job-evict` check that it does. A job held this way cannot be
+released usefully; resubmit. Hold codes 6 and 13 (a broken execute node, a
+stalled `/staging` read) are released automatically up to five times by
+`periodic_release`, the same as `train.sub`.
+
+## 6. What comes back, and the verdicts
+
+`runs/<model>/<Cluster>/` (the job's `output/`):
+
+- `tier1_report.json`: every check, its verdict, the config, the
+  architecture that was loaded
+- `per_volume_R<N>.csv`: SSIM / PSNR / NMSE / MSE per volume, model and
+  zero-filled, one file per rate
+- `results.csv`: one row per (run, rate) in the `VERIFICATION.md` Section 8
+  schema, append-only
 - `wandb/`: the offline W&B run, only when no key was available
-
-In W&B (project `fastmri-varnet-verify`): per-rate aggregates, the per-volume
-table, example target / reconstruction / zero-filled / error images, the
-reference-comparison table, every invariant as a summary field, and the JSON
-report and CSVs as artifacts.
-
-## Verdicts
 
 `tier1` compares each rate against the third-party measurements of the
 released checkpoint listed in `VERIFICATION.md` Section 2 and prints
 `PASS` / `INVESTIGATE` / `FAIL` per source using the Section 4.4 thresholds.
 It also runs the Section 4.5 invariants: determinism (re-runs the first
 volumes and diffs the output), model beats zero-filled by a margin, volume
-count matches, SSIM monotone in the acceleration rate. Exit code 0 means every
-check is pass or investigate, 1 means at least one fail.
+count matches, SSIM monotone in the acceleration rate. Exit code 0 means
+every check is pass or investigate, 1 means at least one fail.
 
 The reference values are for the fastMRI knee convention (`random` masks,
-0.08 / 0.04). Other mask types and rates are recorded but not judged.
+0.08 / 0.04 at 4x / 8x): the `tier1` preset. Under `equispaced_fraction`
+(model1 / model2) the harness logs `no reference values for
+(equispaced_fraction, R); recorded only` and emits metrics without a
+pass/fail. Those runs measure; `tier1` is what verifies. Record the volume
+count with every number; the report and `results.csv` carry it.
 
-## Run Tier 1 before the training repack
-
-This is the one ordering constraint between the two stages, and it is
-one-way. `/staging/a/apryan3` is capped at 100 GB and the full val tarball is
-100.7 GB, so `training/README.md` section 3b deletes it to make room for the
-training subsets. Once that happens, a Tier 1 run over all 199 val volumes is
-impossible without re-downloading 94 GB from the NYU presigned URL (valid to
-roughly 2026-12-08, re-requestable from fastmri@med.nyu.edu after that).
-
-So: **stage the val tarball, run Tier 1 on the full split, and only then run
-`make subset-val`.** If you would rather not spend the hours, Tier 1 on
-`volume_limit=20` still verifies the pipeline — Claim A does not need all 199
-volumes, it needs the metric code to agree with someone else's measurement of
-the same weights. What you lose is the ability to quote a full-split number
-later.
-
-After the repack, `make verify-model1` / `make verify-model2` already point at
-`knee_multicoil_val_subset.tar` (a plain `.tar`, ~20 GB) with
-`request_disk=60GB` — see "Pretrained vs. from-scratch" below. For an ad-hoc
-run, `./submit.sh val_file=knee_multicoil_val_subset.tar request_disk=60GB`
-does the same thing. Those runs are on 20 volumes, so record the volume count
-with every number — the harness already writes it into `tier1_report.json` and
-`results.csv`.
-
-## Where things live on CHTC
-
-| What | Where | Constraint |
-|---|---|---|
-| This repo, submit files, logs | `/home/apryan3` on `ap2001.chtc.wisc.edu` | 40 GB quota, code only |
-| `knee_multicoil_val.tar.xz` (93.8 GiB), released checkpoint | `/staging/a/apryan3/fastmri/` | 100 GB quota — the tarball alone is 100.7 GB decimal, and `training/` section 3b replaces it with a ~20 GB subset |
-| The container image | Docker Hub, pulled by the execute node | never stored on CHTC |
-
-Personal staging is sharded by the first letter of the netid:
-`/staging/a/apryan3`, **not** `/staging/apryan3`. The shared group directory
-`/staging/groups/kamilov_group/Kamilov-SciAI-datasets` is not readable by this
-account as of 2026-09-10. If that changes, the only edits needed are the
-`staging` macro in `verify.sub` and `STAGING_DIR` for `prepare_staging.sh`.
-
-A job never reads `/staging` directly. HTCondor transfers the listed inputs
-into the job's scratch directory, which is why `verify.sub` asks for
-`HasCHTCStaging` slots and requests enough `request_disk` to hold the tarball
-and its extracted contents at the same time.
-
-The 100 GB quota on `/staging/a/apryan3` (confirmed 2026-09-10) is the binding
-constraint, and it is tighter than it looks. The validation tarball is
-100,694,526,932 bytes — 93.8 GiB, or 100.7 GB decimal — so it fits only if
-`get_quotas` counts in binary units, and even then leaves about 6 GiB for
-everything else. Nothing of consequence can be staged alongside it, and
-`multicoil_train` (~931 GB unpacked) is out of reach entirely.
-
-The project's answer to that (decision 2026-09-11, `ROADMAP.md` Phase 2) is
-**not** a quota increase — that is the last resort — but repacking both splits
-into subsets that fit together: `training/README.md` section 3b. Which is why
-a full-split Tier 1 has to happen first, if it happens at all.
-
-## Step by step
-
-### 1. Build and push the image (laptop, once per tag)
-
-```bash
-cd verification
-make build push IMAGE=<you>/fastmri-verify:2026-09
-# equivalent by hand:
-docker build --platform linux/amd64 --build-arg IMAGE_TAG=<you>/fastmri-verify:2026-09 -t <you>/fastmri-verify:2026-09 .
-docker push <you>/fastmri-verify:2026-09
-```
-
-The image must be `linux/amd64`: CHTC is x86_64, the cu118 torch wheels only
-exist for x86_64, and the pinned conda `hdf5` build string is a linux-64
-build. This laptop is Apple Silicon, so a bare `docker build` used to produce
-an arm64 image and die in the conda layer with
-`hdf5 1.10.6 nompi_h6a2412b_1114 does not exist`. The `FROM` line now pins
-the platform and `make build` passes `--platform` too, so either route works.
-Every local `docker run` of this image on the Mac goes through emulation:
-slow, but correct for the synthetic smoke tests.
-
-Use a dated tag, never `:latest`, so a later rebuild cannot change what an
-old result was produced with. The build ends with a self-check that prints the
-installed versions and asserts Lightning is 1.x.
-
-### 2. Smoke-test the harness locally, no real data (laptop, minutes)
-
-```bash
-make local-run       # build, synthetic data, tier0, tier1 smoke, job-executable smoke
-make report          # the verdicts from that run
-```
-
-That is the supported path and needs no `../.env` and no real data. The
-equivalent by hand, if you want to poke at the container:
-
-```bash
-docker run --rm -it --platform linux/amd64 -v "$PWD":/work -w /work <you>/fastmri-verify:2026-09 bash
-python make_synthetic_val.py --out synthetic/multicoil_val --volumes 3 --slices 4
-python verify_varnet.py tier0 --fastmri_repo /opt/fastMRI --run_pytest --no_wandb
-python verify_varnet.py tier1 --data_path synthetic/multicoil_val --random_init \
-    --num_cascades 2 --chans 4 --sens_chans 4 --pools 2 --sens_pools 2 \
-    --accelerations 4 8 --center_fractions 0.08 0.04 --no_wandb --cpu --num_workers 0
-```
-
-The second command is expected to print `FAIL` on the reference comparison
-and on `beats_zero_filled`: the model is random and the data is fake. What it
-proves is that file parsing, masking, model I/O, metric code, CSV / JSON output
-and the verdict logic all run. To smoke-test the CHTC job the same way:
-
-```bash
-tar -cf knee_multicoil_val_synthetic.tar -C synthetic multicoil_val
-# copy to /staging/a/apryan3/fastmri/ then:
-./submit.sh data=osdf:///chtc/staging/a/apryan3/fastmri/knee_multicoil_val_synthetic.tar \
-            request_disk=20GB extra_args="--random_init --num_cascades 2 --chans 4 --sens_chans 4 --pools 2 --sens_pools 2 --num_workers 0"
-```
-
-### 3. Stage the real data (transfer node, one to three hours)
-
-```bash
-ssh apryan3@transfer.chtc.wisc.edu   # not the access point; this host is for bulk data
-export FASTMRI_VAL_URL='...knee_multicoil_val.tar.xz?AWSAccessKeyId=...'   # from the NYU email
-export FASTMRI_SHA_URL='...SHA256?AWSAccessKeyId=...'
-PARALLEL=4 nohup ./prepare_staging.sh > prepare.log 2>&1 &
-```
-
-It lands in `/staging/a/apryan3/fastmri/`, which is what `verify.sub`'s
-`staging` macro already points at. `PARALLEL` defaults to 16 to beat a dorm
-ISP's per-flow shaping; from campus to S3 a few flows are plenty.
-
-Check the quota first (`get_quotas /staging/a/apryan3` on the access point).
-It is 100 GB, and the tarball is 100,694,526,932 bytes — 93.8 GiB or 100.7 GB
-depending on how that limit is counted, so it either just fits or just does
-not. Establish which before committing to a multi-hour transfer. It is the
-only split with ground truth the harness can score, so it is the right thing
-to stage first — and it is also the thing `training/` section 3b later
-deletes, so plan the Tier 1 run around that.
-
-Do not scp the local copy up from the desktop instead. The shaping that makes
-`PARALLEL=16` necessary applies to outbound traffic too, so a 94 GB upload
-takes days where the S3-to-campus fetch takes hours.
-
-### 3b. Files already present, or running on your own GPU
-
-Everything is idempotent, so nothing is re-downloaded or re-extracted:
-
-- `prepare_staging.sh` skips any file whose size already matches the server
-  and resumes a partial one. Point it at a local directory with
-  `STAGING_DIR=/path ./prepare_staging.sh` to use it off-cluster.
-- `verify_varnet.py --state_dict <path>` uses the checkpoint if the file
-  exists and only downloads (with `--download_state_dict`) if it does not.
-- `verify_varnet.py --data_path <dir>` just reads the `.h5` files in place.
-  If you already have `multicoil_val/` extracted, point at it and skip the
-  tarball entirely.
-- `run_verify.sh` skips extraction when `data/multicoil_val/` exists. It
-  deletes the tarball after extracting unless `KEEP_TARBALL=1`, so set that
-  for a local run or, simpler, extract by hand once
-  (`xz -dc -T0 knee_multicoil_val.tar.xz | tar -x`) and call
-  `verify_varnet.py` directly.
-
-### 4. Tier 0 on CHTC (minutes)
-
-```bash
-export WANDB_API_KEY=...        # freshly rotated, see ROADMAP.md security note
-./submit.sh tier0
-```
-
-Do this once per image tag. It runs the repo's own test suite inside the
-container on a GPU node. If it fails, the image is wrong and nothing produced
-from it counts.
-
-### 5. Tier 1 on CHTC
-
-```bash
-./submit.sh volume_limit=20            # ~30 min including extraction, sanity
-./submit.sh                            # full 199 volumes, 4x and 8x, ~2-4 h
-```
-
-Extraction of the 94 GB `.xz` inside the job takes about 2 hours and is the
-reason `request_disk` is 320 GB. `run_verify.sh` deletes the tarball only
-after `xz | tar` finishes, so peak scratch holds both copies at once: 93.8 GB
-compressed plus ~192 GB extracted, about 290 GB, plus results. It prints
-nothing at all while it runs.
-
-More cores will not speed it up, but not for the reason you would guess:
-the archive is 8180 blocks and the image ships xz 5.8.3, so `-T0` can and
-does parallelise the decode. It is I/O bound. Measured locally, xz sits at
-~42% of a single core while output runs at ~24 MB/s -- an order of magnitude
-under what the filesystem sustains -- because it reads 93.8 GB and writes
-191.7 GiB across the same mount while creating 199 one-gigabyte files.
-Local rate was ~1.4 volumes/min. On CHTC, where the job runs against local
-scratch rather than a Docker bind mount, expect this to be faster; time it
-before trusting the 2 h figure for `request_disk` planning.
-
-A one-off interactive job
-(`condor_submit -i`) can extract once and re-tar a 20-volume subset as a
-plain `.tar` for fast reruns; point `data=` at it and drop `request_disk`.
-
-`tail -f logs/tier1_<Cluster>_0.out` shows per-volume progress with a running
-SSIM. `runs/tier1/<Cluster>/tier1_report.json` has the verdicts.
-
-### 6. Pretrained vs. from-scratch (the 2x2)
-
-`verify-model1` / `verify-model2` are the released-checkpoint halves of a 2x2:
-the same two mask configurations as training, evaluated with NYU's leaderboard
-weights instead of weights trained here.
+### Pretrained vs. from-scratch (the 2x2)
 
 | | 4x only | 2x / 4x / 6x / 8x |
 |---|---|---|
-| **Released weights** | `verification: make verify-model1` | `verification: make verify-model2` |
-| **Trained here** | `training: make submit-model1` | `training: make submit-model2` |
+| **Released weights** | `verification: make submit-model1` | `verification: make submit-model2` |
+| **Trained here** | `training: make submit-model1`, then `verification: make submit MODEL=model1 ARGS='ckpt=...'` | `training: make submit-model2`, then `verification: make submit MODEL=model2 ARGS='ckpt=...'` |
 
-```bash
-# on ap2001, in ~/Fall26Research/verification, WANDB_API_KEY exported
-make verify-model1      # accelerations 4,       center_fractions 0.08
-make verify-model2      # accelerations 2 4 6 8, center_fractions 0.16 0.08 0.0533 0.04
-make verify-model2 ARGS='volume_limit=5'        # quick shakeout first
-```
-
-Each resolves to `./submit.sh model1|model2`, which submits `verify.sub` with
-`model=`, the two mask lists, `mask_type=equispaced_fraction`,
-`val_file=knee_multicoil_val_subset.tar` and `request_disk=60GB`. Results land
-in `runs/model1/<Cluster>/` and `runs/model2/<Cluster>/`. Nothing is trained.
-
-What is held identical to training: the acceleration / center-fraction lists,
-the mask family (`equispaced_fraction`, not the `random` this harness defaults
-to), the 20-volume val subset, and seed 42. `verify_varnet.py` evaluates each
-(R, center fraction) pair in its own pass, so `verify-model2` reports four
-per-rate rows rather than one averaged number.
+What is held identical across the row: the acceleration / centre-fraction
+lists, the mask family, the 20-volume val subset, seed 42, and the scorer.
 
 **The released-weights row is a ceiling reference, not a matched control.**
 Three things differ from the trained models, all of them in its favour:
 
 - **It saw the val split.** The leaderboard checkpoint was trained on
-  `train`+`val` combined, so the 20 subset volumes are training data for it and
-  useless as a generalization estimate. model1 / model2 never see them.
-- **It is a bigger model** — 12 cascades (~29.9M parameters) against the demo
+  `train`+`val` combined, so the 20 subset volumes are training data for it
+  and useless as a generalisation estimate. model1 / model2 never see them.
+- **It is a bigger model**: 12 cascades (~29.9M parameters) against the demo
   default 8 that `training/train_wandb.py` uses (~20.1M).
 - **It trained on all 973 train volumes**, against the ~120-volume subset.
 
 So read it as "how far from a fully-trained reference are we", never as
-"pretrained beats from-scratch". `VERIFICATION.md` Claim A is the same point.
-
-Two smaller caveats, both expected and neither an error:
-
-- **No reference verdict.** `REFERENCE_VALUES` is keyed on `("random", 4)` and
-  `("random", 8)`. Under `equispaced_fraction` the harness logs
-  `no reference values for (equispaced_fraction, R); recorded only` and emits
-  metrics without a pass/fail. These runs measure; the plain `./submit.sh`
-  sweep is what verifies.
-- **2x and 6x are not in the paper.** Their center fractions 0.16 and 0.0533
-  come from the fastMRI 0.32/R convention extended by us, not from
-  Sriram et al.
+"pretrained beats from-scratch". `VERIFICATION.md` Claim A is the same
+point. Two smaller caveats: 2x and 6x are not in the paper (their centre
+fractions 0.16 and 0.0533 come from the 0.32/R convention extended by us),
+and under `equispaced_fraction` there is no reference verdict.
 
 ## Mask family notes (from the Tier 0 output)
 
@@ -311,21 +389,31 @@ visible:
   it adds the centre lines on top of every $R$-th line without correcting for
   them. That is the paper's own definition of $M_e(r, l)$, so it is the right
   choice for a Table 1 comparison. `equispaced_fraction` is the corrected
-  variant and does not correspond to either paper table.
+  variant, what training uses, and does not correspond to either paper table.
 
-The reference values in the harness are for `random`, the knee convention.
+## Laptop: the real data locally (optional)
+
+Evaluation is the one job that can also run on a laptop with a GPU, because
+the val split is all it needs. `training/` has no equivalent.
+
+```bash
+cp ../.env.example ../.env         # paste the NYU presigned URLs and, optionally, the W&B key
+make data                          # download the val set + checkpoint into DATA_DIR, verify SHA256
+make extract                       # unpack (~2 h)
+make tier1 MODEL=tier1             # the scored run under the knee convention; MODEL=model1|model2 for training's lists
+make report
+```
+
+`DATA_DIR` defaults to `~/fastmri-data`, outside the repo and outside
+OneDrive. `PARALLEL` (default 64) is the download's connection count, tuned
+for a per-flow-shaped dorm ISP; on a normal network `PARALLEL=1`.
 
 ## W&B key handling
 
-The key is read only from the `WANDB_API_KEY` environment variable of the
-submitting shell and copied into the job by HTCondor's `getenv`. It is never
-written into a `.sub` file, a script, or this directory. It is visible in the
-job ClassAd (`condor_q -l`) to you and CHTC admins, which is the standard
-CHTC pattern. Without a key the harness logs offline under `results/wandb/`
-and `wandb sync runs/<model>/<Cluster>/wandb/offline-run-*` uploads it later.
-
-Rotate the key that is in the old `Research/inpainting.sub` git history
-before using any key here.
+The key is read from `../.env` (or the shell) by `submit.sh` and copied
+into the job by HTCondor's `getenv`. It is never written into a `.sub`
+file, a script, or this directory. It is visible in the job ClassAd
+(`condor_q -l`) to you and CHTC admins, which is the standard CHTC pattern.
 
 ## Running without Docker
 
@@ -341,24 +429,12 @@ pip install --no-deps -e ../fastMRI
 `torch` must be installed first for your platform. The Lightning 1.x
 requirement is the one that cannot be relaxed.
 
-## Training is not here: see `../training/`
+## Not covered here
 
-This directory only evaluates the released checkpoint. Training the two
-models from scratch lives in `../training/` and has its own runbook,
-`../training/README.md`:
-
-| Model | `accelerations` | `center_fractions` | Submit with |
-|---|---|---|---|
-| model1 | `4` | `0.08` | `make submit-model1` |
-| model2 | `2 4 6 8` (one drawn at random per sample) | `0.16 0.08 0.0533 0.04` | `make submit-model2` |
-
-Both use the `train_varnet_demo.py` defaults for everything else (8
-cascades, 18 channels, Adam lr 1e-3, batch 1, 50 epochs,
-`equispaced_fraction` masks). The training image is a separate
-`Dockerfile` in `training/` with the same pins as this one.
-
-Tier 2 (Table 2 reproduction) and Tier 3 (seed variance) from
-`VERIFICATION.md` Sections 5 and 6 are also training runs and would go
-through `training/`, not this harness. The per-volume CSV writer here is the
-piece Tier 3 needs for paired comparisons; `volume_metrics()` and
-`crop_like_evaluate()` in `verify_varnet.py` can be imported for that.
+Training the two models is `../training/`. Tier 2 (Table 2 reproduction)
+and Tier 3 (seed variance) from `VERIFICATION.md` Sections 5 and 6 are
+training runs and go through `training/`; the per-volume CSV writer here is
+the piece Tier 3 needs for paired comparisons, and `volume_metrics()` and
+`crop_like_evaluate()` in `verify_varnet.py` can be imported for that. Read
+`training/README.md` "Known deviations from Sriram et al. 2020" before
+comparing any number to the paper.

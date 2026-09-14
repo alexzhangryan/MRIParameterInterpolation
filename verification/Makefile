@@ -1,81 +1,94 @@
-# Makefile: driver for the verification harness.
+# Makefile: driver for VarNet evaluation on CHTC. The same targets as
+# ../training/Makefile, run in the same two places:
+#   laptop (needs Docker):        make build push tier0 smoke job-smoke job-evict
+#   ap2001.chtc.wisc.edu:         make submit-tier0 submit-model1 submit-model2 submit-tier1 status logs why
 #
-#   laptop:               make local-run build push synthetic tier0 tier1 ...
-#   ap2001.chtc.wisc.edu: make verify-model1 verify-model2 status logs
+#   make local-run       everything laptop-side from scratch, in one go
+#   make help            every target
 #
-# The local targets run in the same Docker image CHTC runs, so a green local
-# run means the image, the harness, and the job executable all work before a
-# single HTCondor slot is used. They touch neither /staging nor condor -- see
-# README.md sections 3-5 for those.
+# Requires GNU make, Docker. On Windows run it from Git Bash or WSL.
 #
-#   make local-run      full smoke test from scratch: build, fake data, tier0,
-#                       tier1, job executable. This is the one to run.
-#   make help           every target
-#
-# Requires: GNU make, Docker. On Windows run it from Git Bash or WSL.
+# CHTC is x86_64, so every docker build and run here passes --platform
+# $(PLATFORM), default linux/amd64. On an Apple Silicon laptop that runs under
+# emulation: slow, but correct, and fine for tiny synthetic data. Override it
+# when you are building somewhere that matches the host, e.g. on a linux/arm64
+# box you only ever smoke-test on:
+#     make smoke PLATFORM=linux/arm64
+# Anything you `make push` for CHTC must stay linux/amd64.
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
 # --- knobs ------------------------------------------------------------------
 # Comments go above the assignments, never after them: make keeps the trailing
-# whitespace, which turns `ifeq ($(PYTEST),1)` into a silent false.
+# whitespace, which turns `ifeq ($(GPU),1)` into a silent false.
 #
-# IMAGE: use a dated tag (fastmri-verify:2026-09) for anything you push.
+# IMAGE: use a dated tag (<user>/fastmri-verify:2026-09) for anything you push.
 IMAGE    ?= fastmri-verify:local
-# PLATFORM: CHTC is x86_64 and the torch cu118 wheels / pinned hdf5 build only
-# exist there. On an Apple Silicon laptop this makes docker build and run use
-# emulation (slow, but correct); without it the conda solve fails outright.
 PLATFORM ?= linux/amd64
-RESULTS  ?= results
-SYNTH    ?= synthetic
-# synthetic volumes, and slices per volume
-VOLUMES  ?= 3
-SLICES   ?= 4
-# paired elementwise, as in fastmri.data.subsample.MaskFunc
-ACCEL    ?= 4 8
-CF       ?= 0.08 0.04
-# random is the fastMRI knee convention and the only one the reference values
-# in verify_varnet.py are valid for (see README "Mask family notes").
-MASK_TYPE ?= random
-# PYTEST=1: tier0 also runs the fastMRI repo test suite
-PYTEST   ?= 1
-# GPU: 1 uses the host GPU, 0 forces CPU. Auto-detected from nvidia-smi because
-# the difference is not cosmetic -- the real Tier 1 run is hours on a GPU and
-# days on CPU, and a silent CPU fallback is easy not to notice.
-# (`nvidia-smi -L` rather than `command -v`: GnuWin32 make 3.81 cannot run a
-# shell builtin in $(shell ...) and dies with a CreateProcess error.)
-GPU      ?= $(if $(shell nvidia-smi -L 2>/dev/null),1,0)
-# extra args appended to verify_varnet.py
-EXTRA    ?=
+# preset for `make submit` and the local `make tier1`: model1 | model2 | tier1
+MODEL    ?= model1
+# extra name=value macro overrides for condor_submit, e.g.
+#   make submit-model1 ARGS='volume_limit=5 extra_args="--num_workers 0"'
+ARGS     ?=
 # ENV_FILE: the secrets file, shared by training/ and verification/. One file
 # at the repo root (see ../.env.example) so there is one key to rotate.
 ENV_FILE ?= ../.env
-# ARGS: name=value macro overrides passed through to condor_submit by the
-# verify-model* targets, e.g. ARGS='volume_limit=5'. MODEL picks the preset
-# for the bare `make verify` target.
-ARGS     ?=
-MODEL    ?= model1
+# synthetic volumes for the smoke tests
+VOLUMES  ?= 3
+SLICES   ?= 4
+# GPU: 1 uses the host GPU, 0 forces CPU. Auto-detected from nvidia-smi.
+GPU      ?= $(if $(shell nvidia-smi -L 2>/dev/null),1,0)
+SHM      ?= 8g
+# extra args appended to verify_varnet.py in the smoke and tier1 targets
+EXTRA    ?=
+# PYTEST=1: tier0 also runs the fastMRI repo test suite
+PYTEST   ?= 1
 
-# Tiny architecture for the smoke test. The released checkpoint's real
-# architecture is the default in verify_varnet.py; we override it here only
-# because --random_init means the weights are meaningless anyway and a small
-# model keeps the CPU run to minutes.
+# The presets: the same lists submit.sh applies on the access point, paired
+# elementwise as in fastmri.data.subsample.MaskFunc. model1 / model2 are
+# training's lists under training's mask family; tier1 is the fastMRI knee
+# convention the reference values in verify_varnet.py are keyed on. Override
+# any of the three on the command line (ACCEL='4 8' CF='0.08 0.04').
+ifeq ($(MODEL),model2)
+  ACCEL     ?= 2 4 6 8
+  CF        ?= 0.16 0.08 0.0533 0.04
+  MASK_TYPE ?= equispaced_fraction
+else ifeq ($(MODEL),tier1)
+  ACCEL     ?= 4 8
+  CF        ?= 0.08 0.04
+  MASK_TYPE ?= random
+else
+  ACCEL     ?= 4
+  CF        ?= 0.08
+  MASK_TYPE ?= equispaced_fraction
+endif
+
+# Tiny architecture for the smoke tests: the point is exercising the data
+# path, the metric code, the report writers and the job executable, not the
+# model. --random_init skips checkpoint loading, so the numbers are noise.
 SMOKE_ARCH ?= --num_cascades 2 --chans 4 --sens_chans 4 --pools 2 --sens_pools 2
+SMOKE_RUN  ?= --random_init --num_workers 0
 
 # --- host/docker plumbing ---------------------------------------------------
-# Git Bash mangles both $PWD and the container-side path; pwd -W gives the
-# Windows form Docker Desktop wants and MSYS_NO_PATHCONV leaves /work alone.
+# The repo root is mounted (not just this directory), the same as training/,
+# so the container sees ../training too and paths match between the two.
+#
+# Windows: Git Bash mangles both the host path and the container-side path.
+# `pwd -W` gives the C:/... form Docker Desktop wants (plain $(CURDIR) yields
+# /c/... , which Docker rejects as a bind mount source) and MSYS_NO_PATHCONV=1
+# stops Git Bash rewriting `-w /work/verification` into a C:/Program Files/...
+# path. --user is dropped there too: Docker Desktop already maps the bind
+# mount as root, and a Git Bash uid (197609) does not exist inside the image.
 ifeq ($(OS),Windows_NT)
-  HOSTPWD  := $(shell pwd -W 2>/dev/null || pwd)
+  REPO     := $(shell cd .. && pwd -W 2>/dev/null || pwd)
   DOCKER   := MSYS_NO_PATHCONV=1 docker
   USERFLAG :=
 else
-  HOSTPWD  := $(CURDIR)
+  REPO     := $(abspath $(CURDIR)/..)
   DOCKER   := docker
   USERFLAG := --user $(shell id -u):$(shell id -g)
 endif
-
 ifeq ($(GPU),1)
   GPUFLAG := --gpus all
   CPUFLAG :=
@@ -83,90 +96,59 @@ else
   GPUFLAG :=
   CPUFLAG := --cpu
 endif
-
 ifeq ($(PYTEST),1)
   PYTESTFLAG := --run_pytest
 else
   PYTESTFLAG :=
 endif
-
 # HOME and the cache dirs go to /tmp: the CHTC container has no writable home
 # either, so depending on one is a bug that would only show up on the cluster.
+# W&B mode is not fixed here (training's ENVFLAGS pins offline) because the
+# local `make tier1` is a run worth logging online; the smoke targets pin it.
 ENVFLAGS := -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e MPLCONFIGDIR=/tmp/.cache/mpl \
             -e PYTHONUNBUFFERED=1
-# Defined before RUN on purpose: RUN uses := , so a SHMFLAG assigned further
-# down would expand to nothing here and silently drop --shm-size.
-SHM      ?= 8g
-SHMFLAG  := --shm-size=$(SHM)
-RUN      := $(DOCKER) run --rm --platform $(PLATFORM) $(SHMFLAG) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
-            -v "$(HOSTPWD)":/work -w /work $(IMAGE)
-
-# PyTorch DataLoader workers hand samples to the parent process through
-# /dev/shm, and Docker gives a container only 64 MB of it by default. One
-# fastMRI slice is 15 x 640 x 368 complex64 = 28 MB, so the default
-# --num_workers 4 prefetching a few of those exceeds 64 MB immediately and the
-# workers die with "Bus error ... insufficient shared memory". tier1-smoke
-# never hit this because it passes --num_workers 0. Whether the CHTC container
-# has a larger /dev/shm is worth checking there before assuming it is fine.
-# Weights & Biases. Every smoke target passes --no_wandb literally and stays
-# silent; this knob is for `make tier1`, the run worth a permanent record.
-# WANDB=1 (default) forwards the credentials from $(ENV_FILE) and lets the script
-# choose: online when WANDB_API_KEY arrives, offline otherwise, in which case
-# it prints the `wandb sync` command. Force it with WANDB_MODE=offline in the
-# environment. WANDB=0 turns logging off entirely.
-WANDB ?= 1
-ifeq ($(WANDB),1)
-  WANDBFLAG :=
-  WANDBENV  := -e WANDB_API_KEY -e WANDB_ENTITY -e WANDB_PROJECT -e WANDB_MODE
-else
-  WANDBFLAG := --no_wandb
-  WANDBENV  := -e WANDB_MODE=offline
-endif
-
+RUN      := $(DOCKER) run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
+            -v "$(REPO)":/work -w /work/verification $(IMAGE)
 
 STAMP := .make/image.$(subst :,_,$(subst /,_,$(IMAGE)))
+SYNTH := synthetic/knee
 
 # ============================================================================
 
 .PHONY: help
 help:
-	@echo "local verification targets (IMAGE=$(IMAGE))"
+	@echo "VarNet evaluation on CHTC (IMAGE=$(IMAGE))"
 	@echo
-	@echo "  make local-run       everything from 0: build, synthetic data, tier0,"
-	@echo "                       tier1 smoke, job-executable smoke"
-	@echo "  make build           build the Docker image (cached; no-op if unchanged)"
-	@echo "  make rebuild         build with --no-cache"
-	@echo "  make synthetic       generate $(SYNTH)/multicoil_val ($(VOLUMES) vols x $(SLICES) slices)"
-	@echo "  make tier0           environment + metric invariants (+ fastMRI pytest)"
-	@echo "  make tier1-smoke     tier1 on synthetic data with a random model"
-	@echo "  make job-smoke       run run_verify.sh itself, the way HTCondor will"
+	@echo "  LAPTOP (Docker):"
+	@echo "  make local-run       build, tier0, smoke, job-smoke, job-evict from scratch"
+	@echo "  make build           build the image for $(PLATFORM) (cached)"
+	@echo "  make push IMAGE=<user>/fastmri-verify:2026-09   publish for CHTC"
+	@echo "  make tier0           environment + metric invariants (+ fastMRI pytest); real verdicts"
+	@echo "  make smoke           verify_varnet.py on synthetic data with a random model"
+	@echo "  make job-smoke       run_verify.sh the way HTCondor will, with an offline W&B run"
+	@echo "  make job-evict       SIGTERM a running job: the eviction cleanup must run"
+	@echo "  make shell           interactive shell in the image, repo mounted at /work"
 	@echo
-	@echo "  REAL DATA (needs ../.env with the NYU presigned URLs):"
+	@echo "  ACCESS POINT (ap2001.chtc.wisc.edu, WANDB_API_KEY in ../.env or exported):"
+	@echo "  make submit-tier0    environment checks on a GPU node, once per image tag"
+	@echo "  make submit-model1   released weights, 4x,          val subset"
+	@echo "  make submit-model2   released weights, 2x/4x/6x/8x, val subset, one pass per rate"
+	@echo "  make submit-tier1    Claim A sweep: random masks 4x/8x on the FULL val split (before the repack)"
+	@echo "  make submit MODEL=model1 ARGS='ckpt=../training/runs/model1/<Cluster>/checkpoints/last.ckpt run_name=verify-model1-trained'"
+	@echo "  make status          condor_q for your jobs"
+	@echo "  make logs            tail the newest job .out"
+	@echo "  make why JOB=<Cluster>   hold reason + log tails for a held job"
+	@echo
+	@echo "  LAPTOP, REAL DATA (needs ../.env with the NYU presigned URLs):"
 	@echo "  make data            download val set + checkpoint into DATA_DIR, verify SHA256"
-	@echo "  make extract         unpack the tarball (~2 h; xz here is single-threaded)"
-	@echo "  make tier1           the real scored run -- these verdicts count"
-	@echo "                       DATA_DIR=$(DATA_DIR)"
+	@echo "  make extract         unpack the tarball (~2 h)"
+	@echo "  make tier1           the real scored run on DATA_DIR=$(DATA_DIR), preset MODEL=$(MODEL)"
 	@echo
-	@echo "  ON CHTC (ap2001, condor):"
-	@echo "  make verify-model1   released weights, 4x,          on the val subset"
-	@echo "  make verify-model2   released weights, 2x/4x/6x/8x, on the val subset"
-	@echo "  make verify MODEL=model2 ARGS='volume_limit=5'"
-	@echo "  make status / make logs    condor_q, and tail the newest .out"
+	@echo "  make report          print the verdicts from the last local run"
+	@echo "  make clean           remove smoke artefacts;  make distclean also drops logs/ runs/ and the image"
 	@echo
-	@echo "  make shell           interactive shell in the image, cwd mounted"
-	@echo "  make report          print the verdicts from the last run"
-	@echo "  make clean           remove $(RESULTS)/, $(SYNTH)/, jobtest/, tarballs"
-	@echo "  make distclean       clean + drop the build stamp and the local image"
-	@echo
-	@echo "  make push IMAGE=<user>/fastmri-verify:2026-09      publish for CHTC"
-	@echo
-	@echo "         PARALLEL=64 CHUNK_MB=16    connections for the tarball download"
-	@echo
-	@echo "         SHM=8g                    /dev/shm for DataLoader workers"
-	@echo "         WANDB=0                   disable W&B logging for tier1"
-	@echo
-	@echo "knobs: GPU=1  PYTEST=0  VOLUMES=  SLICES=  ACCEL='4 8'  CF='0.08 0.04'  EXTRA='...'"
-	@echo "       MODEL=model2  ARGS='volume_limit=5'      (the condor targets)"
+	@echo "knobs: IMAGE= PLATFORM= MODEL= ARGS= GPU= SHM= VOLUMES= SLICES= PYTEST=0 EXTRA='...'"
+	@echo "       MODEL=model1|model2|tier1 picks ACCEL/CF/MASK_TYPE; PARALLEL=$(PARALLEL) for the download"
 
 # --- image ------------------------------------------------------------------
 .PHONY: build rebuild push
@@ -182,96 +164,195 @@ rebuild:
 	$(DOCKER) build --no-cache --platform $(PLATFORM) --build-arg IMAGE_TAG=$(IMAGE) -t $(IMAGE) .
 	@touch $(STAMP)
 
-push:
+push: build
 	@case "$(IMAGE)" in */*:*) ;; *) \
 	  echo "IMAGE must be <dockerhub_user>/<name>:<dated-tag>, got '$(IMAGE)'" >&2; exit 1;; esac
 	@case "$(IMAGE)" in *:latest) \
 	  echo "refusing :latest -- a rebuild would silently change what past results were produced with" >&2; \
 	  exit 1;; esac
 	$(DOCKER) push $(IMAGE)
+	@echo
+	@echo "now set in verify.sub and verify_tier0.sub:   image = docker://$(IMAGE)"
 
-# --- fake data --------------------------------------------------------------
+# --- line endings -----------------------------------------------------------
+# These files execute on Linux; a stray CRLF makes bash fail on "\r".
+#
+# The Makefile and Dockerfile are checked too, because they fail differently
+# and much less obviously: make keeps the \r in every variable, so a CRLF
+# Makefile turns `PLATFORM ?= linux/amd64` into "linux/amd64\r" and every
+# `docker build --platform ...` dies on an invalid platform. .gitattributes
+# pins eol=lf so a Windows checkout cannot reintroduce it.
+.PHONY: check-eol
+check-eol:
+	@bad=""; \
+	for f in Makefile Dockerfile run_verify.sh submit.sh prepare_staging.sh verify.sub verify_tier0.sub verify_varnet.py make_synthetic_val.py; do \
+	  if LC_ALL=C grep -qU "$$(printf '\r')" "$$f" 2>/dev/null; then bad="$$bad $$f"; fi; \
+	done; \
+	if [ -n "$$bad" ]; then \
+	  echo "CRLF line endings found in:$$bad  (fix: dos2unix, or sed -i 's/\r$$//')" >&2; exit 1; \
+	fi
+
+# --- synthetic data ---------------------------------------------------------
+# Phantoms with the real on-disk layout. Numbers scored on this are
+# meaningless; it only exercises the pipeline.
 .PHONY: synthetic
 synthetic: $(SYNTH)/multicoil_val
 
 $(SYNTH)/multicoil_val: make_synthetic_val.py | build
 	$(RUN) python make_synthetic_val.py --out $(SYNTH)/multicoil_val \
-	    --volumes $(VOLUMES) --slices $(SLICES)
+	    --volumes $(VOLUMES) --slices $(SLICES) --seed 2
 	@touch $@
 
 knee_multicoil_val_synthetic.tar: $(SYNTH)/multicoil_val
 	tar -cf $@ -C $(SYNTH) multicoil_val
-	@ls -la $@
 
 # --- tier 0 -----------------------------------------------------------------
 # Real verdicts: a failure here means the image is wrong and nothing produced
 # from it counts, so this one is not allowed to exit non-zero.
 .PHONY: tier0
-tier0: build
-	@mkdir -p $(RESULTS)
+tier0: build check-eol
+	@mkdir -p output
 	$(RUN) python verify_varnet.py tier0 \
-	    --output_dir $(RESULTS) --fastmri_repo /opt/fastMRI $(PYTESTFLAG) --no_wandb $(EXTRA)
+	    --output_dir output --fastmri_repo /opt/fastMRI $(PYTESTFLAG) --no_wandb $(EXTRA)
 
-# --- tier 1 smoke -----------------------------------------------------------
-# A random model on fake phantoms: the reference comparison and
-# beats_zero_filled are EXPECTED to say FAIL, and the harness exits 1 for that.
-# What is being tested is that file parsing, masking, model I/O, the metric
-# code, the CSV/JSON writers and the verdict logic all run end to end, so the
-# pass condition here is "a report was produced", not "the verdicts are green".
-.PHONY: tier1-smoke
-tier1-smoke: build synthetic
-	@mkdir -p $(RESULTS)
-	@rm -f $(RESULTS)/tier1_report.json
-	-$(RUN) python verify_varnet.py tier1 \
-	    --data_path $(SYNTH)/multicoil_val --output_dir $(RESULTS) \
-	    --fastmri_repo /opt/fastMRI --random_init $(SMOKE_ARCH) \
-	    --accelerations $(ACCEL) --center_fractions $(CF) \
-	    --no_wandb $(CPUFLAG) --num_workers 0 $(EXTRA)
-	@test -s $(RESULTS)/tier1_report.json || { \
-	  echo; echo "FAILED: the harness crashed before writing $(RESULTS)/tier1_report.json"; exit 1; }
+# --- smoke: the harness -----------------------------------------------------
+# A random model on fake phantoms with the model 2 rate list: the reference
+# comparison and beats_zero_filled are EXPECTED to say FAIL, and the harness
+# exits 1 for that. What is being tested is that file parsing, masking, model
+# I/O, the metric code, the CSV/JSON writers and the verdict logic all run
+# end to end, so the pass condition is "a report was produced".
+.PHONY: smoke
+smoke: build check-eol synthetic
+	rm -rf output
+	-$(RUN) python verify_varnet.py tier1 --data_path $(SYNTH)/multicoil_val --output_dir output \
+	    --fastmri_repo /opt/fastMRI --run_name smoke \
+	    --accelerations 2 4 6 8 --center_fractions 0.16 0.08 0.0533 0.04 --mask_type equispaced_fraction \
+	    $(SMOKE_ARCH) $(SMOKE_RUN) --no_wandb $(CPUFLAG) $(EXTRA)
+	@test -s output/tier1_report.json || { echo "FAILED: the harness crashed before writing output/tier1_report.json" >&2; exit 1; }
 	@echo
-	@echo "harness ran end to end. Reference-comparison and beats_zero_filled FAILs"
-	@echo "are expected here: random weights, fake data."
+	@echo "smoke passed: the harness ran end to end. Reference-comparison and"
+	@echo "beats_zero_filled FAILs are expected here: random weights, fake data."
 
-# --- job executable ---------------------------------------------------------
-# run_verify.sh is what HTCondor actually executes, and it does things the
-# harness does not: tarball extraction, data discovery, the results/ contract
-# for transfer_output_files. Running it locally against a synthetic tarball is
-# the last thing that can be checked without a cluster slot.
-# CRLF endings are fatal for anything that runs on Linux: bash reads the \r as
-# part of each command ("$'\r': command not found", then a syntax error), and
-# HTCondor would carry it into .sub macro values. .gitattributes keeps them LF
-# on checkout; this catches a Windows editor putting them back.
-.PHONY: check-eol
-check-eol:
-	@bad=""; \
-	for f in run_verify.sh submit.sh prepare_staging.sh verify.sub verify_tier0.sub; do \
-	  [ -f "$$f" ] || continue; \
-	  if LC_ALL=C grep -qU "$$(printf '\r')" "$$f" 2>/dev/null; then bad="$$bad $$f"; fi; \
-	done; \
-	if [ -n "$$bad" ]; then \
-	  echo "CRLF line endings found in:$$bad" >&2; \
-	  echo "These execute on Linux and bash will choke on the carriage returns." >&2; \
-	  echo "Fix:  sed -i 's/[carriage-return]\$$//'$$bad   (or: dos2unix$$bad)" >&2; \
-	  exit 1; \
-	fi
-
+# --- smoke: the job executable ----------------------------------------------
+# run_verify.sh does what the harness does not: tarball extraction, split
+# discovery, checkpoint discovery, the output/ contract. W&B runs offline
+# here rather than being disabled so the run directory and its latest-run
+# symlink exist, and the check at the end proves run_verify.sh removed the
+# symlink -- HTCondor puts a job on hold if one is left in output/.
 .PHONY: job-smoke
 job-smoke: build check-eol knee_multicoil_val_synthetic.tar
 	rm -rf jobtest && mkdir -p jobtest
 	cp verify_varnet.py run_verify.sh knee_multicoil_val_synthetic.tar jobtest/
-	-$(DOCKER) run --rm --platform $(PLATFORM) $(SHMFLAG) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) -e KEEP_TARBALL=1 \
-	    -v "$(HOSTPWD)":/work -w /work/jobtest $(IMAGE) \
-	    bash run_verify.sh tier1 --random_init $(SMOKE_ARCH) \
-	        --accelerations $(ACCEL) --center_fractions $(CF) \
-	        --no_wandb $(CPUFLAG) --num_workers 0 --volume_limit $(VOLUMES) $(EXTRA)
-	@test -s jobtest/results/tier1_report.json || { \
-	  echo; echo "FAILED: run_verify.sh produced no jobtest/results/tier1_report.json"; exit 1; }
+	-$(DOCKER) run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
+	    -e KEEP_TARBALL=1 -e WANDB_MODE=offline \
+	    -v "$(REPO)":/work -w /work/verification/jobtest $(IMAGE) \
+	    bash run_verify.sh tier1 --run_name job-smoke --accelerations 4 --center_fractions 0.08 \
+	        --mask_type equispaced_fraction --volume_limit $(VOLUMES) $(SMOKE_ARCH) $(SMOKE_RUN) $(CPUFLAG) $(EXTRA)
+	@test -s jobtest/output/tier1_report.json || { echo "FAILED: run_verify.sh produced no output/tier1_report.json" >&2; exit 1; }
+	@if [ -n "$$(find jobtest/output -type l)" ]; then \
+	  echo "FAILED: symlinks left under jobtest/output (HTCondor would hold the job):" >&2; \
+	  find jobtest/output -type l >&2; exit 1; fi
 	@echo
-	@echo "run_verify.sh works: extraction, data discovery, results/ contract."
-	@echo "The same tarball can smoke-test CHTC -- README.md section 2."
+	@echo "job-smoke passed: extraction, split discovery, checkpoint discovery, output/ contract, no symlinks."
 
-# --- real data --------------------------------------------------------------
+# --- smoke: the eviction path ------------------------------------------------
+# HTCondor vacates a job by sending SIGTERM to the executable and SIGKILLing
+# the whole job after MachineMaxVacateTime. This starts run_verify.sh with
+# W&B attached (offline), SIGTERMs it mid-run the way the startd does, and
+# checks the script stops promptly and finishes its cleanup, so the symlink
+# sweep runs before output transfer on eviction too. Same test as training's
+# job-evict; forced onto the CPU and the four-rate list so the run is still
+# going when the signal lands. VACATE_GRACE is shortened for speed.
+.PHONY: job-evict
+job-evict: build check-eol knee_multicoil_val_synthetic.tar
+	rm -rf evicttest && mkdir -p evicttest
+	cp verify_varnet.py run_verify.sh knee_multicoil_val_synthetic.tar evicttest/
+	-@$(DOCKER) rm -f fastmri-verify-evict >/dev/null 2>&1 || true
+	$(DOCKER) run -d --name fastmri-verify-evict --platform $(PLATFORM) --shm-size=$(SHM) $(USERFLAG) \
+	    $(ENVFLAGS) -e KEEP_TARBALL=1 -e WANDB_MODE=offline -e VACATE_GRACE=5 \
+	    -v "$(REPO)":/work -w /work/verification/evicttest $(IMAGE) \
+	    bash run_verify.sh tier1 --run_name job-evict --accelerations 2 4 6 8 --center_fractions 0.16 0.08 0.0533 0.04 \
+	        --mask_type equispaced_fraction $(SMOKE_ARCH) $(SMOKE_RUN) --cpu --determinism_volumes 3 $(EXTRA)
+	@echo "--- waiting for scoring to start, then SIGTERM (what HTCondor sends on a vacate) ---"
+	@for i in $$(seq 1 150); do \
+	   $(DOCKER) logs fastmri-verify-evict 2>&1 | grep -q "=== acceleration" && break; sleep 2; done
+	@$(DOCKER) logs fastmri-verify-evict 2>&1 | grep -q "=== acceleration" || { \
+	   echo "FAILED: scoring never started, nothing to evict" >&2; \
+	   $(DOCKER) logs fastmri-verify-evict 2>&1 | tail -20 >&2; $(DOCKER) rm -f fastmri-verify-evict >/dev/null; exit 1; }
+	@$(DOCKER) kill -s TERM fastmri-verify-evict >/dev/null
+	@t0=$$(date +%s); \
+	 while [ "$$($(DOCKER) inspect -f '{{.State.Running}}' fastmri-verify-evict)" = "true" ]; do \
+	   if [ $$(( $$(date +%s) - t0 )) -gt 90 ]; then \
+	     echo "FAILED: run_verify.sh did not exit within 90s of SIGTERM; on CHTC this is the" >&2; \
+	     echo "        SIGKILL case, where the cleanup never runs." >&2; \
+	     $(DOCKER) rm -f fastmri-verify-evict >/dev/null; exit 1; \
+	   fi; sleep 1; \
+	 done; echo "exited $$(( $$(date +%s) - t0 ))s after SIGTERM"
+	@$(DOCKER) logs fastmri-verify-evict 2>&1 | grep -E "^\[run_verify\] (SIGTERM|python|exit code)"
+	@$(DOCKER) logs fastmri-verify-evict 2>&1 | grep -q "SIGTERM received" || { \
+	   echo "FAILED: the trap never fired" >&2; $(DOCKER) rm -f fastmri-verify-evict >/dev/null; exit 1; }
+	@$(DOCKER) rm -f fastmri-verify-evict >/dev/null
+	@l=$$(find evicttest/output -type l | tr '\n' ' '); \
+	 test -z "$$l" || { echo "FAILED: symlinks survived the cleanup, HTCondor would hold the" >&2; \
+	   echo "        job on output transfer: $$l" >&2; exit 1; }
+	@echo
+	@echo "job-evict passed: SIGTERM stops the job and the symlink sweep runs."
+
+# --- the whole laptop side --------------------------------------------------
+# $(MAKE) is quoted because on Windows it expands to a path containing spaces
+# and parentheses ("C:/Program Files (x86)/GnuWin32/bin/make"), which is a
+# shell syntax error unquoted.
+.PHONY: local-run
+local-run:
+	"$(MAKE)" clean
+	"$(MAKE)" build
+	"$(MAKE)" tier0
+	"$(MAKE)" smoke
+	"$(MAKE)" job-smoke
+	"$(MAKE)" job-evict
+	@echo
+	@echo "local run complete. output/tier0_report.json holds real verdicts (all pass);"
+	@echo "the tier1 reports are smoke tests, FAILs expected."
+	@"$(MAKE)" --no-print-directory report
+
+# --- CHTC access point ------------------------------------------------------
+.PHONY: submit submit-tier0 submit-tier1 submit-model1 submit-model2 status logs why
+submit-tier0:
+	./submit.sh tier0 $(ARGS)
+
+submit-tier1:
+	./submit.sh tier1 $(ARGS)
+
+submit-model1:
+	./submit.sh model1 $(ARGS)
+
+submit-model2:
+	./submit.sh model2 $(ARGS)
+
+submit:
+	./submit.sh $(MODEL) $(ARGS)
+
+status:
+	condor_q -nobatch
+
+# make why JOB=<Cluster>[.<Proc>]   why a job is held, plus the tail of its logs
+why:
+	@test -n "$(JOB)" || { echo "usage: make why JOB=<Cluster>[.<Proc>]" >&2; exit 1; }
+	@echo "== hold"; condor_q $(JOB) -af:t HoldReasonCode HoldReasonSubCode NumJobStarts NumSystemHolds \
+	    LastRemoteHost RemoteWallClockTime MemoryUsage RequestMemory DiskUsage RequestDisk ExitCode ExitBySignal ExitSignal
+	@condor_q $(JOB) -af HoldReason
+	@c=$${JOB%%.*}; for f in logs/*_$$c.log logs/*_$$c_*.out logs/*_$$c_*.err; do \
+	    [ -f "$$f" ] || continue; echo "== $$f"; tail -n 60 "$$f"; done
+
+logs:
+	@f=$$(ls -t logs/*.out 2>/dev/null | head -1); \
+	test -n "$$f" || { echo "no logs/*.out yet" >&2; exit 1; }; \
+	echo "== $$f"; tail -f "$$f"
+
+# --- laptop, real data ------------------------------------------------------
+# Evaluation is the one job that can also run on a laptop with a GPU, because
+# the val split is all it needs. Nothing here exists in training/.
+#
 # DATA_DIR deliberately defaults OUTSIDE the repo. This checkout sits under
 # OneDrive, which would try to sync ~200 GiB of k-space to the cloud, and the
 # .h5 files would also land next to tracked files. $(HOME) on Git Bash is
@@ -298,6 +379,17 @@ PARALLEL ?= 64
 # 64 MB chunk takes 4.5 min -- long enough that the run looks hung. 16 MB
 # chunks land every ~70s, which also means an interruption costs less.
 CHUNK_MB ?= 16
+# WANDB=1 (default) forwards the credentials from $(ENV_FILE) and lets the
+# harness choose: online when WANDB_API_KEY arrives, offline otherwise, in
+# which case it prints the `wandb sync` command. WANDB=0 turns logging off.
+WANDB ?= 1
+ifeq ($(WANDB),1)
+  WANDBFLAG :=
+  WANDBENV  := -e WANDB_API_KEY -e WANDB_ENTITY -e WANDB_PROJECT -e WANDB_MODE
+else
+  WANDBFLAG := --no_wandb
+  WANDBENV  := -e WANDB_MODE=offline
+endif
 
 # Resolve DATA_DIR to a host path docker accepts, creating it first.
 # (Done inside the recipe, not at parse time, because the directory may not
@@ -305,13 +397,13 @@ CHUNK_MB ?= 16
 define in_data_container
 D=$$(mkdir -p "$(DATA_DIR)" && cd "$(DATA_DIR)" && { pwd -W 2>/dev/null || pwd; }); \
 echo "[make] DATA_DIR -> $$D"; \
-$(DOCKER) run --rm --platform $(PLATFORM) $(SHMFLAG) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS)
+$(DOCKER) run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS)
 endef
 
 # Download the real val set + released checkpoint, and verify the SHA256.
-# Reads the NYU presigned URLs from $(ENV_FILE). Idempotent: prepare_staging.sh skips
-# files whose size already matches the server and resumes partial ones, so an
-# interrupted 94 GiB download can just be re-run.
+# Reads the NYU presigned URLs from $(ENV_FILE). Idempotent: prepare_staging.sh
+# skips files whose size already matches the server and resumes partial ones,
+# so an interrupted 94 GiB download can just be re-run.
 .PHONY: data
 data: build check-eol
 	@test -f $(ENV_FILE) || { echo "no $(ENV_FILE) -- cp ../.env.example ../.env and paste the NYU URLs" >&2; exit 1; }
@@ -322,7 +414,7 @@ data: build check-eol
 	$(in_data_container) \
 	    -e FASTMRI_VAL_URL -e FASTMRI_SHA_URL -e STAGING_DIR=/data -e NETID \
 	    -e PARALLEL=$(PARALLEL) -e CHUNK_MB=$(CHUNK_MB) \
-	    -v "$(HOSTPWD)":/work -v "$$D":/data -w /work $(IMAGE) \
+	    -v "$(REPO)":/work -v "$$D":/data -w /work/verification $(IMAGE) \
 	    bash prepare_staging.sh
 
 # Extract the tarball in place. Kept separate from `data` so a failed download
@@ -335,90 +427,40 @@ extract: build
 	  xz -dc -T0 knee_multicoil_val.tar.xz | tar -x && \
 	  ls -1 /data/multicoil_val/*.h5 | wc -l | xargs echo "volumes:"'
 
-# The real scored run. Unlike tier1-smoke these verdicts MEAN something, so
+# The real scored run, with the same preset lists the CHTC job uses
+# (MODEL=model1|model2|tier1). Unlike smoke these verdicts MEAN something, so
 # this target is not allowed to exit non-zero.
 .PHONY: tier1
-tier1: build
-	@mkdir -p $(RESULTS)
+tier1: build check-eol
+	@mkdir -p output
 	@if [ -f $(ENV_FILE) ]; then set -a; . $(ENV_FILE); set +a; fi; \
 	$(in_data_container) $(WANDBENV) \
-	    -v "$(HOSTPWD)":/work -v "$$D":/data -w /work $(IMAGE) \
+	    -v "$(REPO)":/work -v "$$D":/data -w /work/verification $(IMAGE) \
 	    python verify_varnet.py tier1 \
 	        --data_path /data/multicoil_val \
 	        --state_dict /data/knee_leaderboard_state_dict.pt \
-	        --output_dir $(RESULTS) --fastmri_repo /opt/fastMRI \
+	        --output_dir output --fastmri_repo /opt/fastMRI --run_name verify-$(MODEL)-local \
 	        --accelerations $(ACCEL) --center_fractions $(CF) \
 	        --mask_type $(MASK_TYPE) --volume_limit $(VOLUME_LIMIT) \
 	        $(WANDBFLAG) $(CPUFLAG) $(EXTRA)
 
-# --- the whole thing --------------------------------------------------------
-# $(MAKE) is quoted because on Windows it expands to a path containing spaces
-# and parentheses ("C:/Program Files (x86)/GnuWin32/bin/make"), which is a
-# shell syntax error unquoted. The literal $(MAKE) still appears in the line,
-# so make's recursive-invocation handling (MAKEFLAGS, -n) is unaffected.
-.PHONY: local-run
-local-run:
-	@echo "=== 0/4  clean slate ============================================="
-	"$(MAKE)" clean
-	@echo "=== 1/4  image ==================================================="
-	"$(MAKE)" build
-	@echo "=== 2/4  tier0 ==================================================="
-	"$(MAKE)" tier0
-	@echo "=== 3/4  tier1 on synthetic data ================================="
-	"$(MAKE)" tier1-smoke
-	@echo "=== 4/4  job executable =========================================="
-	"$(MAKE)" job-smoke
-	@echo
-	@echo "================================================================="
-	@echo "local run complete. Reports:"
-	@echo "  $(RESULTS)/tier0_report.json   real verdicts, all should be pass"
-	@echo "  $(RESULTS)/tier1_report.json   smoke test, FAILs expected"
-	@echo "  $(RESULTS)/per_volume_R*.csv, $(RESULTS)/results.csv"
-	@echo "Next: push a dated image and stage the real data (README.md sections 1, 3)."
-	@"$(MAKE)" --no-print-directory report
-
 .PHONY: report
 report:
-	@for f in $(RESULTS)/tier0_report.json $(RESULTS)/tier1_report.json jobtest/results/tier1_report.json; do \
+	@for f in output/tier0_report.json output/tier1_report.json jobtest/output/tier1_report.json; do \
 	  [ -s "$$f" ] || continue; \
 	  printf '%-38s overall=%s\n' "$$f" \
 	    "$$(sed -n 's/.*"overall": *"\([a-z]*\)".*/\1/p' "$$f" | head -1)"; \
 	done
 
-# --- CHTC submission --------------------------------------------------------
-# These run on the access point, not the laptop: they shell out to ./submit.sh,
-# which refuses to run without condor_submit and without a W&B key (OFFLINE=1
-# to log offline instead). verify-model1 / verify-model2 are the released-
-# checkpoint halves of the 2x2 in README "Pretrained vs. from-scratch" -- the
-# same masks, val subset and seed as training's submit-model1 / submit-model2,
-# evaluating the NYU leaderboard weights instead of training anything.
-.PHONY: verify-model1 verify-model2 verify status logs
-verify-model1:
-	./submit.sh model1 $(ARGS)
-
-verify-model2:
-	./submit.sh model2 $(ARGS)
-
-verify:
-	./submit.sh $(MODEL) $(ARGS)
-
-status:
-	condor_q -nobatch
-
-logs:
-	@f=$$(ls -t logs/*.out 2>/dev/null | head -1); \
-	  test -n "$$f" || { echo "no logs/*.out yet"; exit 0; }; \
-	  echo "== $$f"; tail -f "$$f"
-
 # --- misc -------------------------------------------------------------------
 .PHONY: shell
 shell: build
-	$(DOCKER) run --rm $(SHMFLAG) -it $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
-	    -v "$(HOSTPWD)":/work -w /work $(IMAGE) bash
+	$(DOCKER) run --rm -it --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
+	    -v "$(REPO)":/work -w /work/verification $(IMAGE) bash
 
 .PHONY: clean distclean
 clean:
-	rm -rf $(RESULTS) $(SYNTH) jobtest knee_multicoil_val_synthetic.tar
+	rm -rf output results synthetic jobtest evicttest knee_multicoil_val_synthetic.tar
 
 distclean: clean
 	rm -rf .make logs runs
