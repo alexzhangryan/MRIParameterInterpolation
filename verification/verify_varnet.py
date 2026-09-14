@@ -18,8 +18,14 @@ Typical use
   python verify_varnet.py tier1 \
       --data_path /path/to/multicoil_val \
       --state_dict knee_leaderboard_state_dict.pt \
-      --accelerations 4 8 --center_fractions 0.08 0.04 \
-      --mask_type random --output_dir results
+      --accelerations 4 --center_fractions 0.08 \
+      --mask_type equispaced_fraction --output_dir output
+
+  --state_dict accepts the released fastMRI state dict or a Lightning
+  checkpoint written by ../training/train_wandb.py. The architecture
+  (cascades, channels, pools) is read from the file, so a checkpoint trained
+  with 8 cascades and the released 12-cascade model load the same way. The
+  --num_cascades/--chans/... flags only matter with --random_init.
 
 W&B
 ---
@@ -27,6 +33,9 @@ W&B
   With no key it falls back to offline mode automatically and writes the run
   under <output_dir>/wandb for a later `wandb sync`. Pass --no_wandb to
   disable entirely. The key is never read from a file or an argument.
+  As in training, the run id is --run_name (resume="allow"), so a
+  resubmitted job continues the same W&B run; pass a new --run_name (or
+  --wandb_id) for a genuinely new one.
 
 Exit codes
 ----------
@@ -41,6 +50,7 @@ import csv
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -61,10 +71,12 @@ STATE_DICT_URL = (
     "knee_leaderboard_state_dict.pt"
 )
 
-# Architecture of the released knee checkpoint. Do not change these when
-# loading knee_leaderboard_state_dict.pt; load_state_dict will fail loudly if
-# they drift. They are exposed as CLI flags only so a tiny randomly
-# initialised model can be used to smoke-test the harness itself.
+# Architecture of the released knee checkpoint, the CLI defaults. When a
+# checkpoint is loaded the architecture is read from its state dict
+# (infer_arch) and these are ignored; they only matter for --random_init,
+# where a tiny model keeps the harness smoke test to minutes. Training
+# (../training/train_wandb.py) uses 8 cascades, so a checkpoint from there
+# differs from this in num_cascades only.
 RELEASED_ARCH = dict(num_cascades=12, pools=4, chans=18, sens_pools=4, sens_chans=8)
 
 # Third-party measurements of the released checkpoint. These are pipeline
@@ -194,10 +206,16 @@ class WandB:
 
     def _init(self, args, tier, run_name, config, mode):
         wandb = self.wandb
+        # The run id is the run name (as in training/train_wandb.py) so a
+        # resubmitted job continues the same W&B run. Ids allow only
+        # [A-Za-z0-9_-]; a hostname-derived default name has dots.
+        run_id = re.sub(r"[^A-Za-z0-9_-]", "-", args.wandb_id or run_name)
         return wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity or None,
             name=run_name,
+            id=run_id,
+            resume="allow",
             job_type=tier,
             tags=[tier, "e2e-varnet", "verification"],
             config=config,
@@ -408,17 +426,52 @@ def download(url: str, dest: Path) -> None:
             bar.update(len(chunk))
 
 
-def load_model(args, device):
+def infer_arch(state: Dict) -> Dict[str, int]:
+    """Read the VarNet constructor arguments back out of a state dict.
+
+    fastmri.models.varnet names things as
+        cascades.<i>.model.unet.down_sample_layers.<j>.layers.0.weight
+        sens_net.norm_unet.unet.down_sample_layers.<j>.layers.0.weight
+    so the cascade count is the number of distinct <i>, the pool count the
+    number of distinct <j>, and the channel count the first conv's output
+    dim. This is what lets one harness score both the released 12-cascade
+    checkpoint and an 8-cascade checkpoint from ../training.
+    """
+    def unet(prefix: str):
+        pre = prefix + "down_sample_layers."
+        levels = {int(k[len(pre):].split(".")[0]) for k in state if k.startswith(pre)}
+        if not levels:
+            raise KeyError(f"no '{pre}*' keys in state dict; is this a fastmri VarNet checkpoint?")
+        chans = int(state[pre + "0.layers.0.weight"].shape[0])
+        return len(levels), chans
+
+    cascades = {int(k.split(".")[1]) for k in state if k.startswith("cascades.")}
+    pools, chans = unet("cascades.0.model.unet.")
+    sens_pools, sens_chans = unet("sens_net.norm_unet.unet.")
+    return dict(num_cascades=len(cascades), pools=pools, chans=chans,
+                sens_pools=sens_pools, sens_chans=sens_chans)
+
+
+def load_state(sd_path: Path) -> Dict:
+    """torch.load either the released state dict or a Lightning checkpoint."""
     import torch
+    state = torch.load(str(sd_path), map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state:  # a Lightning checkpoint
+        state = {k[len("varnet."):] if k.startswith("varnet.") else k: v
+                 for k, v in state["state_dict"].items()}
+    return state
+
+
+def load_model(args, device):
     from fastmri.models import VarNet
 
-    arch = dict(num_cascades=args.num_cascades, pools=args.pools, chans=args.chans,
-                sens_pools=args.sens_pools, sens_chans=args.sens_chans)
-    model = VarNet(**arch)
+    cli_arch = dict(num_cascades=args.num_cascades, pools=args.pools, chans=args.chans,
+                    sens_pools=args.sens_pools, sens_chans=args.sens_chans)
 
     if args.random_init:
         log("--random_init: using an untrained model (harness smoke test only, numbers are meaningless)")
-        source = "random_init"
+        arch, source = cli_arch, "random_init"
+        model = VarNet(**arch)
     else:
         sd_path = Path(args.state_dict)
         if not sd_path.exists():
@@ -426,10 +479,11 @@ def load_model(args, device):
                 raise FileNotFoundError(
                     f"{sd_path} not found. Pass --download_state_dict or stage it via transfer_input_files.")
             download(STATE_DICT_URL, sd_path)
-        state = torch.load(str(sd_path), map_location="cpu")
-        if isinstance(state, dict) and "state_dict" in state:  # a Lightning checkpoint
-            state = {k[len("varnet."):] if k.startswith("varnet.") else k: v
-                     for k, v in state["state_dict"].items()}
+        state = load_state(sd_path)
+        arch = infer_arch(state)
+        if arch != cli_arch:
+            log(f"architecture read from {sd_path.name}: {arch} (CLI flags {cli_arch} ignored)")
+        model = VarNet(**arch)
         model.load_state_dict(state, strict=True)
         source = "pretrained"
         log(f"loaded {sd_path} ({sum(p.numel() for p in model.parameters())/1e6:.2f}M params)")
@@ -773,8 +827,11 @@ def tier1(args) -> int:
 # --------------------------------------------------------------------------
 
 def add_common(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--output_dir", type=Path, default=Path("results"))
-    p.add_argument("--run_name", type=str, default=None, help="W&B run name and results.csv run_id")
+    p.add_argument("--output_dir", type=Path, default=Path("output"))
+    p.add_argument("--run_name", type=str, default=None,
+                   help="W&B run name and id (unless --wandb_id is given) and results.csv run_id. "
+                        "Keep it the same across resubmissions of one run so W&B continues the run.")
+    p.add_argument("--wandb_id", type=str, default=None, help="override the W&B run id (default: --run_name)")
     p.add_argument("--fastmri_repo", type=Path, default=None,
                    help="fastMRI checkout, used for git sha and (tier0) --run_pytest")
     p.add_argument("--no_wandb", action="store_true")
@@ -793,12 +850,17 @@ def build_parser() -> argparse.ArgumentParser:
     p1 = sub.add_parser("tier1", help="released-checkpoint evaluation on multicoil_val")
     add_common(p1)
     p1.add_argument("--data_path", type=Path, required=True, help="directory of multicoil_val .h5 files")
-    p1.add_argument("--state_dict", type=str, default="knee_leaderboard_state_dict.pt")
+    p1.add_argument("--state_dict", type=str, default="knee_leaderboard_state_dict.pt",
+                    help="released fastMRI state dict or a Lightning .ckpt from ../training; "
+                         "the architecture is read from the file")
     p1.add_argument("--download_state_dict", action="store_true",
                     help="download the released checkpoint if --state_dict is missing")
-    p1.add_argument("--mask_type", choices=("random", "equispaced", "equispaced_fraction"), default="random")
-    p1.add_argument("--accelerations", type=int, nargs="+", default=[4, 8])
-    p1.add_argument("--center_fractions", type=float, nargs="+", default=[0.08, 0.04])
+    # defaults match ../training/train_wandb.py (model 1). random + 4 8 is
+    # the fastMRI knee convention the reference values are keyed on.
+    p1.add_argument("--mask_type", choices=("random", "equispaced", "equispaced_fraction"),
+                    default="equispaced_fraction")
+    p1.add_argument("--accelerations", type=int, nargs="+", default=[4])
+    p1.add_argument("--center_fractions", type=float, nargs="+", default=[0.08])
     p1.add_argument("--volume_limit", type=int, default=0, help="evaluate only the first N volumes (sorted)")
     p1.add_argument("--determinism_volumes", type=int, default=3,
                     help="re-run this many volumes and compare (0 disables)")
@@ -810,7 +872,8 @@ def build_parser() -> argparse.ArgumentParser:
     p1.add_argument("--num_workers", type=int, default=4)
     p1.add_argument("--seed", type=int, default=42)
     p1.add_argument("--cpu", action="store_true", help="force CPU even if CUDA is available")
-    # architecture: defaults are the released checkpoint, override only for harness smoke tests
+    # architecture: read from the checkpoint when one is loaded; these only
+    # take effect with --random_init (harness smoke tests)
     for k, v in RELEASED_ARCH.items():
         p1.add_argument(f"--{k}", type=int, default=v)
     p1.add_argument("--random_init", action="store_true",

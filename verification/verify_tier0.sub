@@ -1,22 +1,26 @@
-# verify_tier0.sub: Tier 0 on a CHTC GPU node. No data, runs the environment
+# verify_tier0.sub: Tier 0 on a CHTC GPU node. No data: the environment
 # checks, the metric-identity check, and the fastMRI repo test suite inside
-# the container. Submit with ./submit.sh tier0
+# the container. Submit with ./submit.sh tier0 (or `make submit-tier0`).
 #
 # Run this once per image tag before any Tier 1 job. A failing Tier 0 means
 # the image is wrong and no Tier 1 result from it can be trusted.
+# Same macro names and directory layout as verify.sub / train.sub, so
+# logs/tier0_<Cluster>.* and runs/tier0/<Cluster>/ sit next to the model runs.
 
-image           = docker://CHANGE_ME/fastmri-verify:2026-09
+image           = docker://genjigod/fastmri-verify:2026-09
+model           = tier0
+run_name        = verify-$(model)
 
 universe        = container
 container_image = $(image)
 executable      = run_verify.sh
-arguments       = tier0 --run_name tier0-$(Cluster)
+arguments       = tier0 --run_name $(run_name)
 
 transfer_input_files    = verify_varnet.py
 should_transfer_files   = YES
 when_to_transfer_output = ON_EXIT
-transfer_output_files   = results
-transfer_output_remaps  = "results = runs/$(Cluster)"
+transfer_output_files   = output
+transfer_output_remaps  = "output = runs/$(model)/$(Cluster)"
 
 getenv          = WANDB_API_KEY, WANDB_ENTITY, WANDB_PROJECT
 environment     = "WANDB_PROJECT=fastmri-varnet-verify"
@@ -29,9 +33,9 @@ gpus_minimum_capability = 7.0
 +WantGPULab     = true
 +GPUJobLength   = "short"
 
-log             = logs/tier0_$(Cluster).log
-output          = logs/tier0_$(Cluster)_$(Process).out
-error           = logs/tier0_$(Cluster)_$(Process).err
+log             = logs/$(model)_$(Cluster).log
+output          = logs/$(model)_$(Cluster)_$(Process).out
+error           = logs/$(model)_$(Cluster)_$(Process).err
 stream_output   = True
 stream_error    = True
 

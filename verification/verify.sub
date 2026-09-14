@@ -1,28 +1,42 @@
-# verify.sub: HTCondor submit file for Tier 1 (released-checkpoint evaluation)
-# on CHTC. Submit from this directory via ./submit.sh, which creates the log
-# and run directories and checks that the W&B key is exported first.
+# verify.sub: HTCondor submit file for E2E VarNet evaluation on CHTC.
+# Deliberately the same shape as ../training/train.sub: the same macros, the
+# same model presets applied by submit.sh, the same logs/ and
+# runs/<model>/<Cluster>/ layout, the same resources. The only thing that
+# differs is what runs inside the job: verify_varnet.py scores a checkpoint
+# on multicoil_val instead of training one from scratch.
+# Submit from this directory via ./submit.sh (or `make submit-model1`), which
+# creates the log/run directories, applies the per-model macros, and checks
+# that the W&B key is exported first.
 #
-#   ./submit.sh                              full val, 4x and 8x
-#   ./submit.sh volume_limit=20              first 20 volumes (smoke run)
-#   ./submit.sh data=knee_multicoil_val_synthetic.tar request_disk=20GB
+#   ./submit.sh model1                     4x only
+#   ./submit.sh model2                     2x/4x/6x/8x, every rate scored over the whole val set
+#   ./submit.sh model1 ckpt=runs/model1/123/checkpoints/last.ckpt    score a checkpoint you trained
+#   ./submit.sh model1 volume_limit=20 extra_args="--num_workers 0"
 #
-# Edit `image` below before first use. `staging` is already set: this
-# account's personal /staging directory on ap2001, confirmed writable
-# 2026-09-10. The shared group directory
-# /staging/groups/kamilov_group/Kamilov-SciAI-datasets is not readable by this
-# account; if that changes, this one macro is the only thing to repoint.
+# Edit `image` below before first use. `staging` is this account's personal
+# /staging directory on ap2001 (confirmed writable 2026-09-10). If access to
+# /staging/groups/kamilov_group/Kamilov-SciAI-datasets is granted later, this
+# one macro is the only thing to repoint.
 
 staging    = /staging/a/apryan3/fastmri
-image      = docker://CHANGE_ME/fastmri-verify:2026-09
+image      = docker://genjigod/fastmri-verify:2026-09
 
-# --- what to run -----------------------------------------------------------
-tier            = tier1
-accelerations   = 4 8
-center_fractions = 0.08 0.04
-mask_type       = random
-volume_limit    = 0
-extra_args      =
-arguments       = $(tier) --accelerations $(accelerations) --center_fractions $(center_fractions) --mask_type $(mask_type) --volume_limit $(volume_limit) --run_name tier1-$(Cluster) $(extra_args)
+# --- what to evaluate --------------------------------------------------------
+# The two lists are paired elementwise (fastmri.data.subsample.MaskFunc) and
+# are the same presets training uses. Training draws one pair per sample;
+# evaluation scores every pair over the whole val set, one pass per rate.
+# Defaults are model 1; submit.sh overrides them for model 2. center_fractions
+# follow the fastMRI convention 0.32 / R (0.08 at 4x, 0.04 at 8x).
+model            = model1
+accelerations    = 4
+center_fractions = 0.08
+mask_type        = equispaced_fraction
+volume_limit     = 0
+# Same run_name across resubmissions of one run keeps a single W&B run;
+# change it (run_name=verify-model1-trained) for a genuinely new run.
+run_name         = verify-$(model)
+extra_args       =
+arguments        = tier1 --run_name $(run_name) --accelerations $(accelerations) --center_fractions $(center_fractions) --mask_type $(mask_type) --volume_limit $(volume_limit) $(extra_args)
 
 # --- container ---------------------------------------------------------------
 universe        = container
@@ -31,23 +45,28 @@ executable      = run_verify.sh
 
 # --- input files -------------------------------------------------------------
 # Large inputs live in /staging and are transferred into the job scratch by
-# HTCondor, never read directly. Personal staging is sharded by the first
-# letter of the netid: /staging/a/apryan3, not /staging/apryan3.
+# HTCondor, never read directly. CHTC's size rule: osdf:///chtc/staging/<path>
+# for 1-30 GB, file:///staging/<path> for 30 GB and up. Override for subsets:
+#   ./submit.sh model1 val_data=osdf:///chtc/staging/a/apryan3/fastmri/knee_multicoil_val_subset.tar request_disk=60GB
 #
-# CHTC's size rule for /staging inputs is osdf:///chtc/staging/<path> for
-# 1-30 GB and file:///staging/<path> for 30-100 GB. The val tarball is
-# 93.8 GB, so both inputs use file:// here. A small synthetic subset passed
-# as data=... on the submit.sh command line can use osdf:// instead.
-data            = file://$(staging)/knee_multicoil_val.tar.xz
+# `ckpt` is the checkpoint to score: the released fastMRI knee model by
+# default, or a Lightning checkpoint from ../training
+# (ckpt=runs/model1/<Cluster>/checkpoints/last.ckpt). run_verify.sh picks up
+# whatever *.pt / *.ckpt lands in the sandbox, and verify_varnet.py reads the
+# architecture (cascades, channels, pools) from the file itself.
+val_data        = file://$(staging)/knee_multicoil_val.tar.xz
 ckpt            = file://$(staging)/knee_leaderboard_state_dict.pt
-transfer_input_files = verify_varnet.py, $(ckpt), $(data)
+transfer_input_files = verify_varnet.py, $(val_data), $(ckpt)
 should_transfer_files    = YES
+# ON_EXIT_OR_EVICT: output/ (partial results, the W&B run) comes back even
+# when the job is evicted, the same as train.sub.
 when_to_transfer_output  = ON_EXIT_OR_EVICT
 
 # --- output files ------------------------------------------------------------
-# results/ (json report, per-volume CSVs, results.csv, offline W&B run if no key)
-transfer_output_files   = results
-transfer_output_remaps  = "results = runs/$(Cluster)"
+# output/tier1_report.json, output/per_volume_R<N>.csv, output/results.csv,
+# output/wandb/ (offline run if no key)
+transfer_output_files   = output
+transfer_output_remaps  = "output = runs/$(model)/$(Cluster)"
 
 # --- secrets -----------------------------------------------------------------
 # Only these names are copied from the submitting shell, and only if set. The
@@ -57,26 +76,32 @@ getenv          = WANDB_API_KEY, WANDB_ENTITY, WANDB_PROJECT
 environment     = "WANDB_PROJECT=fastmri-varnet-verify"
 
 # --- resources ---------------------------------------------------------------
-# request_disk covers peak scratch, which is during extraction: run_verify.sh
-# deletes the tarball only after `xz | tar` finishes, so both copies exist at
-# once -- 93.8 GB compressed + ~192 GB extracted = ~290 GB, plus results.
-# Override for a subset tarball (a 20-volume plain .tar needs ~20 GB).
+# Identical to train.sub so both jobs land on the same class of slot.
+# request_disk covers peak scratch during extraction: run_verify.sh deletes a
+# tarball only after `xz | tar` finishes, so compressed + extracted coexist
+# (val: 93.8 GB + ~192 GB). Size it from the tarball actually staged and
+# override on the command line: ./submit.sh model1 request_disk=60GB
 #
-# HasCHTCStaging selects slots that can read /staging inputs.
+# request_cpus: DataLoader workers (--num_workers, default 4) plus the main
+# process. HasCHTCStaging selects slots that can read /staging inputs.
+# gpus_minimum_memory carries a unit suffix because condor_submit warns
+# (and may one day change the default) when it is a bare number.
 requirements    = (Target.HasCHTCStaging == true)
-request_cpus    = 4
-request_memory  = 32GB
-request_disk    = 320GB
+request_cpus    = 8
+request_memory  = 48GB
+request_disk    = 350GB
 request_gpus    = 1
-gpus_minimum_memory     = 16000
+gpus_minimum_memory     = 24000M
 gpus_minimum_capability = 7.0
 +WantGPULab     = true
+# Inference only: the full val set at four rates is hours, not days, so the
+# "short" class queues faster than training's "long".
 +GPUJobLength   = "short"
 
 # --- logs ------------------------------------------------------------------
-log             = logs/$(tier)_$(Cluster).log
-output          = logs/$(tier)_$(Cluster)_$(Process).out
-error           = logs/$(tier)_$(Cluster)_$(Process).err
+log             = logs/$(model)_$(Cluster).log
+output          = logs/$(model)_$(Cluster)_$(Process).out
+error           = logs/$(model)_$(Cluster)_$(Process).err
 stream_output   = True
 stream_error    = True
 

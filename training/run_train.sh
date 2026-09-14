@@ -113,6 +113,12 @@ RC=$?
 trap - TERM INT
 
 echo "[run_train] exit code $RC"
+# W&B leaves output/wandb/latest-run as a symlink to the run directory.
+# HTCondor refuses to transfer a symlink to a directory and puts the job on
+# hold instead ("Transfer of symlinks to directories is not supported"), so
+# every symlink under output/ is dropped before exit. Nothing is lost: the
+# run directory itself is transferred.
+find output -type l -exec rm -f {} +
 ls -la output output/checkpoints
 # output/ must exist and be non-empty for transfer_output_files even on failure
 [ -n "$(ls -A output)" ] || echo "no output produced, rc=$RC" > output/EMPTY
