@@ -7,10 +7,21 @@ check, how do we check them, and what do we say when we cannot.
 Nothing here depends on `plan.md`. Run this protocol before any DPI work begins, and re-run
 Tier 1 whenever the environment, the data, or the eval code changes.
 
-*Status: drafted 2026-09-09, not yet executed. No tier has been run.*
+*Status 2026-09-11: drafted 2026-09-09. Tiers 0 and 1 are implemented and pass locally on
+synthetic data (`cd verification && make local-run`). **No tier has been run on real data or on
+CHTC.** Tiers 2 and 3 are training runs and go through `training/`, which is likewise built but
+unrun.*
 
 Tiers 0 and 1 are implemented in `verification/verify_varnet.py`, with the Docker image and
 CHTC submit files alongside it. See `verification/README.md` for the run order.
+
+**One constraint added since drafting.** The 100 GB `/staging` quota forced a decision
+(2026-09-11, `ROADMAP.md` Phase 2) to repack both splits into subsets rather than request more
+quota. That repack deletes the full `knee_multicoil_val.tar.xz`, so a Tier 1 run over all 199
+validation volumes is only possible *before* it, and every Tier 2 / Tier 3 run happens on ~120
+of the 973 training volumes and 20 of the 199 validation volumes. Section 5.3's "reduced-data
+baseline" language is therefore the default case, not the fallback: nothing produced by this
+project should be described as a reproduction of the paper's numbers.
 
 ---
 
@@ -144,8 +155,10 @@ fixtures and catches most environment breakage before it costs GPU time.
 Feed the ground truth in as the prediction. This validates `fastmri.evaluate` end to end with
 zero ambiguity about what the correct answer is.
 
+Implemented as part of `verify_varnet.py tier0`; the standalone form below is what it checks.
+
 ```python
-# tools/verify_metrics_identity.py
+# equivalent standalone: tools/verify_metrics_identity.py
 import numpy as np
 from fastmri.evaluate import ssim, psnr, nmse, mse
 
@@ -187,6 +200,12 @@ not start Tier 2 or any DPI work until this passes.
 
 `knee_multicoil_val` only (93.8 GB). Verify against the `SHA256` file from the NYU download
 before extracting. Extract to `<data>/multicoil_val/` as a flat directory of `.h5`.
+`verification/prepare_staging.sh` does the download and the SHA256 check, and is idempotent
+and resumable.
+
+If the section-3b repack has already happened, the full tarball is gone and what remains is
+`knee_multicoil_val_subset.tar`, 20 volumes. Tier 1 still runs and still verifies Claim A;
+record `n_volumes` (the harness does) and do not compare a 20-volume mean to a 199-volume one.
 
 ### 4.2 The script change that is required
 
@@ -199,13 +218,12 @@ stored inside the file, and only the test and challenge splits store one. Run as
 `multicoil_val` and it fails.
 
 Write a copy rather than editing the repo file, keeping `fastmri/` untouched in line with the
-convention in `plan.md`:
+convention in `plan.md`. This was implemented as `verification/verify_varnet.py` (subcommand
+`tier1`) rather than the `tools/eval_pretrained_val.py` this section originally specified; it
+also folds in the 4.4 verdicts, the 4.5 invariants, the per-volume CSV from 6.3, and the
+section 8 `results.csv` row.
 
-```
-tools/eval_pretrained_val.py
-```
-
-Differences from the original, and only these:
+Differences from the original inference script, and only these:
 
 - `mask = create_mask_for_mask_type(args.mask_type, args.center_fractions, args.accelerations)`
 - `data_transform = T.VarNetDataTransform(mask_func=mask)`
@@ -219,23 +237,32 @@ sens_chans=8)`. Do not change it. That is the architecture the released state di
 ### 4.3 Run
 
 One pass per acceleration. The random mask family is the one the reference values above used.
+The harness does both passes in one invocation, scores them inline (no separate
+`fastmri.evaluate` step), and applies the 4.4 verdicts and 4.5 invariants itself.
+
+On CHTC, which is where this is meant to run:
 
 ```bash
-for R in 4 8; do
-  case $R in 4) F=0.08 ;; 8) F=0.04 ;; esac
-  python tools/eval_pretrained_val.py \
-    --challenge varnet_knee_mc \
-    --data_path  <data>/multicoil_val \
-    --output_path runs/pretrained_val_R${R} \
-    --mask_type random --center_fractions $F --accelerations $R \
-    --seed 42
-  python -m fastmri.evaluate \
-    --target-path      <data>/multicoil_val \
-    --predictions-path runs/pretrained_val_R${R}/reconstructions \
-    --challenge multicoil \
-    | tee runs/pretrained_val_R${R}/metrics.txt
-done
+cd verification
+export WANDB_API_KEY=...             # or OFFLINE=1
+./submit.sh volume_limit=20          # sanity pass first, ~30 min incl. extraction
+./submit.sh                          # the real one: all volumes, 4x and 8x
 ```
+
+The underlying command, for a local GPU or an interactive job (`make tier1` wraps it):
+
+```bash
+python verify_varnet.py tier1 \
+    --data_path   <data>/multicoil_val \
+    --state_dict  <data>/knee_leaderboard_state_dict.pt \
+    --output_dir  results --fastmri_repo /opt/fastMRI \
+    --mask_type random --accelerations 4 8 --center_fractions 0.08 0.04 \
+    --seed 42
+```
+
+Output: `results/tier1_report.json` (verdicts + config), `results/per_volume_R{4,8}.csv`, and an
+appended row per rate in `results/results.csv` using the section 8 schema. Exit code 1 means at
+least one FAIL.
 
 ### 4.4 Pass criteria
 
@@ -328,9 +355,11 @@ executable. Port its values into `train_varnet_demo.py`. It is also the Table 3 
 | more than 0.030 below | undertrained or buggy, do not report, debug |
 | above the paper | suspect leakage or a metric mismatch, investigate before celebrating |
 
-If training on one downloaded train batch rather than the full 973-volume training set, a deficit
-is expected and the run should not be described as a reproduction attempt at all. Call it a
-reduced-data baseline.
+If training on a subset rather than the full 973-volume training set, a deficit is expected and
+the run should not be described as a reproduction attempt at all. Call it a reduced-data
+baseline. **This is the current default**: under the `/staging` quota both Phase A models train
+on ~120 volumes (`training/README.md` section 3b), so expect to land in the bottom rows of the
+table above and report accordingly.
 
 ### 5.4 Deviation register
 
@@ -388,9 +417,10 @@ test over volumes (Wilcoxon signed-rank is the safe default, since per-volume SS
 normally distributed). Report the median paired difference and its confidence interval alongside
 the mean-of-means.
 
-This requires per-volume output, which `fastmri.evaluate` does not currently emit. A small
-wrapper that pushes per-volume values to a CSV instead of only to the `Statistics` aggregator is
-worth writing once, at Tier 1, and reusing everywhere.
+This requires per-volume output, which `fastmri.evaluate` does not emit. That wrapper now
+exists: `verify_varnet.py` writes `per_volume_R<N>.csv` (SSIM / PSNR / NMSE / MSE per volume,
+model and zero-filled) on every Tier 1 run, and its `volume_metrics()` and
+`crop_like_evaluate()` can be imported by the Tier 3 scripts rather than reimplemented.
 
 ### 6.4 Baseline competence check
 
@@ -444,10 +474,15 @@ without a row here does not exist.
 
 ## 9. Execution order
 
+0. `cd verification && make local-run` on the laptop. Everything below assumes a green image.
 1. Tier 0, all four checks. No data needed.
-2. Download `knee_multicoil_val`, verify SHA256.
-3. Tier 1. Do not proceed past a failure.
-4. Download one train batch, size the staging quota.
+2. Download `knee_multicoil_val`, verify SHA256 (`verification/prepare_staging.sh` on
+   `transfer.chtc.wisc.edu`).
+3. Tier 1, on the full split. Do not proceed past a failure. **This is the last point at which
+   the full val split exists** — step 4 deletes it.
+4. Repack `/staging` into the two subsets: `training/` `make subset-val`, delete the full val
+   tarball, `make subset-train`. Keep both `*_subset_files.txt` in the repo; they define the
+   data every later number is measured on.
 5. Tier 3.1, three baseline seeds. Establish $\sigma$ before any DPI comparison exists.
 6. Tier 2, Table 2 reproduction at 4x, 6x, 8x, if the compute budget allows.
 7. Tier 2 with the fixed-line mask for Table 1, optional.

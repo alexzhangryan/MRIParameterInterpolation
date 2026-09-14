@@ -10,6 +10,28 @@ Phase A exists to get a working, correctly-instrumented baseline before touching
 
 ---
 
+## Where this actually stands (2026-09-11)
+
+Everything below is built and green locally. **Nothing has run on CHTC yet** — no
+job has been submitted, no tier of `VERIFICATION.md` has been executed, no
+training has started, and `/staging` has not been confirmed to hold any fastMRI
+data.
+
+| Piece | State |
+|---|---|
+| `verification/` harness (Tiers 0 + 1), Docker image, submit files, local `make local-run` | written, smoke-tested on synthetic data |
+| `training/` driver + job executable + `train.sub`, local `make smoke` / `make job-smoke` | written, smoke-tested on synthetic data, checkpoint/resume contract asserted |
+| Staging repack (`make_subset.sh`, `subset_val.sub`, `subset_train.sub`) | written, exercised on synthetic archives, **never run on CHTC** |
+| `train.sub` image macro | set to `docker://genjigod/fastmri-train:2026-09` |
+| `verify.sub` image macro | still `CHANGE_ME` — edit before the first verification submit |
+| Data in `/staging/a/apryan3/fastmri/` | unconfirmed; assume nothing is there until `ls` says otherwise |
+| Phase B (DPI) | designed in `plan.md`, no code written |
+
+The immediate next action is a CHTC session: confirm what is in `/staging`, push
+the images, then Tier 0 → Tier 1 → the section 3b repack → training.
+
+---
+
 ## Security note — do this first
 
 Your previous CHTC project (`Research/` on your Desktop, the diffusion model collapse work) has a **live-looking Weights & Biases API key hardcoded in `inpainting.sub`**, committed to git history and pushed to the public repo `alexzhangryan/Diffusion-Model-Collapse`. Rotate that key in your W&B account settings before starting new work. Going forward, don't write secrets into `.sub` files that get committed — inject them via an untracked local env file or CHTC's environment-injection mechanisms instead.
@@ -19,10 +41,10 @@ Your previous CHTC project (`Research/` on your Desktop, the diffusion model col
 ## Definition of done for Phase A this week
 
 - [x] fastMRI knee dataset access requested — approved week of 2026-09-08, presigned URLs in hand
-- [ ] CHTC GPU environment set up and reproducible (container + repo cloned + env documented)
-- [ ] `train_varnet_demo.py` runs successfully end-to-end on a small local subset (smoke test)
+- [x] CHTC GPU environment set up and reproducible — two Docker images (`verification/Dockerfile`, `training/Dockerfile`, both pinned to fastMRI `91f2df4`, Lightning 1.9.5, torch 2.0.1+cu118, conda h5py, `linux/amd64`), submit files, and runbooks. Not yet exercised on a CHTC slot
+- [x] Training runs end-to-end on a small local subset (smoke test) — `training/make smoke` (the driver) and `training/make job-smoke` (the job executable as HTCondor runs it, twice, to assert resume-after-eviction), both on synthetic phantoms
 - [ ] A real training job is submitted to CHTC and producing checkpoints
-- [ ] Known deviations from the paper's setup are documented so results get interpreted correctly
+- [x] Known deviations from the paper's setup are documented — `VERIFICATION.md` sections 1 and 5.4, `training/README.md` "Known deviations from Sriram et al. 2020". The reduced-subset deviation (section 3b) is the biggest one and is new as of 2026-09-11
 
 ## Reusing your proven CHTC recipe
 
@@ -62,47 +84,55 @@ fastmri@med.nyu.edu if they lapse before the data is staged.
 ## Phase 1 — CHTC environment (do in parallel, don't wait on Phase 0)
 
 - [ ] Confirm your CHTC account still works at `ap2001.chtc.wisc.edu` (same account as the diffusion-collapse work) or file a new account request if this is a separate allocation
-- [ ] `git clone https://github.com/facebookresearch/fastMRI` into your project directory
-- [ ] Build a Docker image (extend the pattern from `Research/Dockerfile`) with PyTorch matching a CUDA version CHTC's GPUs support, `pip install -e .` for the `fastmri` package, and `conda install h5py=3.6.0` specifically (pip's h5py has a known memory leak that matters for a multi-day training job) — push it to Docker Hub
-- [ ] Write `varnet.sub` following the `diffusion.sub` template: `universe = container`, your new image, resource requests sized for VarNet, `transfer_output_files` pointed at wherever checkpoints/logs land
+- [x] fastMRI vendored as a submodule at commit `91f2df4` (`fastMRI/`), never modified. The DPI reference code is a second submodule, `parameter_interpolation/`
+- [x] Docker images built for both stages, `linux/amd64`, conda `h5py` (pip's leaks over a multi-day run), fastMRI installed at the pinned commit, and a build-time self-check that asserts Lightning is 1.x. **Push to Docker Hub still to confirm**; `train.sub` already points at `docker://genjigod/fastmri-train:2026-09`, `verify.sub` still says `CHANGE_ME`
+- [x] Submit files written: `training/train.sub` (container universe, 1 GPU, `ON_EXIT_OR_EVICT` so an evicted job resumes from its own `output/`), `verification/verify.sub` + `verify_tier0.sub`, and the two one-off repack jobs `training/subset_val.sub` / `subset_train.sub`. Each has a `submit.sh` wrapper that creates the output directories and refuses to submit without a W&B key unless `OFFLINE=1`
 - [x] `/staging` confirmed working on `ap2001`: **`/staging/a/apryan3/`** (personal staging, sharded by the netid's first letter). `/home` is 40 GB and holds code only — the dataset was never going to fit there. The shared `/staging/groups/kamilov_group/Kamilov-SciAI-datasets` is not readable by this account
 
 ## Phase 2 — Data transfer
 
-Target: **`/staging/a/apryan3/fastmri/`**. NYU already ships each split as a
-single large `.tar.xz`, so there is no repackaging to do — the archive stays
-packed in `/staging` and HTCondor transfers it into job scratch, where
-`run_verify.sh` extracts it.
+Target: **`/staging/a/apryan3/fastmri/`**. Archives stay packed in `/staging`;
+HTCondor transfers them into job scratch, where `run_verify.sh` / `run_train.sh`
+extract them. A job never reads `/staging` directly.
+
+NYU ships each split as one or more large `.tar.xz`, and **neither full split
+fits the 100 GB quota**, so there *is* repackaging to do — see the decision
+below and `training/README.md` section 3b.
 
 - [ ] Fetch `knee_multicoil_val.tar.xz` (93.8 GB) straight from the NYU presigned URL onto CHTC with `verification/prepare_staging.sh`, run on `transfer.chtc.wisc.edu` under tmux with `PARALLEL=1..4`
 - [ ] Do **not** scp the desktop copy up: that connection is per-flow shaped, so a 94 GB upload takes days where an S3-to-campus fetch takes hours
 - [ ] Verify against NYU's `SHA256` manifest — `prepare_staging.sh` does this automatically and is idempotent and resumable
 - [ ] Sanity-check that a handful of files load correctly with `h5py` before trusting the full set
-- [ ] **Quota gate — now the critical path, not just a Phase 3 concern:** `/staging/a/apryan3` is capped at 100 GB (confirmed 2026-09-10) and the val tarball is 100,694,526,932 bytes, i.e. 93.8 GiB or 100.7 GB decimal. It fits only under binary counting and leaves nothing over either way. Request an increase before the transfer; `multicoil_train` (~931 GB unpacked) needs one regardless, as does group-directory access if that comes through
+- [x] **Decision 2026-09-11: do not request a quota increase (last resort).** Instead repack `/staging` into subsets that fit: `training/README.md` section 3b (`make subset-val`, then delete the full val tarball, then `make subset-train`, which streams a ~65 GB prefix of NYU's `knee_multicoil_train_batch_0` (the split ships as five ~91 GB batches) straight into `/staging`). `train.sub` now defaults to the subset names. Both jobs and `run_train.sh` were tested end to end on synthetic archives in the training image; not yet run on CHTC
+- [ ] **Quota gate — superseded by the line above unless the full splits are ever wanted:** `/staging/a/apryan3` is capped at 100 GB (confirmed 2026-09-10) and the val tarball is 100,694,526,932 bytes, i.e. 93.8 GiB or 100.7 GB decimal. It fits only under binary counting and leaves nothing over either way. Request an increase before the transfer; `multicoil_train` (~931 GB unpacked) needs one regardless, as does group-directory access if that comes through
 
 ## Phase 3 — Get training actually running
 
 - [ ] Generate `fastmri_dirs.yaml` (or pass `--data_path` directly) pointing at the data — inside a job that means the copy HTCondor transferred into scratch, not `/staging` itself
 - [ ] **Smoke test first**, locally or in a short job, on a tiny subset (10-20 files) before submitting a real GPU job — catches path/env bugs without burning queue time
-- [ ] Submit the real job with the paper-matching flags:
+- [ ] Submit the real job. This is now `training/submit.sh`, not a bare
+  `train_varnet_demo.py` invocation: `train_wandb.py` builds the same
+  `VarNetModule` / `FastMriDataModule` and adds the W&B logger and the
+  auto-resume-from-`output/checkpoints` contract a multi-day CHTC run needs.
+  Two runs, one after the other:
+  ```bash
+  # on ap2001, in ~/Fall26Research/training, WANDB_API_KEY exported
+  make submit-model1   # accelerations 4,       center_fractions 0.08
+  make submit-model2   # accelerations 2 4 6 8, center_fractions 0.16 0.08 0.0533 0.04
   ```
-  python train_varnet_demo.py \
-    --challenge multicoil \
-    --data_path /staging/a/apryan3/fastmri/knee \
-    --mask_type equispaced_fraction \
-    --center_fractions 0.08 \
-    --accelerations 4 \
-    --num_cascades 8 \
-    --chans 18 \
-    --lr 0.001 \
-    --batch_size 1 \
-    --gpus 2 \
-    --max_epochs 50
-  ```
-- [ ] **Document known deviations from the paper** before trusting numbers against it:
-  - this implementation uses a variable `center_fractions` rather than the paper's fixed center lines
-  - it trains jointly on 4x and 8x acceleration rather than separate models per the paper (this matters directly for Phase B — right now there's no explicit conditioning signal for acceleration rate at all, joint training just relies on the mask pattern differing)
-  - the reported leaderboard numbers combined `train`+`val` splits — keep them separate for a valid held-out comparison
+  Everything else is the `train_varnet_demo.py` default (8 cascades, 18 chans,
+  Adam 1e-3 with x0.1 at epoch 40, batch 1, 50 epochs, `equispaced_fraction`,
+  seed 42) except `--gpus 1` instead of 2. model1 is the Phase A reproduction
+  target; model2 is the joint-training-no-conditioning Phase B baseline.
+  Full runbook: `training/README.md` section 4.
+- [x] **Known deviations from the paper documented** — the register lives in
+  `training/README.md` ("Known deviations from Sriram et al. 2020") and
+  `VERIFICATION.md` sections 1 and 5.4. In short:
+  - variable `center_fractions` rather than the paper's fixed center-line counts (29/15 at 368 wide vs 30/16)
+  - model2 trains jointly across four rates rather than one model per rate, with no explicit conditioning signal — exactly the gap Phase B targets
+  - `equispaced_fraction` is the corrected-density family and matches neither paper table; `random` is the knee-leaderboard convention
+  - the released checkpoint's leaderboard numbers combined `train`+`val`, so `multicoil_val` is training data for it — fine for pipeline verification (Claim A), useless as a generalization estimate
+  - **and now the big one:** both models train on the section-3b subsets (~120 of 973 train volumes, 20 of 199 val volumes), so absolute numbers are not comparable to the paper at all. Every Phase A/B comparison must use the same two subsets
 - [ ] A 50-epoch multicoil run will very likely exceed a single GPU job's runtime cap — confirm checkpoint resume actually works before relying on it across multiple resubmissions
 
 ## Phase 4 — Monitor and sanity-check
@@ -131,7 +161,8 @@ Rough plan to adapt it to VarNet:
 ## Known risks / things likely to slow this down
 
 - fastMRI approval timeline is undocumented — start Phase 0 today regardless of what else is ready
-- Dataset size vs the 100 GB `/staging` quota — the val tarball is within a rounding error of the entire quota (93.8 GiB against 100 GB, unit-dependent) and the train split is nowhere close. Gates both a full Tier 1 run on CHTC and any from-scratch training until there is a quota increase or group-directory access
+- Dataset size vs the 100 GB `/staging` quota — resolved by repacking into subsets rather than by a quota increase (Phase 2 decision, 2026-09-11). The residual cost: a full Tier 1 run on all 199 val volumes is only possible *before* `make subset-val` deletes the full val tarball, or after re-downloading it from the NYU URL (valid to ~2026-12-08). Run Tier 1 first if that number is wanted
+- The subset path has never been exercised on CHTC. The two repack jobs are the riskiest unrun thing in the repo: `subset_train.sub` streams a 65 GB HTTP range request through `xz` in a CPU slot and writes its output straight into `/staging` via `transfer_output_remaps`, which goes on hold if the quota is short
 - GPU queue times can be long for high-end tiers; a mid-tier GPU is fine for a first working run
 - Job runtime caps mean the real training run will not finish in one submission — expected, not a bug
 - Phase B has no existing reference implementation to check against — budget real time for getting the parameter-interpolation mechanics right before trusting any results from it
@@ -147,4 +178,4 @@ Rough plan to adapt it to VarNet:
 - Your prior CHTC recipe (reference): `Research/Dockerfile`, `Research/diffusion.sub`, `Research/submit.sh` on your Desktop
 
 ---
-*Last updated: 2026-09-07*
+*Last updated: 2026-09-11*

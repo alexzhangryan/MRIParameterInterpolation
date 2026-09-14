@@ -3,6 +3,11 @@
 Runbook for the two training runs. Read top to bottom the first time; after
 that, section 4 is the only part you come back to.
 
+*Status 2026-09-11: everything here is written and passes the local smoke
+tests (`make smoke`, `make job-smoke`) on synthetic data. Nothing in this
+directory has run on CHTC yet — no job submitted, and the subsets in section
+3b do not exist yet.*
+
 Nothing here modifies `fastMRI/`, `parameter_interpolation/`, or any file
 outside this directory. The job runs the `fastmri` package as installed in the
 Docker image (pinned to the same commit the `fastMRI/` submodule is checked
@@ -95,6 +100,9 @@ both at once, but that is not the plan.
 | `submit.sh` | access point | `./submit.sh model1\|model2 [name=value ...]`. Refuses to submit without a W&B key unless `OFFLINE=1`. |
 | `Makefile` | laptop + access point | `make build/push/smoke/job-smoke` (Docker) and `make submit-model1/submit-model2/resume/status/logs` (condor). |
 | `Dockerfile` | laptop (build), CHTC (run) | Lightning 1.9.5, torch 2.0.1+cu118, conda h5py, wandb, fastMRI at `91f2df4`. Pinned to `linux/amd64`. |
+| `make_subset.sh` | inside the job | One-off (section 3b): cuts `/staging` down to subsets that fit the quota. `val` extracts and re-tars N volumes; `train` streams a prefix of NYU's `train_batch_0` and re-packs the complete volumes. Validates every kept `.h5` with h5py. |
+| `subset_val.sub`, `subset_train.sub` | access point | The two CPU jobs that run `make_subset.sh`. Run once, in that order. |
+| `.env.example` | access point | Template for `.env` (gitignored): `WANDB_API_KEY`, `WANDB_ENTITY`, `FASTMRI_TRAIN_URL`. `submit.sh` and the subset targets source `.env` themselves. |
 
 ## Where things run
 
@@ -147,11 +155,15 @@ Use a dated tag, never `:latest`, so a rebuild cannot change what a checkpoint
 was produced with. The build ends with a self-check that imports `fastmri`,
 `WandbLogger`, and asserts Lightning is 1.x.
 
-Then edit one line in `train.sub` and keep it that way in git:
+Then set one line in `train.sub` and keep it that way in git:
 
 ```
 image      = docker://<dockerhub_user>/fastmri-train:2026-09
 ```
+
+It is currently `docker://genjigod/fastmri-train:2026-09`. Change it if you
+push under a different Docker Hub account; `submit.sh` only refuses to submit
+when it still says `CHANGE_ME`.
 
 ## 2. Laptop: smoke-test with no real data (minutes each, under emulation)
 
@@ -187,7 +199,11 @@ What goes up:
 | `make_subset.sh`, `subset_val.sub`, `subset_train.sub`, `.env.example` | the one-off staging repack in 3b |
 
 What must not go up: `synthetic/`, `jobtest/`, `output/`, `*.tar`, `*.ckpt`,
-`.env`, `.make/`. They are laptop smoke-test leftovers. A `.ckpt` in the
+`.env`, `.make/`, `dataset_cache.pkl`. They are laptop smoke-test leftovers.
+(`dataset_cache.pkl` is a fastMRI slice-index cache keyed by data path. One
+from a synthetic smoke run is currently committed by mistake; it is harmless
+on CHTC — the paths in it do not match, so `SliceDataset` just rebuilds — but
+it should not be there.) A `.ckpt` in the
 directory is harmless (only the one named in `resume=` is transferred), but
 the tarballs and phantoms would just waste home quota.
 
@@ -195,6 +211,7 @@ the tarballs and phantoms would just waste home quota.
 # laptop, from the repo root
 ssh apryan3@ap2001.chtc.wisc.edu 'mkdir -p ~/Fall26Research/training'
 scp training/train.sub training/submit.sh training/run_train.sh training/train_wandb.py training/Makefile \
+    training/make_subset.sh training/subset_val.sub training/subset_train.sub training/.env.example \
     apryan3@ap2001.chtc.wisc.edu:~/Fall26Research/training/
 ```
 
@@ -386,8 +403,12 @@ argument (`--num_workers`, `--sample_rate`, `--lr`, `--deterministic false`,
 
 Size `request_disk` from what is actually staged: peak scratch is every
 tarball plus its extracted contents at the same time, because `run_train.sh`
-deletes a tarball only after its extraction finishes. For the val split alone
-that is 93.8 GB + ~192 GB. The default in `train.sub` is 350 GB.
+deletes a tarball only after its extraction finishes. For the section-3b
+subsets that is (65 GB train `.tar.xz` -> ~125 GB) + (20 GB val `.tar`, no
+compression) ~= 210 GB, which is what the `request_disk = 260GB` default in
+`train.sub` covers. Pointing `train_data=` at a full NYU batch instead needs
+roughly 91 + 175 GB for that file alone: override with
+`./submit.sh model1 train_data=... request_disk=400GB`.
 
 ## 5. Monitor
 
