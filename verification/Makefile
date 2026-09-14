@@ -1,9 +1,12 @@
-# Makefile: local (laptop) driver for the verification harness.
+# Makefile: driver for the verification harness.
 #
-# Everything here runs in the same Docker image CHTC runs, so a green local run
-# means the image, the harness, and the job executable all work before a single
-# HTCondor slot is used. Nothing here touches /staging, condor, or the real
-# 94 GB dataset -- see README.md sections 3-5 for those.
+#   laptop:               make local-run build push synthetic tier0 tier1 ...
+#   ap2001.chtc.wisc.edu: make verify-model1 verify-model2 status logs
+#
+# The local targets run in the same Docker image CHTC runs, so a green local
+# run means the image, the harness, and the job executable all work before a
+# single HTCondor slot is used. They touch neither /staging nor condor -- see
+# README.md sections 3-5 for those.
 #
 #   make local-run      full smoke test from scratch: build, fake data, tier0,
 #                       tier1, job executable. This is the one to run.
@@ -45,6 +48,14 @@ PYTEST   ?= 1
 GPU      ?= $(if $(shell nvidia-smi -L 2>/dev/null),1,0)
 # extra args appended to verify_varnet.py
 EXTRA    ?=
+# ENV_FILE: the secrets file, shared by training/ and verification/. One file
+# at the repo root (see ../.env.example) so there is one key to rotate.
+ENV_FILE ?= ../.env
+# ARGS: name=value macro overrides passed through to condor_submit by the
+# verify-model* targets, e.g. ARGS='volume_limit=5'. MODEL picks the preset
+# for the bare `make verify` target.
+ARGS     ?=
+MODEL    ?= model1
 
 # Tiny architecture for the smoke test. The released checkpoint's real
 # architecture is the default in verify_varnet.py; we override it here only
@@ -99,7 +110,7 @@ RUN      := $(DOCKER) run --rm --platform $(PLATFORM) $(SHMFLAG) $(GPUFLAG) $(US
 # has a larger /dev/shm is worth checking there before assuming it is fine.
 # Weights & Biases. Every smoke target passes --no_wandb literally and stays
 # silent; this knob is for `make tier1`, the run worth a permanent record.
-# WANDB=1 (default) forwards the credentials from .env and lets the script
+# WANDB=1 (default) forwards the credentials from $(ENV_FILE) and lets the script
 # choose: online when WANDB_API_KEY arrives, offline otherwise, in which case
 # it prints the `wandb sync` command. Force it with WANDB_MODE=offline in the
 # environment. WANDB=0 turns logging off entirely.
@@ -130,11 +141,17 @@ help:
 	@echo "  make tier1-smoke     tier1 on synthetic data with a random model"
 	@echo "  make job-smoke       run run_verify.sh itself, the way HTCondor will"
 	@echo
-	@echo "  REAL DATA (needs .env with the NYU presigned URLs):"
+	@echo "  REAL DATA (needs ../.env with the NYU presigned URLs):"
 	@echo "  make data            download val set + checkpoint into DATA_DIR, verify SHA256"
 	@echo "  make extract         unpack the tarball (~2 h; xz here is single-threaded)"
 	@echo "  make tier1           the real scored run -- these verdicts count"
 	@echo "                       DATA_DIR=$(DATA_DIR)"
+	@echo
+	@echo "  ON CHTC (ap2001, condor):"
+	@echo "  make verify-model1   released weights, 4x,          on the val subset"
+	@echo "  make verify-model2   released weights, 2x/4x/6x/8x, on the val subset"
+	@echo "  make verify MODEL=model2 ARGS='volume_limit=5'"
+	@echo "  make status / make logs    condor_q, and tail the newest .out"
 	@echo
 	@echo "  make shell           interactive shell in the image, cwd mounted"
 	@echo "  make report          print the verdicts from the last run"
@@ -149,6 +166,7 @@ help:
 	@echo "         WANDB=0                   disable W&B logging for tier1"
 	@echo
 	@echo "knobs: GPU=1  PYTEST=0  VOLUMES=  SLICES=  ACCEL='4 8'  CF='0.08 0.04'  EXTRA='...'"
+	@echo "       MODEL=model2  ARGS='volume_limit=5'      (the condor targets)"
 
 # --- image ------------------------------------------------------------------
 .PHONY: build rebuild push
@@ -291,16 +309,16 @@ $(DOCKER) run --rm --platform $(PLATFORM) $(SHMFLAG) $(GPUFLAG) $(USERFLAG) $(EN
 endef
 
 # Download the real val set + released checkpoint, and verify the SHA256.
-# Reads the NYU presigned URLs from .env. Idempotent: prepare_staging.sh skips
+# Reads the NYU presigned URLs from $(ENV_FILE). Idempotent: prepare_staging.sh skips
 # files whose size already matches the server and resumes partial ones, so an
 # interrupted 94 GiB download can just be re-run.
 .PHONY: data
 data: build check-eol
-	@test -f .env || { echo "no .env -- cp .env.example .env and paste the NYU URLs" >&2; exit 1; }
-	@set -a; . ./.env; set +a; \
+	@test -f $(ENV_FILE) || { echo "no $(ENV_FILE) -- cp ../.env.example ../.env and paste the NYU URLs" >&2; exit 1; }
+	@set -a; . $(ENV_FILE); set +a; \
 	test -n "$$FASTMRI_VAL_URL" -a -n "$$FASTMRI_SHA_URL" || { \
-	  echo "FASTMRI_VAL_URL / FASTMRI_SHA_URL are empty in .env" >&2; exit 1; }
-	@set -a; . ./.env; set +a; \
+	  echo "FASTMRI_VAL_URL / FASTMRI_SHA_URL are empty in $(ENV_FILE)" >&2; exit 1; }
+	@set -a; . $(ENV_FILE); set +a; \
 	$(in_data_container) \
 	    -e FASTMRI_VAL_URL -e FASTMRI_SHA_URL -e STAGING_DIR=/data -e NETID \
 	    -e PARALLEL=$(PARALLEL) -e CHUNK_MB=$(CHUNK_MB) \
@@ -322,7 +340,7 @@ extract: build
 .PHONY: tier1
 tier1: build
 	@mkdir -p $(RESULTS)
-	@if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	@if [ -f $(ENV_FILE) ]; then set -a; . $(ENV_FILE); set +a; fi; \
 	$(in_data_container) $(WANDBENV) \
 	    -v "$(HOSTPWD)":/work -v "$$D":/data -w /work $(IMAGE) \
 	    python verify_varnet.py tier1 \
@@ -366,6 +384,31 @@ report:
 	  printf '%-38s overall=%s\n' "$$f" \
 	    "$$(sed -n 's/.*"overall": *"\([a-z]*\)".*/\1/p' "$$f" | head -1)"; \
 	done
+
+# --- CHTC submission --------------------------------------------------------
+# These run on the access point, not the laptop: they shell out to ./submit.sh,
+# which refuses to run without condor_submit and without a W&B key (OFFLINE=1
+# to log offline instead). verify-model1 / verify-model2 are the released-
+# checkpoint halves of the 2x2 in README "Pretrained vs. from-scratch" -- the
+# same masks, val subset and seed as training's submit-model1 / submit-model2,
+# evaluating the NYU leaderboard weights instead of training anything.
+.PHONY: verify-model1 verify-model2 verify status logs
+verify-model1:
+	./submit.sh model1 $(ARGS)
+
+verify-model2:
+	./submit.sh model2 $(ARGS)
+
+verify:
+	./submit.sh $(MODEL) $(ARGS)
+
+status:
+	condor_q -nobatch
+
+logs:
+	@f=$$(ls -t logs/*.out 2>/dev/null | head -1); \
+	  test -n "$$f" || { echo "no logs/*.out yet"; exit 0; }; \
+	  echo "== $$f"; tail -f "$$f"
 
 # --- misc -------------------------------------------------------------------
 .PHONY: shell

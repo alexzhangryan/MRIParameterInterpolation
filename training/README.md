@@ -102,7 +102,7 @@ both at once, but that is not the plan.
 | `Dockerfile` | laptop (build), CHTC (run) | Lightning 1.9.5, torch 2.0.1+cu118, conda h5py, wandb, fastMRI at `91f2df4`. Pinned to `linux/amd64`. |
 | `make_subset.sh` | inside the job | One-off (section 3b): cuts `/staging` down to subsets that fit the quota. `val` extracts and re-tars N volumes; `train` streams a prefix of NYU's `train_batch_0` and re-packs the complete volumes. Validates every kept `.h5` with h5py. |
 | `subset_val.sub`, `subset_train.sub` | access point | The two CPU jobs that run `make_subset.sh`. Run once, in that order. |
-| `.env.example` | access point | Template for `.env` (gitignored): `WANDB_API_KEY`, `WANDB_ENTITY`, `FASTMRI_TRAIN_URL`. `submit.sh` and the subset targets source `.env` themselves. |
+| `../.env.example` | repo root | Template for the shared `../.env` (gitignored): `WANDB_API_KEY`, `WANDB_ENTITY`, `FASTMRI_TRAIN_URL`, and verification's NYU URLs. `submit.sh` and the subset targets source `../.env` themselves. One file for both stages. |
 
 ## Where things run
 
@@ -196,10 +196,11 @@ What goes up:
 | `run_train.sh` | the job executable (transferred to the execute node by HTCondor) |
 | `train_wandb.py` | the driver (listed in `transfer_input_files`) |
 | `Makefile` | for `make submit-model1` etc. Optional; `./submit.sh` works alone. |
-| `make_subset.sh`, `subset_val.sub`, `subset_train.sub`, `.env.example` | the one-off staging repack in 3b |
+| `make_subset.sh`, `subset_val.sub`, `subset_train.sub` | the one-off staging repack in 3b (needs `FASTMRI_TRAIN_URL` from `../.env`) |
 
 What must not go up: `synthetic/`, `jobtest/`, `output/`, `*.tar`, `*.ckpt`,
-`.env`, `.make/`, `dataset_cache.pkl`. They are laptop smoke-test leftovers.
+`.make/`, `dataset_cache.pkl`. (Nor the laptop's `../.env` — create that one
+by hand on the access point from `../.env.example`.) They are laptop smoke-test leftovers.
 (`dataset_cache.pkl` is a fastMRI slice-index cache keyed by data path. One
 from a synthetic smoke run is currently committed by mistake; it is harmless
 on CHTC — the paths in it do not match, so `SliceDataset` just rebuilds — but
@@ -211,8 +212,9 @@ the tarballs and phantoms would just waste home quota.
 # laptop, from the repo root
 ssh apryan3@ap2001.chtc.wisc.edu 'mkdir -p ~/Fall26Research/training'
 scp training/train.sub training/submit.sh training/run_train.sh training/train_wandb.py training/Makefile \
-    training/make_subset.sh training/subset_val.sub training/subset_train.sub training/.env.example \
+    training/make_subset.sh training/subset_val.sub training/subset_train.sub \
     apryan3@ap2001.chtc.wisc.edu:~/Fall26Research/training/
+scp .env.example apryan3@ap2001.chtc.wisc.edu:~/Fall26Research/
 ```
 
 Or, if the repo is cloned on the access point, `git pull` there. The
@@ -302,8 +304,8 @@ used again any time before it expires (~2026-12-08) or re-requested.
 
 NYU ships the train split as five batches. Put the presigned URL for
 `knee_multicoil_train_batch_0.tar.xz` (the line in the approval email ending
-in `--output knee_multicoil_train_batch_0.tar.xz`) in `.env`
-(`cp .env.example .env`, `chmod 600 .env`, paste it quoted). Then:
+in `--output knee_multicoil_train_batch_0.tar.xz`) in the shared `../.env`
+(`cp ../.env.example ../.env`, `chmod 600 ../.env`, paste it quoted). Then:
 
 ```bash
 make subset-train                    # TRAIN_PREFIX_GB=50 to fit a smaller quota gap
@@ -340,8 +342,8 @@ Every submission starts the same way:
 ```bash
 ssh apryan3@ap2001.chtc.wisc.edu
 cd ~/Fall26Research/training
-# either export them, or put them in .env (cp .env.example .env; chmod 600 .env);
-# submit.sh sources .env itself.
+# either export them, or put them in the shared root .env
+# (cp ../.env.example ../.env; chmod 600 ../.env); submit.sh sources ../.env itself.
 export WANDB_API_KEY=...          # freshly rotated
 export WANDB_ENTITY=...           # optional
 ```

@@ -31,6 +31,9 @@ MODEL    ?= model1
 # extra name=value macro overrides for condor_submit, e.g.
 #   make submit-model2 ARGS='max_epochs=2 extra_args="--limit_train_batches 20"'
 ARGS     ?=
+# ENV_FILE: the secrets file, shared by training/ and verification/. One file
+# at the repo root (see ../.env.example) so there is one key to rotate.
+ENV_FILE ?= ../.env
 # checkpoint for `make resume`
 CKPT     ?=
 # synthetic volumes for the smoke tests
@@ -290,7 +293,7 @@ job-evict: build check-eol knee_multicoil_train_synthetic.tar
 .PHONY: submit submit-model1 submit-model2 resume status logs why subset-val subset-train
 # README section 3b: build the subset tarballs that fit under the /staging
 # quota. subset-val brings ~N_VAL GB back to this directory; subset-train
-# needs FASTMRI_TRAIN_URL (from .env) and writes straight into /staging.
+# needs FASTMRI_TRAIN_URL (from $(ENV_FILE)) and writes straight into /staging.
 N_VAL           ?= 20
 TRAIN_PREFIX_GB ?= 65
 subset-val:
@@ -299,8 +302,8 @@ subset-val:
 
 subset-train:
 	@mkdir -p logs
-	@set -a; [ -f .env ] && . ./.env; set +a; \
-	test -n "$$FASTMRI_TRAIN_URL" || { echo "FASTMRI_TRAIN_URL is empty: put the NYU presigned URL in .env (see .env.example)" >&2; exit 1; }; \
+	@set -a; [ -f $(ENV_FILE) ] && . $(ENV_FILE); set +a; \
+	test -n "$$FASTMRI_TRAIN_URL" || { echo "FASTMRI_TRAIN_URL is empty: put the NYU presigned URL in $(ENV_FILE) (see ../.env.example)" >&2; exit 1; }; \
 	condor_submit subset_train.sub train_prefix_gb=$(TRAIN_PREFIX_GB)
 
 submit-model1:

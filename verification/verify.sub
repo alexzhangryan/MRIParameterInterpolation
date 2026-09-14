@@ -3,26 +3,75 @@
 # and run directories and checks that the W&B key is exported first.
 #
 #   ./submit.sh                              full val, 4x and 8x
+#   ./submit.sh model1                       released weights, 4x, on the val subset
+#   ./submit.sh model2                       released weights, 2x/4x/6x/8x, on the val subset
 #   ./submit.sh volume_limit=20              first 20 volumes (smoke run)
 #   ./submit.sh data=knee_multicoil_val_synthetic.tar request_disk=20GB
 #
-# Edit `image` below before first use. `staging` is already set: this
+# model1 / model2 are the released-checkpoint halves of the 2x2 in
+# README "Pretrained vs. from-scratch": same masks, same val subset and same
+# seed as training/submit.sh model1 / model2, but the NYU leaderboard weights
+# instead of weights trained here. Nothing is trained by this file.
+#
+# `image` and `staging` are both set below. `staging` is this
 # account's personal /staging directory on ap2001, confirmed writable
 # 2026-09-10. The shared group directory
 # /staging/groups/kamilov_group/Kamilov-SciAI-datasets is not readable by this
 # account; if that changes, this one macro is the only thing to repoint.
 
-staging    = /staging/a/apryan3/fastmri
-image      = docker://CHANGE_ME/fastmri-verify:2026-09
+# --- how the defaults in this file work --------------------------------------
+# Every macro below is a DEFAULT ONLY and is wrapped in `if ! defined`. That
+# guard is load-bearing, not style.
+#
+# condor_submit parses a command-line `name=value` "as if it was placed at the
+# beginning of the submit description file" (condor_submit man page). A plain
+# `mask_type = random` line here would therefore be parsed AFTER the preset
+# and silently overwrite it, so `./submit.sh model1` would evaluate the wrong
+# masks on the wrong data and say nothing about it. training/train.sub carries
+# the same guards after exactly that bug cost three hours on 2026-09-13 (see
+# the note in training/submit.sh); submit.sh re-checks the resolved job ad
+# with -dry-run before it submits.
+
+if ! defined staging
+  staging = /staging/a/apryan3/fastmri
+endif
+if ! defined image
+  image = docker://genjigod/fastmri-verify:2026-09
+endif
 
 # --- what to run -----------------------------------------------------------
-tier            = tier1
-accelerations   = 4 8
-center_fractions = 0.08 0.04
-mask_type       = random
-volume_limit    = 0
-extra_args      =
-arguments       = $(tier) --accelerations $(accelerations) --center_fractions $(center_fractions) --mask_type $(mask_type) --volume_limit $(volume_limit) --run_name tier1-$(Cluster) $(extra_args)
+# `model` names the run and keeps its logs and results apart from every other
+# run: `tier1` for the plain released-checkpoint sweep, `model1` / `model2`
+# for the two that pair with training. `tier` stays tier1 regardless -- it is
+# what run_verify.sh dispatches on, and these are all Tier 1 evaluations.
+if ! defined model
+  model = tier1
+endif
+if ! defined tier
+  tier = tier1
+endif
+if ! defined accelerations
+  accelerations = 4 8
+endif
+if ! defined center_fractions
+  center_fractions = 0.08 0.04
+endif
+if ! defined mask_type
+  mask_type = random
+endif
+if ! defined volume_limit
+  volume_limit = 0
+endif
+# run_name is the W&B run name and the run_id in results.csv. Deriving it from
+# $(model) is what keeps tier1 / model1 / model2 apart, so it is only correct
+# as long as $(model) is.
+if ! defined run_name
+  run_name = $(model)-$(Cluster)
+endif
+if ! defined extra_args
+  extra_args =
+endif
+arguments       = $(tier) --accelerations $(accelerations) --center_fractions $(center_fractions) --mask_type $(mask_type) --volume_limit $(volume_limit) --run_name $(run_name) $(extra_args)
 
 # --- container ---------------------------------------------------------------
 universe        = container
@@ -38,8 +87,24 @@ executable      = run_verify.sh
 # 1-30 GB and file:///staging/<path> for 30-100 GB. The val tarball is
 # 93.8 GB, so both inputs use file:// here. A small synthetic subset passed
 # as data=... on the submit.sh command line can use osdf:// instead.
-data            = file://$(staging)/knee_multicoil_val.tar.xz
-ckpt            = file://$(staging)/knee_leaderboard_state_dict.pt
+# The default is the full 199-volume split. The 20-volume subset is the one
+# built by training/subset_val.sub (training/README.md section 3b): it is what
+# model1 / model2 train against, so the presets select it with
+# val_file=knee_multicoil_val_subset.tar. `make subset-val` DELETES the full
+# tarball, so run the plain `./submit.sh` sweep first if the 199-volume
+# number is wanted.
+# `val_file` is just the basename inside $(staging), so a preset only has to
+# pass a plain string; `data` stays overridable wholesale for an osdf:// or
+# synthetic tarball.
+if ! defined val_file
+  val_file = knee_multicoil_val.tar.xz
+endif
+if ! defined data
+  data = file://$(staging)/$(val_file)
+endif
+if ! defined ckpt
+  ckpt = file://$(staging)/knee_leaderboard_state_dict.pt
+endif
 transfer_input_files = verify_varnet.py, $(ckpt), $(data)
 should_transfer_files    = YES
 when_to_transfer_output  = ON_EXIT_OR_EVICT
@@ -47,7 +112,7 @@ when_to_transfer_output  = ON_EXIT_OR_EVICT
 # --- output files ------------------------------------------------------------
 # results/ (json report, per-volume CSVs, results.csv, offline W&B run if no key)
 transfer_output_files   = results
-transfer_output_remaps  = "results = runs/$(Cluster)"
+transfer_output_remaps  = "results = runs/$(model)/$(Cluster)"
 
 # --- secrets -----------------------------------------------------------------
 # Only these names are copied from the submitting shell, and only if set. The
@@ -60,23 +125,43 @@ environment     = "WANDB_PROJECT=fastmri-varnet-verify"
 # request_disk covers peak scratch, which is during extraction: run_verify.sh
 # deletes the tarball only after `xz | tar` finishes, so both copies exist at
 # once -- 93.8 GB compressed + ~192 GB extracted = ~290 GB, plus results.
-# Override for a subset tarball (a 20-volume plain .tar needs ~20 GB).
+# Override for a subset tarball: the 20-volume val subset is a plain ~20 GB
+# .tar, so peak is ~40 GB and the model1 / model2 presets pass request_disk=60GB.
 #
 # HasCHTCStaging selects slots that can read /staging inputs.
 requirements    = (Target.HasCHTCStaging == true)
-request_cpus    = 4
-request_memory  = 32GB
-request_disk    = 320GB
-request_gpus    = 1
+# request_cpus and request_memory are the two exceptions to the `if ! defined`
+# rule: condor_submit seeds them into the macro table BEFORE reading this file,
+# so the guard never fires and the request silently collapses to 1 CPU and an
+# ImageSize-derived memory figure. Hence the aliases -- override these two as
+# cpus=8 / mem=64GB, not as request_cpus= / request_memory=. request_disk and
+# request_gpus are not pre-seeded, so they keep their own names.
+if ! defined cpus
+  cpus = 4
+endif
+if ! defined mem
+  mem = 32GB
+endif
+request_cpus    = $(cpus)
+request_memory  = $(mem)
+if ! defined request_disk
+  request_disk = 320GB
+endif
+if ! defined request_gpus
+  request_gpus = 1
+endif
 gpus_minimum_memory     = 16000
 gpus_minimum_capability = 7.0
 +WantGPULab     = true
-+GPUJobLength   = "short"
+if ! defined gpu_job_length
+  gpu_job_length = "short"
+endif
++GPUJobLength   = $(gpu_job_length)
 
 # --- logs ------------------------------------------------------------------
-log             = logs/$(tier)_$(Cluster).log
-output          = logs/$(tier)_$(Cluster)_$(Process).out
-error           = logs/$(tier)_$(Cluster)_$(Process).err
+log             = logs/$(model)_$(Cluster).log
+output          = logs/$(model)_$(Cluster)_$(Process).out
+error           = logs/$(model)_$(Cluster)_$(Process).err
 stream_output   = True
 stream_error    = True
 

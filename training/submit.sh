@@ -12,13 +12,15 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# .env (gitignored, see .env.example) holds the W&B key and the NYU URL.
-# The file wins over the shell: leave a line out of .env if you would rather
-# export that variable by hand.
-if [ -f .env ]; then
+# ../.env (gitignored, see ../.env.example) is the single secrets file shared
+# by training/ and verification/: the W&B key and the NYU presigned URLs. The
+# file wins over the shell, so leave a line out of .env if you would rather
+# export that variable by hand. ENV_FILE= points at a different one.
+ENV_FILE="${ENV_FILE:-../.env}"
+if [ -f "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1091
-  . ./.env
+  . "$ENV_FILE"
   set +a
 fi
 

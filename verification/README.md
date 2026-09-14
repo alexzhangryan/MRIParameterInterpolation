@@ -21,11 +21,12 @@ below — the window for a full-split Tier 1 is closing.*
 | `run_verify.sh` | inside the job | Job executable: extracts data, runs the harness, collects `results/`. |
 | `submit.sh` | CHTC access point | Wraps `condor_submit`, refuses to submit without a W&B key unless `OFFLINE=1`. |
 | `Makefile` | laptop | The local driver: `make local-run` does build → synthetic data → tier0 → tier1 smoke → job-executable smoke in one go. Also `make data` / `make extract` / `make tier1` for a real run on your own GPU. `make help` lists everything. |
-| `.env.example` | laptop + access point | Template for `.env` (gitignored): `WANDB_API_KEY`, `WANDB_ENTITY`, `FASTMRI_VAL_URL`, `FASTMRI_SHA_URL`, `NETID`. Nothing in `make local-run` needs it. |
+| `../.env.example` | repo root | Template for the shared `../.env` (gitignored): `WANDB_API_KEY`, `WANDB_ENTITY`, `FASTMRI_VAL_URL`, `FASTMRI_SHA_URL`, `NETID`, and training's `FASTMRI_TRAIN_URL`. One file for both stages; `submit.sh` and the `make data` / `make tier1` targets source it themselves. Nothing in `make local-run` needs it. |
 
 ## What a run produces
 
-`results/` (transferred back to `runs/<Cluster>/`):
+`results/` (transferred back to `runs/<model>/<Cluster>/`, where `<model>` is
+`tier1` by default and `model1` / `model2` for the paired runs below):
 
 - `tier0_report.json` or `tier1_report.json`: every check, its verdict, and the config
 - `per_volume_R<N>.csv`: SSIM / PSNR / NMSE / MSE per volume, model and zero-filled, one file per rate
@@ -66,12 +67,13 @@ volumes, it needs the metric code to agree with someone else's measurement of
 the same weights. What you lose is the ability to quote a full-split number
 later.
 
-After the repack, point `data=` at
-`file:///staging/a/apryan3/fastmri/knee_multicoil_val_subset.tar` (a plain
-`.tar`, ~20 GB) and drop `request_disk` to about 60GB. Those runs are scored
-against the same reference values but on 20 volumes, so record the volume
-count with every number — the harness already writes it into
-`tier1_report.json` and `results.csv`.
+After the repack, `make verify-model1` / `make verify-model2` already point at
+`knee_multicoil_val_subset.tar` (a plain `.tar`, ~20 GB) with
+`request_disk=60GB` — see "Pretrained vs. from-scratch" below. For an ad-hoc
+run, `./submit.sh val_file=knee_multicoil_val_subset.tar request_disk=60GB`
+does the same thing. Those runs are on 20 volumes, so record the volume count
+with every number — the harness already writes it into `tier1_report.json` and
+`results.csv`.
 
 ## Where things live on CHTC
 
@@ -136,7 +138,7 @@ make local-run       # build, synthetic data, tier0, tier1 smoke, job-executable
 make report          # the verdicts from that run
 ```
 
-That is the supported path and needs no `.env` and no real data. The
+That is the supported path and needs no `../.env` and no real data. The
 equivalent by hand, if you want to poke at the container:
 
 ```bash
@@ -242,7 +244,60 @@ A one-off interactive job
 plain `.tar` for fast reruns; point `data=` at it and drop `request_disk`.
 
 `tail -f logs/tier1_<Cluster>_0.out` shows per-volume progress with a running
-SSIM. `runs/<Cluster>/tier1_report.json` has the verdicts.
+SSIM. `runs/tier1/<Cluster>/tier1_report.json` has the verdicts.
+
+### 6. Pretrained vs. from-scratch (the 2x2)
+
+`verify-model1` / `verify-model2` are the released-checkpoint halves of a 2x2:
+the same two mask configurations as training, evaluated with NYU's leaderboard
+weights instead of weights trained here.
+
+| | 4x only | 2x / 4x / 6x / 8x |
+|---|---|---|
+| **Released weights** | `verification: make verify-model1` | `verification: make verify-model2` |
+| **Trained here** | `training: make submit-model1` | `training: make submit-model2` |
+
+```bash
+# on ap2001, in ~/Fall26Research/verification, WANDB_API_KEY exported
+make verify-model1      # accelerations 4,       center_fractions 0.08
+make verify-model2      # accelerations 2 4 6 8, center_fractions 0.16 0.08 0.0533 0.04
+make verify-model2 ARGS='volume_limit=5'        # quick shakeout first
+```
+
+Each resolves to `./submit.sh model1|model2`, which submits `verify.sub` with
+`model=`, the two mask lists, `mask_type=equispaced_fraction`,
+`val_file=knee_multicoil_val_subset.tar` and `request_disk=60GB`. Results land
+in `runs/model1/<Cluster>/` and `runs/model2/<Cluster>/`. Nothing is trained.
+
+What is held identical to training: the acceleration / center-fraction lists,
+the mask family (`equispaced_fraction`, not the `random` this harness defaults
+to), the 20-volume val subset, and seed 42. `verify_varnet.py` evaluates each
+(R, center fraction) pair in its own pass, so `verify-model2` reports four
+per-rate rows rather than one averaged number.
+
+**The released-weights row is a ceiling reference, not a matched control.**
+Three things differ from the trained models, all of them in its favour:
+
+- **It saw the val split.** The leaderboard checkpoint was trained on
+  `train`+`val` combined, so the 20 subset volumes are training data for it and
+  useless as a generalization estimate. model1 / model2 never see them.
+- **It is a bigger model** — 12 cascades (~29.9M parameters) against the demo
+  default 8 that `training/train_wandb.py` uses (~20.1M).
+- **It trained on all 973 train volumes**, against the ~120-volume subset.
+
+So read it as "how far from a fully-trained reference are we", never as
+"pretrained beats from-scratch". `VERIFICATION.md` Claim A is the same point.
+
+Two smaller caveats, both expected and neither an error:
+
+- **No reference verdict.** `REFERENCE_VALUES` is keyed on `("random", 4)` and
+  `("random", 8)`. Under `equispaced_fraction` the harness logs
+  `no reference values for (equispaced_fraction, R); recorded only` and emits
+  metrics without a pass/fail. These runs measure; the plain `./submit.sh`
+  sweep is what verifies.
+- **2x and 6x are not in the paper.** Their center fractions 0.16 and 0.0533
+  come from the fastMRI 0.32/R convention extended by us, not from
+  Sriram et al.
 
 ## Mask family notes (from the Tier 0 output)
 
@@ -267,7 +322,7 @@ submitting shell and copied into the job by HTCondor's `getenv`. It is never
 written into a `.sub` file, a script, or this directory. It is visible in the
 job ClassAd (`condor_q -l`) to you and CHTC admins, which is the standard
 CHTC pattern. Without a key the harness logs offline under `results/wandb/`
-and `wandb sync runs/<Cluster>/wandb/offline-run-*` uploads it later.
+and `wandb sync runs/<model>/<Cluster>/wandb/offline-run-*` uploads it later.
 
 Rotate the key that is in the old `Research/inpainting.sub` git history
 before using any key here.

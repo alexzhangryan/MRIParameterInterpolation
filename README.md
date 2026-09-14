@@ -100,9 +100,14 @@ says `CHANGE_ME` — edit it before the first verification submit.
 
 ## Secrets
 
-The Weights & Biases key and the NYU presigned URLs live in an untracked
-`.env` in each stage directory (`cp .env.example .env; chmod 600 .env`) or
-are exported in the submitting shell. They reach the job through HTCondor
+The Weights & Biases key and the NYU presigned URLs live in a single
+untracked `.env` at the repo root (`cp .env.example .env; chmod 600 .env`),
+shared by `training/` and `verification/` alike — both stages' `submit.sh`
+and `Makefile` source `../.env` relative to themselves, so there is one key
+to paste and one file to rotate. They can also just be exported in the
+submitting shell; the file wins over the shell when both are set.
+`WANDB_PROJECT` is deliberately not in it — the two stages log to different
+projects and each `.sub` sets its own. They reach the job through HTCondor
 `getenv`, and are never written to a `.sub` file or anything committed.
 Rotate the key that is in the old `Research/inpainting.sub` history before
 using any key here.

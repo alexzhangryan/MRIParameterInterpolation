@@ -15,4 +15,3 @@
 *.sub   text eol=lf
 *.py    text eol=lf
 Makefile text eol=lf
-.env.example text eol=lf
