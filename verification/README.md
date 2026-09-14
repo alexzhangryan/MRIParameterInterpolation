@@ -5,6 +5,12 @@ modifies `fastMRI/`, `parameter_interpolation/`, or any file outside this
 directory. It imports the `fastmri` package and reads its data files, that is
 all.
 
+*Status 2026-09-11: written and green locally (`make local-run`, synthetic
+data). **No tier has been run on CHTC.** Two things block a real Tier 1: the
+`image` macro in `verify.sub` still says `CHANGE_ME`, and the val tarball is
+not confirmed to be in `/staging`. See "Run Tier 1 before the training repack"
+below — the window for a full-split Tier 1 is closing.*
+
 | File | Runs where | Purpose |
 |---|---|---|
 | `verify_varnet.py` | anywhere with the `fastmri` env | The harness. `tier0` and `tier1` subcommands. |
@@ -14,6 +20,8 @@ all.
 | `verify.sub`, `verify_tier0.sub` | CHTC access point | HTCondor submit files, container universe. |
 | `run_verify.sh` | inside the job | Job executable: extracts data, runs the harness, collects `results/`. |
 | `submit.sh` | CHTC access point | Wraps `condor_submit`, refuses to submit without a W&B key unless `OFFLINE=1`. |
+| `Makefile` | laptop | The local driver: `make local-run` does build → synthetic data → tier0 → tier1 smoke → job-executable smoke in one go. Also `make data` / `make extract` / `make tier1` for a real run on your own GPU. `make help` lists everything. |
+| `.env.example` | laptop + access point | Template for `.env` (gitignored): `WANDB_API_KEY`, `WANDB_ENTITY`, `FASTMRI_VAL_URL`, `FASTMRI_SHA_URL`, `NETID`. Nothing in `make local-run` needs it. |
 
 ## What a run produces
 
@@ -42,12 +50,35 @@ check is pass or investigate, 1 means at least one fail.
 The reference values are for the fastMRI knee convention (`random` masks,
 0.08 / 0.04). Other mask types and rates are recorded but not judged.
 
+## Run Tier 1 before the training repack
+
+This is the one ordering constraint between the two stages, and it is
+one-way. `/staging/a/apryan3` is capped at 100 GB and the full val tarball is
+100.7 GB, so `training/README.md` section 3b deletes it to make room for the
+training subsets. Once that happens, a Tier 1 run over all 199 val volumes is
+impossible without re-downloading 94 GB from the NYU presigned URL (valid to
+roughly 2026-12-08, re-requestable from fastmri@med.nyu.edu after that).
+
+So: **stage the val tarball, run Tier 1 on the full split, and only then run
+`make subset-val`.** If you would rather not spend the hours, Tier 1 on
+`volume_limit=20` still verifies the pipeline — Claim A does not need all 199
+volumes, it needs the metric code to agree with someone else's measurement of
+the same weights. What you lose is the ability to quote a full-split number
+later.
+
+After the repack, point `data=` at
+`file:///staging/a/apryan3/fastmri/knee_multicoil_val_subset.tar` (a plain
+`.tar`, ~20 GB) and drop `request_disk` to about 60GB. Those runs are scored
+against the same reference values but on 20 volumes, so record the volume
+count with every number — the harness already writes it into
+`tier1_report.json` and `results.csv`.
+
 ## Where things live on CHTC
 
 | What | Where | Constraint |
 |---|---|---|
 | This repo, submit files, logs | `/home/apryan3` on `ap2001.chtc.wisc.edu` | 40 GB quota, code only |
-| `knee_multicoil_val.tar.xz` (93.8 GiB), released checkpoint | `/staging/a/apryan3/fastmri/` | 100 GB quota — the tarball alone is 100.7 GB decimal |
+| `knee_multicoil_val.tar.xz` (93.8 GiB), released checkpoint | `/staging/a/apryan3/fastmri/` | 100 GB quota — the tarball alone is 100.7 GB decimal, and `training/` section 3b replaces it with a ~20 GB subset |
 | The container image | Docker Hub, pulled by the execute node | never stored on CHTC |
 
 Personal staging is sharded by the first letter of the netid:
@@ -66,9 +97,12 @@ constraint, and it is tighter than it looks. The validation tarball is
 100,694,526,932 bytes — 93.8 GiB, or 100.7 GB decimal — so it fits only if
 `get_quotas` counts in binary units, and even then leaves about 6 GiB for
 everything else. Nothing of consequence can be staged alongside it, and
-`multicoil_train` (~931 GB unpacked) is out of reach entirely. A full Tier 1
-run and any from-scratch training both need a quota increase or access to the
-group directory.
+`multicoil_train` (~931 GB unpacked) is out of reach entirely.
+
+The project's answer to that (decision 2026-09-11, `ROADMAP.md` Phase 2) is
+**not** a quota increase — that is the last resort — but repacking both splits
+into subsets that fit together: `training/README.md` section 3b. Which is why
+a full-split Tier 1 has to happen first, if it happens at all.
 
 ## Step by step
 
@@ -96,6 +130,14 @@ old result was produced with. The build ends with a self-check that prints the
 installed versions and asserts Lightning is 1.x.
 
 ### 2. Smoke-test the harness locally, no real data (laptop, minutes)
+
+```bash
+make local-run       # build, synthetic data, tier0, tier1 smoke, job-executable smoke
+make report          # the verdicts from that run
+```
+
+That is the supported path and needs no `.env` and no real data. The
+equivalent by hand, if you want to poke at the container:
 
 ```bash
 docker run --rm -it --platform linux/amd64 -v "$PWD":/work -w /work <you>/fastmri-verify:2026-09 bash
@@ -134,9 +176,10 @@ ISP's per-flow shaping; from campus to S3 a few flows are plenty.
 Check the quota first (`get_quotas /staging/a/apryan3` on the access point).
 It is 100 GB, and the tarball is 100,694,526,932 bytes — 93.8 GiB or 100.7 GB
 depending on how that limit is counted, so it either just fits or just does
-not. Establish which before committing to a multi-hour transfer. Under a
-100 GB ceiling the val set is the one file worth keeping: it is the only split
-with ground truth the harness can score.
+not. Establish which before committing to a multi-hour transfer. It is the
+only split with ground truth the harness can score, so it is the right thing
+to stage first — and it is also the thing `training/` section 3b later
+deletes, so plan the Tier 1 run around that.
 
 Do not scp the local copy up from the desktop instead. The shaping that makes
 `PARALLEL=16` necessary applies to outbound traffic too, so a 94 GB upload
