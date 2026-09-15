@@ -514,6 +514,22 @@ def build_dataset(args, mask_func, selected: List[str]):
     return ds, by_volume
 
 
+def assigned_rate(mask_func, fname: str) -> Tuple[float, int]:
+    """The (center_fraction, acceleration) this filename's seed makes the mask draw.
+
+    MaskFunc.__call__ wraps sample_mask in temp_seed(self.rng, seed), and the
+    first thing sample_mask spends that seeded rng on is choose_acceleration().
+    VarNetDataTransform passes seed = tuple(map(ord, fname)) whenever
+    use_seed is set, which is the default and what training validates with, so
+    a volume's rate is a pure function of its filename and this reproduces it.
+    temp_seed restores the rng state on the way out, so asking does not disturb
+    the sampling that follows.
+    """
+    from fastmri.data.subsample import temp_seed
+    with temp_seed(mask_func.rng, tuple(map(ord, fname))):
+        return mask_func.choose_acceleration()
+
+
 def zero_filled_rss(masked_kspace):
     """Zero-filled root-sum-of-squares reconstruction, same input as the model."""
     import fastmri
@@ -663,16 +679,15 @@ def tier1(args) -> int:
         invariants.append(Check(name, status, detail, dict(v)))
         log(f"{status.upper():6s} invariant {name}: {detail}")
 
-    for R, cf in zip(args.accelerations, args.center_fractions):
-        log(f"=== acceleration {R}x, center_fraction {cf}, mask {args.mask_type} ===")
-        mask_func = create_mask_for_mask_type(args.mask_type, [cf], [R])
-        ds, by_volume = build_dataset(args, mask_func, files)
-        if set(by_volume) != set(files):
-            missing = sorted(set(files) - set(by_volume))
-            inv(f"R{R}_volume_listing", "fail", f"{len(missing)} selected volumes not indexed: {missing[:3]}...")
-            all_verdicts.append("fail")
-            continue
+    def score_pass(label, ds, by_volume, rate_of):
+        """Reconstruct and score every selected volume once under one dataset.
 
+        `label` is what the pass is filed under in the log, in W&B and in the
+        CSV name ("R4", "mixed"). `rate_of` returns the (center_fraction,
+        acceleration) to record for a volume: constant for a single-rate pass,
+        and for the mixed pass the pair that volume's own filename seed drew.
+        Returns (rows, det_records, aggregate).
+        """
         rows: List[Dict] = []
         det_records: List[Dict] = []
         t0 = time.time()
@@ -684,7 +699,8 @@ def tier1(args) -> int:
                 log(f"note: {fname} target {target.shape} vs recon {recon.shape} (will square-crop)")
             m = volume_metrics(target, recon)
             mz = volume_metrics(target, zf)
-            row = dict(fname=fname, n_slices=int(target.shape[0]), acceleration=R, center_fraction=cf,
+            cf_v, R_v = rate_of(fname)
+            row = dict(fname=fname, n_slices=int(target.shape[0]), acceleration=R_v, center_fraction=cf_v,
                        **m, **{f"zf_{k}": v for k, v in mz.items()})
             rows.append(row)
 
@@ -700,7 +716,7 @@ def tier1(args) -> int:
                 vmax = float(target[s].max())
                 t_, r_ = crop_like_evaluate(target[s], recon[s])
                 _, z_ = crop_like_evaluate(target[s], zf[s])
-                wb.images(f"R{R}/{Path(fname).stem}", {
+                wb.images(f"{label}/{Path(fname).stem}", {
                     "target": to_uint8_image(t_, vmax),
                     "recon": to_uint8_image(r_, vmax),
                     "zero_filled": to_uint8_image(z_, vmax),
@@ -710,17 +726,10 @@ def tier1(args) -> int:
             if (vi + 1) % args.log_every == 0 or vi + 1 == len(files):
                 elapsed = time.time() - t0
                 run_ssim = np.mean([r["ssim"] for r in rows])
-                log(f"R{R} {vi+1}/{len(files)} volumes, running SSIM {run_ssim:.4f}, "
+                log(f"{label} {vi+1}/{len(files)} volumes, running SSIM {run_ssim:.4f}, "
                     f"{elapsed/(vi+1):.1f}s/volume")
-                wb.log({f"R{R}/progress_volumes": vi + 1, f"R{R}/running_ssim": run_ssim,
-                        f"R{R}/sec_per_volume": elapsed / (vi + 1)})
-
-        # per-volume CSV
-        pv_csv = out / f"per_volume_R{R}.csv"
-        with open(pv_csv, "w", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
-            w.writeheader()
-            w.writerows(rows)
+                wb.log({f"{label}/progress_volumes": vi + 1, f"{label}/running_ssim": run_ssim,
+                        f"{label}/sec_per_volume": elapsed / (vi + 1)})
 
         agg = {}
         for k in ("ssim", "psnr", "nmse", "mse", "zf_ssim", "zf_psnr", "zf_nmse"):
@@ -730,9 +739,16 @@ def tier1(args) -> int:
         agg["n_volumes"] = len(rows)
         agg["n_slices"] = int(sum(r["n_slices"] for r in rows))
         agg["seconds"] = time.time() - t0
+        return rows, det_records, agg
 
-        log("R{} measured over {} volumes / {} slices in {:.0f}s".format(
-            R, agg["n_volumes"], agg["n_slices"], agg["seconds"]))
+    def write_pass(label, rows, agg, pv_csv):
+        """The per-volume CSV, the summary table in the log, and the W&B logging."""
+        with open(pv_csv, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+        log("{} measured over {} volumes / {} slices in {:.0f}s".format(
+            label, agg["n_volumes"], agg["n_slices"], agg["seconds"]))
         log("    {:<10} {:>11} {:>11} {:>11}".format("metric", "model", "zero-filled", "model std"))
         log("    {:<10} {:>11.4f} {:>11.4f} {:>11.4f}".format(
             "SSIM", agg["ssim_mean"], agg["zf_ssim_mean"], agg["ssim_std"]))
@@ -740,6 +756,44 @@ def tier1(args) -> int:
             "PSNR (dB)", agg["psnr_mean"], agg["zf_psnr_mean"], agg["psnr_std"]))
         log("    {:<10} {:>11.4f} {:>11.4f} {:>11.4f}".format(
             "NMSE", agg["nmse_mean"], agg["zf_nmse_mean"], agg["nmse_std"]))
+        wb.log({f"{label}/{k}": v for k, v in agg.items()})
+        wb.table(f"{label}/per_volume", list(rows[0].keys()), [list(r.values()) for r in rows])
+        wb.artifact_file(pv_csv, f"per_volume_{label}", "per_volume_metrics")
+
+    def det_invariant(label, det_records):
+        if not det_records:
+            return
+        md = max(d["max_abs_diff"] for d in det_records)
+        ok = md == 0.0 or md < args.determinism_tol
+        inv(f"{label}_determinism", "pass" if ok else "fail",
+            f"max |recon - recon_rerun| = {md:.3e} over {len(det_records)} volumes (tol {args.determinism_tol:g})",
+            max_abs_diff=md)
+        all_verdicts.append("pass" if ok else "fail")
+
+    def zf_invariant(label, agg):
+        margin = agg["ssim_mean"] - agg["zf_ssim_mean"]
+        ok = margin > args.zf_min_margin
+        inv(f"{label}_beats_zero_filled", "pass" if ok else "fail",
+            f"model SSIM - zero-filled SSIM = {margin:+.4f} (min {args.zf_min_margin})", margin=margin)
+        all_verdicts.append("pass" if ok else "fail")
+
+    # --- one pass per rate: every volume at the SAME rate ----------------------
+    # This is what says how the model does at each individual acceleration, and
+    # it is the only form the reference values can be compared against.
+    for R, cf in zip(args.accelerations, args.center_fractions):
+        log(f"=== acceleration {R}x, center_fraction {cf}, mask {args.mask_type} ===")
+        mask_func = create_mask_for_mask_type(args.mask_type, [cf], [R])
+        ds, by_volume = build_dataset(args, mask_func, files)
+        if set(by_volume) != set(files):
+            missing = sorted(set(files) - set(by_volume))
+            inv(f"R{R}_volume_listing", "fail", f"{len(missing)} selected volumes not indexed: {missing[:3]}...")
+            all_verdicts.append("fail")
+            continue
+
+        label = f"R{R}"
+        rows, det_records, agg = score_pass(label, ds, by_volume, lambda f, cf=cf, R=R: (cf, R))
+        pv_csv = out / f"per_volume_R{R}.csv"
+        write_pass(label, rows, agg, pv_csv)
 
         # reference comparison
         refs = compare_to_reference(args.mask_type, R, agg)
@@ -755,27 +809,14 @@ def tier1(args) -> int:
             log("R{}: no reference values for ({}, {}); recorded only".format(R, args.mask_type, R))
 
         # invariants for this rate
-        if det_records:
-            md = max(d["max_abs_diff"] for d in det_records)
-            ok = md == 0.0 or md < args.determinism_tol
-            inv(f"R{R}_determinism", "pass" if ok else "fail",
-                f"max |recon - recon_rerun| = {md:.3e} over {len(det_records)} volumes (tol {args.determinism_tol:g})",
-                max_abs_diff=md)
-            all_verdicts.append("pass" if ok else "fail")
-        margin = agg["ssim_mean"] - agg["zf_ssim_mean"]
-        ok = margin > args.zf_min_margin
-        inv(f"R{R}_beats_zero_filled", "pass" if ok else "fail",
-            f"model SSIM - zero-filled SSIM = {margin:+.4f} (min {args.zf_min_margin})", margin=margin)
-        all_verdicts.append("pass" if ok else "fail")
+        det_invariant(label, det_records)
+        zf_invariant(label, agg)
         inv(f"R{R}_volume_count", "pass" if agg["n_volumes"] == len(files) else "fail",
             f"{agg['n_volumes']} scored of {len(files)} selected")
 
         per_rate[R] = dict(center_fraction=cf, aggregate=agg, references=refs,
                            determinism=det_records, per_volume_csv=str(pv_csv))
 
-        wb.log({f"R{R}/{k}": v for k, v in agg.items()})
-        wb.table(f"R{R}/per_volume", list(rows[0].keys()), [list(r.values()) for r in rows])
-        wb.artifact_file(pv_csv, f"per_volume_R{R}", "per_volume_metrics")
         append_results_row(out / "results.csv", dict(
             run_id=run_id, date=time.strftime("%Y-%m-%d"), git_sha=config["fastmri_sha"], tier="tier1",
             model_source=model_source, checkpoint_path=args.state_dict if model_source == "pretrained" else "",
@@ -785,6 +826,98 @@ def tier1(args) -> int:
             psnr_mean=f"{agg['psnr_mean']:.4f}", nmse_mean=f"{agg['nmse_mean']:.6f}",
             per_volume_csv=pv_csv.name, notes=" | ".join(f"{r['source']}: {r['verdict']}" for r in refs),
         ))
+
+    # --- the mixed pass: ONE rate per volume, drawn the way training draws -----
+    # Training never evaluates a fixed rate. Its val_transform is
+    # VarNetDataTransform(mask_func=mask) built over the FULL rate lists with
+    # use_seed=True, so MaskFunc.choose_acceleration() is seeded from the
+    # filename (transforms.py: seed = tuple(map(ord, fname))) and every volume
+    # is locked to one rate for the whole run. What Lightning logs as
+    # val_metrics/ssim is the mean over volumes of that mixture, so a per-rate
+    # number here can never equal it -- not because either is wrong, but
+    # because they are different quantities.
+    #
+    # Rebuilding the same mask function reproduces the mixture exactly, which
+    # makes mixed/ssim_mean directly comparable to a training run's
+    # val_metrics/ssim. The metric itself already agrees: MriModule averages
+    # per-slice SSIM at data_range=attrs["max"] over volumes, and
+    # fastmri.evaluate.ssim (what volume_metrics uses) averages per-slice SSIM
+    # at data_range=target.max(), the same number whenever attrs["max"] is the
+    # volume's own max, which is how the fastMRI knee files are written.
+    #
+    # Costs one extra pass over the data. --no_mixed_pass skips it; it is
+    # skipped anyway when there is only one rate, where it would duplicate the
+    # single per-rate pass exactly.
+    mixed: Dict = {}
+    if args.mixed_pass and len(args.accelerations) > 1:
+        pairs = list(zip(args.accelerations, args.center_fractions))
+        log("=== mixed: one rate per volume from {}, seeded by filename (as training validates) ===".format(
+            " ".join(f"{R}x/{cf}" for R, cf in pairs)))
+        mask_func = create_mask_for_mask_type(args.mask_type, args.center_fractions, args.accelerations)
+        ds, by_volume = build_dataset(args, mask_func, files)
+        if set(by_volume) != set(files):
+            missing = sorted(set(files) - set(by_volume))
+            inv("mixed_volume_listing", "fail", f"{len(missing)} selected volumes not indexed: {missing[:3]}...")
+            all_verdicts.append("fail")
+        else:
+            drawn = {f: assigned_rate(mask_func, f) for f in files}
+            counts: Dict[int, int] = defaultdict(int)
+            for _cf, R_v in drawn.values():
+                counts[R_v] += 1
+            log("    rate assignment over {} volumes: {}".format(
+                len(files), "  ".join(f"R{R}={counts.get(R, 0)}" for R in sorted(set(args.accelerations)))))
+
+            rows, det_records, agg = score_pass("mixed", ds, by_volume, lambda f: drawn[f])
+            pv_csv = out / "per_volume_mixed.csv"
+            write_pass("mixed", rows, agg, pv_csv)
+
+            # Where the mixed number comes from: the volumes that drew each rate,
+            # scored on their own. These are NOT the per-rate passes above (those
+            # score every volume); they are disjoint subsets of this one pass.
+            within: Dict[int, Dict] = {}
+            for R_v in sorted(set(int(r["acceleration"]) for r in rows)):
+                sub = [r["ssim"] for r in rows if int(r["acceleration"]) == R_v]
+                within[R_v] = dict(n_volumes=len(sub), ssim_mean=float(np.mean(sub)))
+            log("    within the mixture: " + "  ".join(
+                f"R{R_v}={v['ssim_mean']:.4f}({v['n_volumes']}v)" for R_v, v in within.items()))
+
+            det_invariant("mixed", det_records)
+            zf_invariant("mixed", agg)
+            inv("mixed_volume_count", "pass" if agg["n_volumes"] == len(files) else "fail",
+                f"{agg['n_volumes']} scored of {len(files)} selected")
+            # A mixture of per-volume scores should land inside the span of the
+            # per-rate means. Not a hard guarantee -- each rate here is scored on
+            # its own subset of volumes rather than on all of them -- so a small
+            # excursion is expected and a large one means something is off.
+            if per_rate:
+                lo = min(v["aggregate"]["ssim_mean"] for v in per_rate.values())
+                hi = max(v["aggregate"]["ssim_mean"] for v in per_rate.values())
+                ok = lo - 1e-6 <= agg["ssim_mean"] <= hi + 1e-6
+                inv("mixed_within_per_rate_span", "pass" if ok else "warn",
+                    "mixed SSIM {:.4f} vs per-rate span [{:.4f}, {:.4f}]{}".format(
+                        agg["ssim_mean"], lo, hi,
+                        "" if ok else " -- outside; the rate subsets are disjoint so a small"
+                                      " excursion is expected, a large one is not"))
+
+            mixed = dict(rates=[dict(acceleration=R, center_fraction=cf) for R, cf in pairs],
+                         aggregate=agg, rate_counts={int(k): int(v) for k, v in counts.items()},
+                         within_mixture=within, determinism=det_records,
+                         per_volume_csv=str(pv_csv),
+                         comparable_to="training val_metrics/* (same mask function, same seeding)")
+
+            append_results_row(out / "results.csv", dict(
+                run_id=run_id, date=time.strftime("%Y-%m-%d"), git_sha=config["fastmri_sha"], tier="tier1",
+                model_source=model_source, checkpoint_path=args.state_dict if model_source == "pretrained" else "",
+                split=data_path.name, n_volumes=agg["n_volumes"], mask_type=args.mask_type,
+                center_fraction="mixed", acceleration="mixed", mask_seed="filename", train_seed="",
+                ssim_mean=f"{agg['ssim_mean']:.6f}", ssim_std=f"{agg['ssim_std']:.6f}",
+                psnr_mean=f"{agg['psnr_mean']:.4f}", nmse_mean=f"{agg['nmse_mean']:.6f}",
+                per_volume_csv=pv_csv.name,
+                notes="one rate per volume, seeded by filename; comparable to training val_metrics; "
+                      + " ".join(f"R{R}={counts.get(R, 0)}v" for R in sorted(set(args.accelerations))),
+            ))
+    elif args.mixed_pass:
+        log("mixed pass skipped: only one rate, it would duplicate the per-rate pass above")
 
     # cross-rate ordering
     if len(per_rate) > 1:
@@ -799,7 +932,7 @@ def tier1(args) -> int:
     report = dict(
         tier="tier1", overall=overall, run_id=run_id, model_source=model_source, arch=arch,
         data_path=str(data_path), n_volumes=len(files), mask_type=args.mask_type, seed=args.seed,
-        device=str(device), thresholds=THRESHOLDS, per_rate=per_rate,
+        device=str(device), thresholds=THRESHOLDS, per_rate=per_rate, mixed=mixed,
         invariants=[asdict(c) for c in invariants], config=config,
     )
     (out / "tier1_report.json").write_text(json.dumps(report, indent=2, default=json_safe))
@@ -807,6 +940,8 @@ def tier1(args) -> int:
                 **{f"R{R}/ssim_mean": v["aggregate"]["ssim_mean"] for R, v in per_rate.items()},
                 **{f"R{R}/verdict": worst([r["verdict"] for r in v["references"]] or ["pass"])
                    for R, v in per_rate.items()},
+                **({f"mixed/{k}": mixed["aggregate"][k]
+                    for k in ("ssim_mean", "psnr_mean", "nmse_mean", "ssim_std")} if mixed else {}),
                 **{f"invariant/{c.name}": c.status for c in invariants}})
     wb.table("tier1/reference_comparison",
              ["acceleration", "source", "verdict", "ssim", "ref_ssim", "psnr", "ref_psnr", "nmse", "ref_nmse"],
@@ -816,6 +951,10 @@ def tier1(args) -> int:
     wb.artifact_file(out / "tier1_report.json", "tier1_report", "report")
     wb.finish()
 
+    if mixed:
+        log("mixed (one rate per volume, as training validates): SSIM {:.4f}  PSNR {:.2f}  NMSE {:.4f}".format(
+            mixed["aggregate"]["ssim_mean"], mixed["aggregate"]["psnr_mean"], mixed["aggregate"]["nmse_mean"]))
+        log("    compare this with the training run's val_metrics/ssim; the R* numbers above are per-rate")
     log(f"tier1 overall: {overall.upper()}  (report: {out / 'tier1_report.json'})")
     if model_source == "random_init":
         log("reminder: --random_init numbers are meaningless, this was a harness smoke test")
@@ -862,6 +1001,10 @@ def build_parser() -> argparse.ArgumentParser:
     p1.add_argument("--accelerations", type=int, nargs="+", default=[4])
     p1.add_argument("--center_fractions", type=float, nargs="+", default=[0.08])
     p1.add_argument("--volume_limit", type=int, default=0, help="evaluate only the first N volumes (sorted)")
+    p1.add_argument("--no_mixed_pass", dest="mixed_pass", action="store_false",
+                    help="skip the extra pass that draws one rate per volume the way training "
+                         "validates (mixed/*). That pass is what is comparable to a training run's "
+                         "val_metrics; it is skipped anyway when there is only one rate.")
     p1.add_argument("--determinism_volumes", type=int, default=3,
                     help="re-run this many volumes and compare (0 disables)")
     p1.add_argument("--determinism_tol", type=float, default=1e-5)

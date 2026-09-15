@@ -1,7 +1,7 @@
 # Makefile: driver for VarNet evaluation on CHTC. The same targets as
 # ../training/Makefile, run in the same two places:
 #   laptop (needs Docker):        make build push tier0 smoke job-smoke job-evict
-#   ap2001.chtc.wisc.edu:         make submit-tier0 submit-model1 submit-model2 submit-tier1 status logs why
+#   ap2001.chtc.wisc.edu:         make verify-tier0 verify-model1 verify-model2 verify-tier1 status logs why
 #
 #   make local-run       everything laptop-side from scratch, in one go
 #   make help            every target
@@ -26,10 +26,10 @@ SHELL := /bin/bash
 # IMAGE: use a dated tag (<user>/fastmri-verify:2026-09) for anything you push.
 IMAGE    ?= fastmri-verify:local
 PLATFORM ?= linux/amd64
-# preset for `make submit` and the local `make tier1`: model1 | model2 | tier1
+# preset for `make verify` and the local `make tier1`: model1 | model2 | tier1
 MODEL    ?= model1
 # extra name=value macro overrides for condor_submit, e.g.
-#   make submit-model1 ARGS='volume_limit=5 extra_args="--num_workers 0"'
+#   make verify-model1 ARGS='volume_limit=5 extra_args="--num_workers 0"'
 ARGS     ?=
 # ENV_FILE: the secrets file, shared by training/ and verification/. One file
 # at the repo root (see ../.env.example) so there is one key to rotate.
@@ -40,7 +40,9 @@ SLICES   ?= 4
 # GPU: 1 uses the host GPU, 0 forces CPU. Auto-detected from nvidia-smi.
 GPU      ?= $(if $(shell nvidia-smi -L 2>/dev/null),1,0)
 SHM      ?= 8g
-# extra args appended to verify_varnet.py in the smoke and tier1 targets
+# extra args appended to verify_varnet.py in the smoke and tier1 targets.
+# --no_mixed_pass drops the extra one-rate-per-volume pass (see README
+# "Per-rate and mixed"); on CHTC pass it through ARGS as extra_args=...
 EXTRA    ?=
 # PYTEST=1: tier0 also runs the fastMRI repo test suite
 PYTEST   ?= 1
@@ -130,11 +132,12 @@ help:
 	@echo "  make shell           interactive shell in the image, repo mounted at /work"
 	@echo
 	@echo "  ACCESS POINT (ap2001.chtc.wisc.edu, WANDB_API_KEY in ../.env or exported):"
-	@echo "  make submit-tier0    environment checks on a GPU node, once per image tag"
-	@echo "  make submit-model1   released weights, 4x,          val subset"
-	@echo "  make submit-model2   released weights, 2x/4x/6x/8x, val subset, one pass per rate"
-	@echo "  make submit-tier1    Claim A sweep: random masks 4x/8x on the FULL val split (before the repack)"
-	@echo "  make submit MODEL=model1 ARGS='ckpt=../training/runs/model1/<Cluster>/checkpoints/last.ckpt run_name=verify-model1-trained'"
+	@echo "  make verify-tier0    environment checks on a GPU node, once per image tag"
+	@echo "  make verify-model1   released weights, 4x,          val subset   (= training: make submit-model1)"
+	@echo "  make verify-model2   released weights, 2x/4x/6x/8x, val subset: one pass per rate,"
+	@echo "                       plus a mixed pass (one rate per volume) comparable to training's val_metrics"
+	@echo "  make verify-tier1    Claim A sweep: random masks 4x/8x on the FULL val split (before the repack)"
+	@echo "  make verify MODEL=model1 ARGS='ckpt=../training/runs/model1/<Cluster>/checkpoints/last.ckpt run_name=verify-model1-trained'"
 	@echo "  make status          condor_q for your jobs"
 	@echo "  make logs            tail the newest job .out"
 	@echo "  make why JOB=<Cluster>   hold reason + log tails for a held job"
@@ -316,21 +319,31 @@ local-run:
 	@"$(MAKE)" --no-print-directory report
 
 # --- CHTC access point ------------------------------------------------------
-.PHONY: submit submit-tier0 submit-tier1 submit-model1 submit-model2 status logs why
-submit-tier0:
+# verify-model1 here is the evaluation twin of training's submit-model1: same
+# preset, same val subset, same seed, released weights instead of a training
+# run. The submit-* spellings work too, for muscle memory from training/.
+.PHONY: verify verify-tier0 verify-tier1 verify-model1 verify-model2 status logs why
+verify-tier0:
 	./submit.sh tier0 $(ARGS)
 
-submit-tier1:
+verify-tier1:
 	./submit.sh tier1 $(ARGS)
 
-submit-model1:
+verify-model1:
 	./submit.sh model1 $(ARGS)
 
-submit-model2:
+verify-model2:
 	./submit.sh model2 $(ARGS)
 
-submit:
+verify:
 	./submit.sh $(MODEL) $(ARGS)
+
+.PHONY: submit submit-tier0 submit-tier1 submit-model1 submit-model2
+submit: verify
+submit-tier0: verify-tier0
+submit-tier1: verify-tier1
+submit-model1: verify-model1
+submit-model2: verify-model2
 
 status:
 	condor_q -nobatch

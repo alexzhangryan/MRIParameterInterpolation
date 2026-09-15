@@ -5,6 +5,7 @@ runs/
 .make/
 synthetic/
 jobtest/
+evicttest/
 output/
 results/
 wandb/

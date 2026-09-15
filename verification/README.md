@@ -2,7 +2,7 @@
 
 Runbook for evaluating a checkpoint on `multicoil_val`. It is the same
 setup as `../training/` on purpose: the same Docker recipe, the same
-`submit.sh model1|model2` presets, a `train.sub`-shaped submit file with the
+`submit.sh model1|model2` presets (`make verify-model1` here is `make submit-model1` there), a `train.sub`-shaped submit file with the
 same guarded macros, the same `run_*.sh` job executable with the same
 eviction handling, the same `logs/` and `runs/<model>/<Cluster>/` layout,
 the same resources, the same shared `../.env`. The one difference is what
@@ -23,17 +23,54 @@ produced a real number yet.*
 
 | Preset | `accelerations` | `center_fractions` | `mask_type` | Data | What the job does |
 |---|---|---|---|---|---|
-| **model1** | `4` | `0.08` | `equispaced_fraction` | val subset (20 vol) | Score the checkpoint at 4x. Pairs with `training: make submit-model1`. |
-| **model2** | `2 4 6 8` | `0.16 0.08 0.0533 0.04` | `equispaced_fraction` | val subset (20 vol) | Score the checkpoint at each of the four rates, one full pass per rate. Pairs with `training: make submit-model2`. |
+| **model1** | `4` | `0.08` | `equispaced_fraction` | val subset (20 vol) | `make verify-model1`: score the checkpoint at 4x. Pairs with `training: make submit-model1`. |
+| **model2** | `2 4 6 8` | `0.16 0.08 0.0533 0.04` | `equispaced_fraction` | val subset (20 vol) | `make verify-model2`: one full pass per rate, **plus** a mixed pass that draws one rate per volume the way training validates. Pairs with `training: make submit-model2`. |
 | **tier1** | `4 8` | `0.08 0.04` | `random` | full val (199 vol) | The `VERIFICATION.md` Claim A sweep: the fastMRI knee convention the third-party reference values are keyed on. PASS / INVESTIGATE / FAIL verdicts. |
 | **tier0** | | | | none | Environment checks + the fastMRI test suite on a GPU node. Once per image tag. |
 
 model1 / model2 are training's lists, paired elementwise by
 `fastmri.data.subsample.MaskFunc`, under training's mask family and on the
-same 20-volume val subset training validates against. Where training draws
-one (acceleration, centre fraction) pair per sample, evaluation scores every
-pair separately, so a model 2 job reports four per-rate results plus the
-cross-rate invariant (SSIM must fall as the rate rises).
+same 20-volume val subset training validates against.
+
+### Per-rate and mixed: model 2 reports both
+
+A multi-rate job scores the checkpoint two different ways, because they
+answer two different questions:
+
+- **Per-rate** (`R2/`, `R4/`, `R6/`, `R8/`): every volume forced to the same
+  rate, one full pass each. This says how the model does at each individual
+  acceleration, it is what the cross-rate invariant checks (SSIM must fall as
+  the rate rises), and it is the only form the reference values can be
+  compared against. Four passes for model 2.
+- **Mixed** (`mixed/`): one extra pass in which each volume gets one rate,
+  drawn the way training draws it. This is the number to put next to a
+  training run's `val_metrics/ssim`.
+
+The mixed pass exists because training and a per-rate pass are not measuring
+the same thing, so their SSIMs cannot agree. Training's `val_transform` is
+`VarNetDataTransform(mask_func=mask)` over the **full** rate lists with
+`use_seed=True`, so `MaskFunc.choose_acceleration()` is seeded from the
+filename (`seed = tuple(map(ord, fname))`) and every validation volume is
+locked to one rate for the whole run. What Lightning logs each epoch is the
+mean over volumes of that mixture. The mixed pass rebuilds exactly that mask
+function, so `mixed/ssim_mean` is directly comparable; the per-rate numbers
+bracket it.
+
+The metric definitions already agree, which is worth knowing because it means
+the mixing was the entire discrepancy: `MriModule` averages per-slice SSIM at
+`data_range=attrs["max"]` over volumes, and `fastmri.evaluate.ssim` (what this
+harness uses) averages per-slice SSIM at `data_range=target.max()` — the same
+number whenever `attrs["max"]` is the volume's own max, which is how the
+fastMRI knee files are written.
+
+The mixed pass is a genuine extra pass, not a regrouping of the per-rate
+results. `choose_acceleration()` spends a different amount of the seeded
+random state on `randint(1)` than on `randint(4)`, so a volume that drew 4x in
+the mixture gets a different mask from the same volume in the `R4` pass
+(measured: 17 of 40 filenames differ). It costs one more pass over the data,
+about 25% on top of model 2's four; `--no_mixed_pass` in `extra_args` skips
+it. A single-rate job (model1, tier0) skips it automatically, since there it
+would just repeat the one per-rate pass.
 
 **Which checkpoint.** By default the released fastMRI knee model
 (`knee_leaderboard_state_dict.pt`, 12 cascades) staged next to the data:
@@ -54,7 +91,7 @@ path.
 | `verify.sub` | access point | HTCondor submit file, container universe, every default guarded with `if ! defined`. Model 1 defaults; the other presets via macros. | `train.sub` |
 | `verify_tier0.sub` | access point | Tier 0 on a GPU node, no data. | |
 | `submit.sh` | access point | `./submit.sh model1\|model2\|tier1\|tier0 [name=value ...]`. Sources `../.env`, refuses to submit without a W&B key unless `OFFLINE=1`, proves with `-dry-run` that the preset reached the job ad. | `submit.sh` |
-| `Makefile` | laptop + access point | `make build/push/tier0/smoke/job-smoke/job-evict` (Docker) and `make submit-*/status/logs/why` (condor). | `Makefile` |
+| `Makefile` | laptop + access point | `make build/push/tier0/smoke/job-smoke/job-evict` (Docker) and `make verify-*/status/logs/why` (condor). | `Makefile` |
 | `Dockerfile` | laptop (build), CHTC (run) | Same pins as training's: Lightning 1.9.5, torch 2.0.1+cu118, conda h5py, fastMRI at `91f2df4`, plus pytest for Tier 0. `linux/amd64`. | `Dockerfile` |
 | `make_synthetic_val.py` | laptop | Tiny fake `multicoil_val` for the smoke tests. Training's smoke tests use it too. | |
 | `prepare_staging.sh` | CHTC transfer node | Downloads `knee_multicoil_val.tar.xz` and the released checkpoint into `/staging/a/apryan3/fastmri/`, verifies SHA256. | |
@@ -150,7 +187,7 @@ clone there, or scp:
 | `submit.sh` | wraps `condor_submit`, applies the presets, runs the preflight |
 | `run_verify.sh` | the job executable |
 | `verify_varnet.py` | the harness (listed in `transfer_input_files`) |
-| `Makefile` | for `make submit-model1` etc. Optional; `./submit.sh` works alone. |
+| `Makefile` | for `make verify-model1` etc. Optional; `./submit.sh` works alone. |
 | `prepare_staging.sh` | only if the data still has to be staged (section 3a) |
 | `../.env.example` | to create `../.env` by hand on the access point |
 
@@ -224,7 +261,7 @@ cd ~/Fall26Research/verification            # ../.env holds WANDB_API_KEY; or ex
 ### 4.1 Tier 0 once per image tag (minutes)
 
 ```bash
-make submit-tier0                 # ./submit.sh tier0
+make verify-tier0                 # ./submit.sh tier0
 ```
 
 `runs/tier0/<Cluster>/tier0_report.json` must say `"overall": "pass"`.
@@ -232,7 +269,7 @@ make submit-tier0                 # ./submit.sh tier0
 ### 4.2 Short test job first (model 1, 5 volumes)
 
 ```bash
-make submit-model1 ARGS='volume_limit=5'
+make verify-model1 ARGS='volume_limit=5'
 make logs                          # tail -f the newest logs/*.out
 ```
 
@@ -249,9 +286,9 @@ directory is a throwaway.
 ### 4.3 The presets
 
 ```bash
-make submit-model1                 # accelerations="4"       center_fractions="0.08"                  mask_type=equispaced_fraction
-make submit-model2                 # accelerations="2 4 6 8" center_fractions="0.16 0.08 0.0533 0.04" mask_type=equispaced_fraction
-make submit-tier1                  # accelerations="4 8"     center_fractions="0.08 0.04"             mask_type=random, full val, request_disk=320GB
+make verify-model1                 # accelerations="4"       center_fractions="0.08"                  mask_type=equispaced_fraction
+make verify-model2                 # accelerations="2 4 6 8" center_fractions="0.16 0.08 0.0533 0.04" mask_type=equispaced_fraction
+make verify-tier1                  # accelerations="4 8"     center_fractions="0.08 0.04"             mask_type=random, full val, request_disk=320GB
 ```
 
 Run names and W&B runs: `verify-model1`, `verify-model2`, `verify-tier1`.
@@ -265,8 +302,8 @@ The point of matching the training setup. When `../training/` has produced
 list and val subset it was trained against:
 
 ```bash
-make submit MODEL=model1 ARGS='ckpt=../training/runs/model1/<Cluster>/checkpoints/last.ckpt run_name=verify-model1-trained'
-make submit MODEL=model2 ARGS='ckpt=../training/runs/model2/<Cluster>/checkpoints/last.ckpt run_name=verify-model2-trained'
+make verify MODEL=model1 ARGS='ckpt=../training/runs/model1/<Cluster>/checkpoints/last.ckpt run_name=verify-model1-trained'
+make verify MODEL=model2 ARGS='ckpt=../training/runs/model2/<Cluster>/checkpoints/last.ckpt run_name=verify-model2-trained'
 ```
 
 `submit.sh` checks the file exists, HTCondor transfers it into the sandbox,
@@ -279,7 +316,7 @@ given explicitly so it does not continue the released-checkpoint W&B run.
 
 ### 4.5 Overrides
 
-`make submit-model1 ARGS='...'` and `./submit.sh model1 name=value ...` are
+`make verify-model1 ARGS='...'` and `./submit.sh model1 name=value ...` are
 the same thing. Any `name=value` is a `condor_submit` macro override, so
 every knob in `verify.sub` (`val_data`, `ckpt`, `request_disk`,
 `volume_limit`, `run_name`, `mask_type`, `extra_args`, `cpus`, `mem`,
@@ -332,9 +369,22 @@ stalled `/staging` read) are released automatically up to five times by
   architecture that was loaded
 - `per_volume_R<N>.csv`: SSIM / PSNR / NMSE / MSE per volume, model and
   zero-filled, one file per rate
+- `per_volume_mixed.csv`: the same columns for the mixed pass, with each
+  volume's `acceleration` / `center_fraction` column showing the rate its
+  filename actually drew
 - `results.csv`: one row per (run, rate) in the `VERIFICATION.md` Section 8
   schema, append-only
 - `wandb/`: the offline W&B run, only when no key was available
+
+In the report JSON, `per_rate` holds the four per-rate blocks and `mixed`
+holds the mixture, including `rate_counts` (how many volumes drew each rate)
+and `within_mixture` (how the volumes that drew each rate scored on their
+own — disjoint subsets of the one mixed pass, not the per-rate passes). In
+`results.csv` the mixed row carries `acceleration = mixed`. In W&B the keys
+are `mixed/ssim_mean`, `mixed/psnr_mean`, `mixed/nmse_mean` alongside the
+`R<N>/...` ones, and the extra invariants are `mixed_beats_zero_filled`,
+`mixed_volume_count` and `mixed_within_per_rate_span` (a sanity check that
+the mixture lands inside the span of the per-rate means).
 
 `tier1` compares each rate against the third-party measurements of the
 released checkpoint listed in `VERIFICATION.md` Section 2 and prints
@@ -355,11 +405,19 @@ count with every number; the report and `results.csv` carry it.
 
 | | 4x only | 2x / 4x / 6x / 8x |
 |---|---|---|
-| **Released weights** | `verification: make submit-model1` | `verification: make submit-model2` |
-| **Trained here** | `training: make submit-model1`, then `verification: make submit MODEL=model1 ARGS='ckpt=...'` | `training: make submit-model2`, then `verification: make submit MODEL=model2 ARGS='ckpt=...'` |
+| **Released weights** | `verification: make verify-model1` | `verification: make verify-model2` |
+| **Trained here** | `training: make submit-model1`, then `verification: make verify MODEL=model1 ARGS='ckpt=...'` | `training: make submit-model2`, then `verification: make verify MODEL=model2 ARGS='ckpt=...'` |
 
 What is held identical across the row: the acceleration / centre-fraction
 lists, the mask family, the 20-volume val subset, seed 42, and the scorer.
+
+**Comparing a verification number with the training run it came from.** Use
+`mixed/ssim_mean` in `fastmri-varnet-verify`, not `R4/ssim_mean`, against
+`val_metrics/ssim` in `fastmri-varnet-train`. Those two are the same
+measurement. The remaining difference is the data: training validates on
+whatever `val_data` its job was given, so the two only line up when the
+verification job scored the same subset, which the `model1` / `model2`
+presets do by default.
 
 **The released-weights row is a ceiling reference, not a matched control.**
 Three things differ from the trained models, all of them in its favour:
