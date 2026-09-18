@@ -1,11 +1,12 @@
 #!/bin/bash
 # submit.sh: submit a VarNet training job on the CHTC access point.
 #
-#   ./submit.sh model1                     acceleration 4 only
-#   ./submit.sh model2                     accelerations 2 4 6 8, one drawn per sample
-#   ./submit.sh model1 resume=runs/<model>/<Cluster>/checkpoints/last.ckpt
+#   ./submit.sh model2                     accelerations 2 4 6 8, one drawn per sample (brain)
+#   ./submit.sh model1                     acceleration 4 only (brain)
+#   ./submit.sh model2 resume=runs/brain/<model>/<Cluster>/checkpoints/last.ckpt
 #   ./submit.sh model2 max_epochs=2 extra_args="--limit_train_batches 20 --limit_val_batches 5"
-#   OFFLINE=1 ./submit.sh model1           skip the W&B key check, log offline
+#   ./submit.sh model2 dataset=knee staging=... train_data=... val_data=...   the 2026-09 knee subsets
+#   OFFLINE=1 ./submit.sh model2           skip the W&B key check, log offline
 #
 # The first argument picks the model preset; any further name=value pairs are
 # passed straight to condor_submit as macro overrides and win over the preset.
@@ -32,8 +33,14 @@ case "$MODEL" in
 esac
 
 SUB=train.sub
+# dataset= is a train.sub macro (default brain). It is read here only so the
+# runs/ directory and the preflight's expected run name follow it.
+DATASET=brain
+for kv in "$@"; do
+  case "$kv" in dataset=*) DATASET="${kv#dataset=}" ;; esac
+done
 # the remap target's parent must exist before HTCondor writes output/ there
-mkdir -p logs "runs/$MODEL"
+mkdir -p logs "runs/$DATASET/$MODEL"
 
 if ! command -v condor_submit >/dev/null 2>&1; then
   echo "condor_submit not found: run this on ap2001.chtc.wisc.edu, not on the laptop" >&2
@@ -83,7 +90,7 @@ echo "job args: ${ARGS_LINE#*=}"
 grep -E '^Request(Cpus|Memory|Disk|GPUs) *=' "$DRY" | tr '\n' ' '; echo
 
 # Only assert on knobs the caller did not override by hand.
-want_name="varnet-$MODEL"
+want_name="varnet-$DATASET-$MODEL"
 want_accel="$(printf '%s' "${PRESET[1]}" | sed 's/^accelerations=//')"
 fail=""
 case " $* " in *" run_name="*) ;; *)
@@ -106,5 +113,5 @@ fi
 echo "submitting $SUB ${PRESET[*]} $*"
 condor_submit "$SUB" "${PRESET[@]}" "$@"
 echo
-echo "watch:       condor_q -nobatch; tail -f logs/${MODEL}_*.out"
-echo "checkpoints: runs/<model>/<Cluster>/checkpoints/last.ckpt  (resume=... to continue)"
+echo "watch:       condor_q -nobatch; tail -f logs/${DATASET}_${MODEL}_*.out"
+echo "checkpoints: runs/$DATASET/$MODEL/<Cluster>/checkpoints/last.ckpt  (resume=... to continue)"

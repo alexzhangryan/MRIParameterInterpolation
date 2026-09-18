@@ -24,6 +24,13 @@ Model 2:  --accelerations 2 4 6 8  --center_fractions 0.16 0.08 0.0533 0.04
 The mask function pairs the two lists elementwise and draws one pair uniformly
 at random per training sample (fastmri.data.subsample.MaskFunc), so model 2 is
 a single network trained jointly on four rates with no explicit rate signal.
+
+Architecture and optimiser defaults (12 cascades, Adam 3e-4) are the paper's
+and the fastMRI leaderboard scripts' (varnet_reproduce_20201111/), not
+train_varnet_demo.py's memory-saving 8 cascades / 1e-3. Data is whatever
+--data_path holds under multicoil_train/ and multicoil_val/: the brain set
+since 2026-09-18, the knee subsets before that. The transform, module and
+metrics are anatomy-agnostic (crop size and max value come from each file).
 """
 
 import os
@@ -126,6 +133,8 @@ def cli_main(args):
         test_path=args.test_path,
         sample_rate=args.sample_rate,
         volume_sample_rate=args.volume_sample_rate,
+        val_sample_rate=args.val_sample_rate,
+        val_volume_sample_rate=args.val_volume_sample_rate,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         distributed_sampler=use_ddp,
@@ -164,6 +173,10 @@ def cli_main(args):
     resume = args.resume_from_checkpoint or latest_checkpoint(checkpoint_dir)
     print(f"[train_wandb] run_name={args.run_name} accelerations={args.accelerations} "
           f"center_fractions={args.center_fractions} mask_type={args.mask_type}")
+    print(f"[train_wandb] data_path={args.data_path} num_cascades={args.num_cascades} "
+          f"chans={args.chans} sens_chans={int(args.sens_chans)} lr={args.lr} "
+          f"lr_step_size={args.lr_step_size} batch_size={args.batch_size} "
+          f"max_epochs={args.max_epochs}")
     print(f"[train_wandb] checkpoints -> {checkpoint_dir}")
     print(f"[train_wandb] resume from: {resume or 'nothing (fresh run)'}")
 
@@ -198,9 +211,17 @@ def build_args():
              "same across resubmissions of one training run so W&B continues the run.",
     )
 
-    # data transform params (paired elementwise, see module docstring)
+    # data transform params (paired elementwise, see module docstring).
+    # Every family fastmri.data.subsample.create_mask_for_mask_type knows:
+    #   random               Bernoulli lines, knee leaderboard convention
+    #   equispaced           the paper's M_e(m, l): every R-th line + centre,
+    #                        uncorrected, so the realised rate is < R
+    #   equispaced_fraction  equispaced with the spacing corrected for the
+    #                        centre so the realised rate == R (default)
+    #   magic, magic_fraction  Defazio 2019 offset sampling
     parser.add_argument(
-        "--mask_type", choices=("random", "equispaced_fraction"),
+        "--mask_type",
+        choices=("random", "equispaced", "equispaced_fraction", "magic", "magic_fraction"),
         default="equispaced_fraction", type=str,
     )
     parser.add_argument("--center_fractions", nargs="+", default=[0.08], type=float)
@@ -217,15 +238,21 @@ def build_args():
     parser = FastMriDataModule.add_data_specific_args(parser)
     parser.set_defaults(challenge="multicoil", batch_size=1, test_path=None)
 
-    # model: --num_cascades, --chans, --lr, ...  (paper / demo defaults below)
+    # model: --num_cascades, --chans, --lr, ...
+    # These are the values of fastmri_examples/varnet/varnet_reproduce_20201111/
+    # varnet_{knee,brain}_leaderboard.py, which are also VarNetModule's own
+    # defaults and, where the paper states a value (12 cascades, Adam 3e-4,
+    # 50 epochs, ~30M parameters), the paper's. train_varnet_demo.py instead
+    # uses 8 cascades and lr 1e-3 "for lower memory consumption"; this
+    # directory used those until 2026-09-18 (README "Configuration").
     parser = VarNetModule.add_model_specific_args(parser)
     parser.set_defaults(
-        num_cascades=8,
+        num_cascades=12,
         pools=4,
         chans=18,
         sens_pools=4,
         sens_chans=8,
-        lr=0.001,
+        lr=0.0003,
         lr_step_size=40,
         lr_gamma=0.1,
         weight_decay=0.0,

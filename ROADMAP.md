@@ -10,7 +10,35 @@ Phase A exists to get a working, correctly-instrumented baseline before touching
 
 ---
 
-## Where this actually stands (2026-09-11)
+## Where this actually stands (2026-09-18)
+
+**The dataset changed.** Group-directory access came through and the full
+fastMRI **brain** multicoil set (20 NYU tarballs, ~1.37 TB, compressed) is in
+`/staging/groups/kamilov_group/Kamilov-SciAI-datasets/fastMRI_brain/`,
+transferred and SHA256-verified by `verification/prepare_brain_staging.sh`.
+The 2026-09-18 meeting set the training target: **E2E VarNet on multicoil
+brain, acceleration rates 2, 4, 6, 8**, with the training configuration and
+the mask generation checked against the paper. `training/` was repointed the
+same day; the knee subsets in personal staging are superseded but still
+reachable through `dataset=knee` macros.
+
+| Piece | State |
+|---|---|
+| `training/` (`train.sub`, `run_train.sh`, `train_wandb.py`, `submit.sh`) | repointed to brain batch 0 of each split, group staging, `runs/brain/<model>/`, W&B `varnet-brain-<model>`; defaults now 12 cascades / Adam 3e-4 (paper + leaderboard script) instead of the demo's 8 / 1e-3; smoke-tested locally on synthetic data. **Not yet submitted in this form.** |
+| Configuration audit (meeting item 1) | `training/README.md` "Configuration": every setting against the paper, the leaderboard script, and the demo. Batch size and LR schedule are not in the paper; effective batch 1 vs the leaderboard's 32 is the one real deviation |
+| Mask audit (meeting item 3) | `training/README.md` "Masks": equispaced lines with density correction, rate drawn uniformly per training slice, per volume at validation, no rate input to the network |
+| Gain hypothesis (meeting item 4) | `plan.md` "Expected gain from explicit rate conditioning" |
+| `verification/` | unchanged; scores brain checkpoints via `val_data=` / `ckpt=` overrides (the defaults still say knee) |
+| Knee subsets in `/staging/a/apryan3/fastmri/` | built 2026-09-12..14 (`knee_multicoil_{train,val}_subset`), used by short test jobs only, superseded |
+| Phase B (DPI) | designed in `plan.md`, no code written |
+
+The immediate next action is a CHTC session: `git pull` in
+`~/Fall26Research`, `ls` the brain directory to confirm the two batch-0
+tarballs and size `request_disk`, the 4.1 short test job, then
+`make submit-model2`. Runbook: `training/README.md` sections 3a and 4.
+
+<details>
+<summary>Previous status block (2026-09-11), kept for the record</summary>
 
 Everything below is built and green locally. **Nothing has run on CHTC yet** — no
 job has been submitted, no tier of `VERIFICATION.md` has been executed, no
@@ -27,8 +55,7 @@ data.
 | Data in `/staging/a/apryan3/fastmri/` | unconfirmed; assume nothing is there until `ls` says otherwise |
 | Phase B (DPI) | designed in `plan.md`, no code written |
 
-The immediate next action is a CHTC session: confirm what is in `/staging`, push
-the images, then Tier 0 → Tier 1 → the section 3b repack → training.
+</details>
 
 ---
 
@@ -91,7 +118,18 @@ fastmri@med.nyu.edu if they lapse before the data is staged.
 
 ## Phase 2 — Data transfer
 
-Target: **`/staging/a/apryan3/fastmri/`**. Archives stay packed in `/staging`;
+- [x] **Brain (2026-09-16..18, the current data).** Group-directory access
+  granted. `verification/prepare_brain_staging.sh` fetched all 20 NYU brain
+  tarballs (~1.37 TB: 10 train batches, 3 val, 3 test, 3 fully-sampled test,
+  DICOM) into `/staging/groups/kamilov_group/Kamilov-SciAI-datasets/fastMRI_brain/`
+  and verified them against NYU's `SHA256`. Nothing is extracted there (10,000-item
+  cap); jobs pull one `.tar.xz` per split into scratch. `train.sub` defaults to
+  batch 0 of train and val.
+
+The knee material below is what happened before that and is kept for the
+record; the knee subsets still exist in personal staging.
+
+Target (knee): **`/staging/a/apryan3/fastmri/`**. Archives stay packed in `/staging`;
 HTCondor transfers them into job scratch, where `run_verify.sh` / `run_train.sh`
 extract them. A job never reads `/staging` directly.
 
@@ -114,17 +152,20 @@ below and `training/README.md` section 3b.
   `train_varnet_demo.py` invocation: `train_wandb.py` builds the same
   `VarNetModule` / `FastMriDataModule` and adds the W&B logger and the
   auto-resume-from-`output/checkpoints` contract a multi-day CHTC run needs.
-  Two runs, one after the other:
+  **Since 2026-09-18: brain data, and model2 is the primary run:**
   ```bash
   # on ap2001, in ~/Fall26Research/training, WANDB_API_KEY exported
-  make submit-model1   # accelerations 4,       center_fractions 0.08
-  make submit-model2   # accelerations 2 4 6 8, center_fractions 0.16 0.08 0.0533 0.04
+  make submit-model2 ARGS='max_epochs=1 extra_args="--limit_train_batches 50 --limit_val_batches 10"'   # short test first
+  make submit-model2   # brain, accelerations 2 4 6 8, center_fractions 0.16 0.08 0.0533 0.04
+  make submit-model1   # brain, acceleration 4 only (optional per-rate reference)
   ```
-  Everything else is the `train_varnet_demo.py` default (8 cascades, 18 chans,
-  Adam 1e-3 with x0.1 at epoch 40, batch 1, 50 epochs, `equispaced_fraction`,
-  seed 42) except `--gpus 1` instead of 2. model1 is the Phase A reproduction
-  target; model2 is the joint-training-no-conditioning Phase B baseline.
-  Full runbook: `training/README.md` section 4.
+  Configuration: 12 cascades, 18 / 8 channels, Adam 3e-4 with x0.1 at epoch
+  40, batch 1, 50 epochs, `equispaced_fraction`, seed 42, one GPU (the paper
+  and the fastMRI brain leaderboard script; the demo's 8 cascades / 1e-3 were
+  dropped 2026-09-18). Data: `brain_multicoil_train_batch_0` (455 volumes) and
+  `brain_multicoil_val_batch_0` (460 volumes). model2 is the
+  joint-training-no-conditioning Phase B baseline; model1 is one point of the
+  per-rate ceiling. Full runbook: `training/README.md` section 4.
 - [x] **Known deviations from the paper documented** — the register lives in
   `training/README.md` ("Known deviations from Sriram et al. 2020") and
   `VERIFICATION.md` sections 1 and 5.4. In short:
@@ -178,4 +219,4 @@ Rough plan to adapt it to VarNet:
 - Your prior CHTC recipe (reference): `Research/Dockerfile`, `Research/diffusion.sub`, `Research/submit.sh` on your Desktop
 
 ---
-*Last updated: 2026-09-11*
+*Last updated: 2026-09-18*

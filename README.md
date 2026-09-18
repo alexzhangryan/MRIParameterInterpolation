@@ -1,30 +1,32 @@
-# Fall26Research: E2E VarNet on fastMRI knee, then Deep Parameter Interpolation
+# Fall26Research: E2E VarNet on fastMRI brain, then Deep Parameter Interpolation
 
 Two phases (see `CLAUDE.md`, `ROADMAP.md`):
 
-- **Phase A**: reproduce End-to-End VarNet on the fastMRI knee dataset on
-  UW-Madison CHTC (HTCondor), and train two baseline models.
+- **Phase A**: train End-to-End VarNet baselines on the fastMRI multicoil
+  **brain** dataset on UW-Madison CHTC (HTCondor). Started on knee; moved to
+  brain on 2026-09-18 once the group staging directory held the full set.
 - **Phase B**: extend VarNet with Deep Parameter Interpolation (Park et al.,
   CVPR 2026) to condition on acceleration rate. Designed in `plan.md`, not
   started.
 
-## Status (2026-09-11)
+## Status (2026-09-18)
 
-Both stages are built, documented, and green on synthetic data locally.
-**Nothing has run on CHTC yet**: no job submitted, no verification tier
-executed, no training started, and `/staging` not confirmed to hold any
-fastMRI data. `ROADMAP.md` has the per-item checklist.
+The brain set (20 NYU tarballs, ~1.37 TB) is in the Kamilov group staging
+directory, transferred and SHA256-verified. `training/` is repointed at it
+with the paper's configuration (12 cascades, Adam 3e-4) and the meeting's
+rate list (2, 4, 6, 8), and passes the local smoke tests. **The brain runs
+have not been submitted yet.** `ROADMAP.md` has the per-item checklist.
 
-Next CHTC session, in order: confirm what is in `/staging` → push both images
-→ Tier 0 → Tier 1 (on the full val split, while it still exists) → the
-section 3b subset repack → `make submit-model1`.
+Next CHTC session: `git pull`, confirm the two batch-0 tarballs with `ls`,
+the one-epoch test job, then `make submit-model2` (`training/README.md`
+sections 3a and 4).
 
 ## Layout
 
 | Path | What | Runbook |
 |---|---|---|
 | `verification/` | Evaluate the released VarNet checkpoint on `multicoil_val` (Tiers 0 and 1 of `VERIFICATION.md`). Proves the environment and the metric code before any training. | `verification/README.md` |
-| `training/` | Train **model 1** (acceleration 4 only) and **model 2** (accelerations 2, 4, 6, 8, one drawn at random per sample). Also holds the one-off `/staging` repack jobs. | `training/README.md` |
+| `training/` | Train **model 2** (accelerations 2, 4, 6, 8, one drawn at random per sample; the primary run) and **model 1** (acceleration 4 only) on brain. Also holds the knee-era `/staging` repack jobs. | `training/README.md` |
 | `fastMRI/` | Submodule, `facebookresearch/fastMRI` at commit `91f2df4`. Never modified. Not needed on CHTC: the images carry their own copy. | |
 | `parameter_interpolation/` | Submodule, the DPI reference code. Phase B only. | |
 | `Claude outputs/` | Archived first draft of the verification harness, superseded by `verification/`. Do not run. | |
@@ -36,51 +38,48 @@ section 3b subset repack → `make submit-model1`.
 | `plan.md` | Phase B design: the DPI mechanism, the files to create, the scope table, related work. |
 | `CLAUDE.md` | Project context for Claude Code sessions. |
 
-## The two training runs
+## The training runs
 
 | Model | `accelerations` | `center_fractions` | Purpose |
 |---|---|---|---|
-| model1 | `4` | `0.08` | Phase A reproduction target, one rate |
-| model2 | `2 4 6 8` | `0.16 0.08 0.0533 0.04` | Joint training on four rates with no rate signal: the Phase B baseline |
+| model2 | `2 4 6 8` | `0.16 0.08 0.0533 0.04` | Joint training on four rates with no rate signal: the Phase B baseline. **The run the 2026-09-18 meeting asked for.** |
+| model1 | `4` | `0.08` | One rate; the 4x point of the per-rate ceiling Phase B compares against. Optional. |
 
-Both are trained from scratch (random init, no checkpoint) with the
-`train_varnet_demo.py` defaults for everything except the mask lists: 8
-cascades, 18 channels, Adam lr 1e-3 with a x0.1 step at epoch 40, batch 1,
-50 epochs, `equispaced_fraction` masks, seed 42, one GPU. They run one after
-the other, model 1 first, and model 2 does not start from model 1's weights.
+Both are trained from scratch (random init, no checkpoint) with the paper's
+and the fastMRI leaderboard script's configuration for everything except the
+mask lists: 12 cascades, 18 channels, Adam lr 3e-4 with a x0.1 step at epoch
+40, batch 1, 50 epochs, `equispaced_fraction` masks, seed 42, one GPU. Neither
+starts from the other's weights.
 
 ```bash
 # on ap2001.chtc.wisc.edu, in ~/Fall26Research/training, WANDB_API_KEY exported
-make submit-model1        # acceleration 4
-make submit-model2        # accelerations 2 4 6 8, one drawn per sample
+make submit-model2        # brain, accelerations 2 4 6 8, one drawn per sample
+make submit-model1        # brain, acceleration 4 (optional)
 ```
 
-Full instructions, including what to copy to CHTC, the short test job to run
-first, and how to resume and monitor, are in `training/README.md`.
+Full instructions, including the short test job to run first, the
+configuration audit against the paper, how the masks are generated, and how
+to resume and monitor, are in `training/README.md`.
 
-## Data: the 100 GB staging quota shapes everything
+## Data: the brain set in group staging
 
-`/staging/a/apryan3` is capped at 100 GB. The full val tarball alone is
-100.7 GB and the train split ships as five ~91 GB batches, so neither full
-split fits, and requesting an increase is a last resort (decision 2026-09-11).
-Instead `/staging` holds two subsets, built once by `training/README.md`
-section 3b:
+`/staging/groups/kamilov_group/Kamilov-SciAI-datasets/fastMRI_brain/` holds
+all 20 NYU brain tarballs (10 train batches of ~450 volumes, 3 val batches
+of ~460, 3 test, 3 fully-sampled test, DICOM; ~1.37 TB compressed), verified
+against NYU's `SHA256`. The directory has a 10,000-item cap, so nothing is
+extracted there; a job pulls one `.tar.xz` per split into scratch and
+unpacks it.
 
-| File | Built by | Size | Contents |
-|---|---|---|---|
-| `knee_multicoil_val_subset.tar` | `make subset-val` | ~20 GB | 20 of the 199 val volumes |
-| `knee_multicoil_train_subset.tar.xz` | `make subset-train` | ~65 GB | ~120 of the 973 train volumes, streamed as a prefix of NYU's `train_batch_0` |
+`train.sub` defaults to `brain_multicoil_train_batch_0.tar.xz` (455 volumes)
+and `brain_multicoil_val_batch_0.tar.xz` (460 volumes): one batch per split
+is what fits a job's scratch, and it is the same volumes every time. Every
+Phase A and Phase B model must train and validate on those same two batches.
+**Absolute numbers are not comparable to the paper**, which trained on all
+4,469 brain volumes; see "Known deviations" in `training/README.md`.
 
-`train.sub` defaults to these. Every Phase A and Phase B model must train and
-validate on the same two subsets — the `*_subset_files.txt` lists those jobs
-emit are the definition of that set. **Absolute numbers from these runs are
-not comparable to the paper**; see "Known deviations" in
-`training/README.md`.
-
-Building the val subset deletes the full val tarball from `/staging`, which
-makes a full-split Tier 1 run impossible without re-downloading it (the NYU
-presigned URLs are valid to roughly 2026-12-08). Run Tier 1 first if that
-number matters.
+The knee subsets from 2026-09 (`knee_multicoil_{train,val}_subset` in
+`/staging/a/apryan3/fastmri/`, built under the 100 GB personal quota) are
+superseded and still reachable with `dataset=knee` overrides.
 
 ## What runs where
 
@@ -88,7 +87,7 @@ number matters.
 |---|---|
 | Laptop (Apple Silicon) | Build the `linux/amd64` Docker images, push to Docker Hub, smoke-test on synthetic data |
 | `ap2001.chtc.wisc.edu` (access point) | Holds `verification/` and `training/`, submits jobs, receives results |
-| `transfer.chtc.wisc.edu` | Downloads the NYU tarballs into `/staging/a/apryan3/fastmri/` |
+| `transfer.chtc.wisc.edu` | Downloaded the NYU tarballs into `/staging` (brain: group directory; knee: `/staging/a/apryan3/fastmri/`) |
 
 Both Docker images must be built for `linux/amd64`; the Dockerfiles pin it
 and the Makefiles pass `--platform`. A bare arm64 build fails in the conda

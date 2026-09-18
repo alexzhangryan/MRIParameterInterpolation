@@ -2,7 +2,7 @@
 #
 # Two kinds of targets, run in two places:
 #   laptop (needs Docker):        make build push smoke job-smoke
-#   ap2001.chtc.wisc.edu:         make submit-model1 submit-model2 resume status logs
+#   ap2001.chtc.wisc.edu:         make submit-model2 submit-model1 resume status logs
 #
 #   make help            every target
 #
@@ -102,12 +102,12 @@ help:
 	@echo "  make shell           interactive shell in the image, repo mounted at /work"
 	@echo
 	@echo "  ACCESS POINT (ap2001.chtc.wisc.edu, WANDB_API_KEY exported):"
-	@echo "  make subset-val      one-off: val subset from the staged tarball (README 3b, step 1)"
-	@echo "  make subset-train    one-off: train subset streamed from NYU into /staging (step 2)"
-	@echo "  make submit-model1   train on acceleration 4 only"
-	@echo "  make submit-model2   train on accelerations 2 4 6 8, one drawn per sample"
+	@echo "  make submit-model2   brain, accelerations 2 4 6 8, one drawn per sample (the 2026-09-18 ask)"
+	@echo "  make submit-model1   brain, acceleration 4 only (per-rate reference)"
 	@echo "  make submit MODEL=model2 ARGS='max_epochs=2'"
-	@echo "  make resume MODEL=model1 CKPT=runs/<model>/<Cluster>/checkpoints/last.ckpt"
+	@echo "  make resume MODEL=model2 CKPT=runs/brain/<model>/<Cluster>/checkpoints/last.ckpt"
+	@echo "  make subset-val      knee only (2026-09, README 3b): val subset from the staged tarball"
+	@echo "  make subset-train    knee only: train subset streamed from NYU into personal /staging"
 	@echo "  make status          condor_q for your jobs"
 	@echo "  make logs            tail the newest job .out"
 	@echo "  make why JOB=<Cluster>   hold reason + log tails for a held job"
@@ -173,9 +173,11 @@ $(SYNTH)/multicoil_val: ../verification/make_synthetic_val.py | build
 	    --volumes 2 --slices $(SLICES) --seed 2
 	@touch $@
 
-knee_multicoil_train_synthetic.tar knee_multicoil_val_synthetic.tar: $(SYNTH)/multicoil_val
-	tar -cf knee_multicoil_train_synthetic.tar -C $(SYNTH) multicoil_train
-	tar -cf knee_multicoil_val_synthetic.tar   -C $(SYNTH) multicoil_val
+# Named so run_train.sh's *multicoil_*.tar glob picks them up, like the real
+# brain_multicoil_*_batch_N.tar.xz / knee_multicoil_*_subset.tar files.
+synthetic_multicoil_train.tar synthetic_multicoil_val.tar: $(SYNTH)/multicoil_val
+	tar -cf synthetic_multicoil_train.tar -C $(SYNTH) multicoil_train
+	tar -cf synthetic_multicoil_val.tar   -C $(SYNTH) multicoil_val
 
 # --- smoke: the driver ------------------------------------------------------
 # Epoch 1 from scratch, then epoch 2 must start from output/checkpoints/last.ckpt.
@@ -219,9 +221,9 @@ smoke-wandb: smoke
 # scratch dir: the second run sees output/ exactly as HTCondor would deliver it
 # after an eviction and must resume rather than restart.
 .PHONY: job-smoke
-job-smoke: build check-eol knee_multicoil_train_synthetic.tar
+job-smoke: build check-eol synthetic_multicoil_train.tar
 	rm -rf jobtest && mkdir -p jobtest
-	cp train_wandb.py run_train.sh knee_multicoil_*_synthetic.tar jobtest/
+	cp train_wandb.py run_train.sh synthetic_multicoil_*.tar jobtest/
 	$(DOCKER) run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) -e KEEP_TARBALL=1 \
 	    -v "$(REPO)":/work -w /work/training/jobtest $(IMAGE) \
 	    bash run_train.sh --run_name job-smoke --accelerations 4 --center_fractions 0.08 \
@@ -253,9 +255,9 @@ job-smoke: build check-eol knee_multicoil_train_synthetic.tar
 # symlink sweep never happens, re-holding the job on output transfer. This test
 # pins down the behaviour either way. VACATE_GRACE is shortened here for speed.
 .PHONY: job-evict
-job-evict: build check-eol knee_multicoil_train_synthetic.tar
+job-evict: build check-eol synthetic_multicoil_train.tar
 	rm -rf evicttest && mkdir -p evicttest
-	cp train_wandb.py run_train.sh knee_multicoil_*_synthetic.tar evicttest/
+	cp train_wandb.py run_train.sh synthetic_multicoil_*.tar evicttest/
 	-@$(DOCKER) rm -f fastmri-evict >/dev/null 2>&1 || true
 	$(DOCKER) run -d --name fastmri-evict --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) \
 	    $(ENVFLAGS) -e KEEP_TARBALL=1 -e VACATE_GRACE=5 \
@@ -291,9 +293,11 @@ job-evict: build check-eol knee_multicoil_train_synthetic.tar
 
 # --- CHTC access point ------------------------------------------------------
 .PHONY: submit submit-model1 submit-model2 resume status logs why subset-val subset-train
-# README section 3b: build the subset tarballs that fit under the /staging
-# quota. subset-val brings ~N_VAL GB back to this directory; subset-train
-# needs FASTMRI_TRAIN_URL (from $(ENV_FILE)) and writes straight into /staging.
+# KNEE ONLY (README section 3b, 2026-09): build the subset tarballs that fit
+# under the 100 GB personal /staging quota. Not used for the brain runs, which
+# read NYU's batches from the group staging directory as shipped. subset-val
+# brings ~N_VAL GB back to this directory; subset-train needs
+# FASTMRI_TRAIN_URL (from $(ENV_FILE)) and writes straight into /staging.
 N_VAL           ?= 20
 TRAIN_PREFIX_GB ?= 65
 subset-val:
@@ -316,7 +320,7 @@ submit:
 	./submit.sh $(MODEL) $(ARGS)
 
 resume:
-	@test -n "$(CKPT)" || { echo "usage: make resume MODEL=model1 CKPT=runs/<model>/<Cluster>/checkpoints/last.ckpt" >&2; exit 1; }
+	@test -n "$(CKPT)" || { echo "usage: make resume MODEL=model2 CKPT=runs/brain/<model>/<Cluster>/checkpoints/last.ckpt" >&2; exit 1; }
 	./submit.sh $(MODEL) resume=$(CKPT) $(ARGS)
 
 status:
@@ -342,7 +346,7 @@ shell: build
 
 .PHONY: clean distclean
 clean:
-	rm -rf output synthetic jobtest evicttest knee_multicoil_*_synthetic.tar
+	rm -rf output synthetic jobtest evicttest synthetic_multicoil_*.tar knee_multicoil_*_synthetic.tar
 
 distclean: clean
 	rm -rf .make logs runs

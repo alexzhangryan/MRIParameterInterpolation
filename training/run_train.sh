@@ -6,8 +6,9 @@
 #
 # Expects, in cwd (delivered by transfer_input_files):
 #   train_wandb.py
-#   knee_multicoil_train*.tar.xz | *.tar     training split
-#   knee_multicoil_val*.tar.xz   | *.tar     validation split
+#   *multicoil_train*.tar.xz | *.tar         training split (brain_multicoil_train_batch_0.tar.xz;
+#                                            several batches may be given)
+#   *multicoil_val*.tar.xz   | *.tar         validation split
 #   *.ckpt                                   optional: a checkpoint to resume from
 #   output/                                  optional: brought back by HTCondor after an
 #                                            eviction (when_to_transfer_output = ON_EXIT_OR_EVICT)
@@ -22,7 +23,7 @@
 
 set -uo pipefail
 
-mkdir -p output/checkpoints data/knee
+mkdir -p output/checkpoints data/fastmri
 
 # Keep every W&B / cache write inside scratch. CHTC containers do not have a
 # writable home, and nothing here should depend on one.
@@ -63,7 +64,9 @@ fi
 
 # ---- data -------------------------------------------------------------------
 # Extract every tarball in cwd into data/, then expose the two split
-# directories under data/knee/ whatever depth the archives put them at.
+# directories under data/fastmri/ whatever depth the archives put them at.
+# NYU's brain and knee archives both unpack to multicoil_train/ and
+# multicoil_val/, which is all FastMriDataModule needs under --data_path.
 extract() {  # extract <tarball>
   echo "[run_train] extracting $1 ($(du -h "$1" | cut -f1)) with $(nproc) threads"
   local t0; t0=$(date +%s)
@@ -78,26 +81,26 @@ extract() {  # extract <tarball>
 }
 
 shopt -s nullglob
-TARBALLS=(knee_multicoil_*.tar.xz knee_multicoil_*.tar)
+TARBALLS=(*multicoil_*.tar.xz *multicoil_*.tar)
 shopt -u nullglob
-if [ ${#TARBALLS[@]} -eq 0 ] && [ ! -d data/knee/multicoil_train ]; then
-  echo "[run_train] ERROR: no knee_multicoil_*.tar(.xz) in cwd and no data/knee/multicoil_train" >&2
+if [ ${#TARBALLS[@]} -eq 0 ] && [ ! -d data/fastmri/multicoil_train ]; then
+  echo "[run_train] ERROR: no *multicoil_*.tar(.xz) in cwd and no data/fastmri/multicoil_train" >&2
   exit 3
 fi
 for t in "${TARBALLS[@]}"; do extract "$t"; done
 
 for split in multicoil_train multicoil_val; do
-  if [ ! -d "data/knee/$split" ]; then
-    found="$(find data -mindepth 1 -maxdepth 4 -type d -name "$split" -not -path "data/knee/*" | head -n1)"
+  if [ ! -d "data/fastmri/$split" ]; then
+    found="$(find data -mindepth 1 -maxdepth 4 -type d -name "$split" -not -path "data/fastmri/*" | head -n1)"
     if [ -z "$found" ]; then
       echo "[run_train] ERROR: no $split directory found after extraction" >&2
       find data -maxdepth 3 -type d | head -50 >&2
       exit 3
     fi
-    ln -s "$PWD/$found" "data/knee/$split"
+    ln -s "$PWD/$found" "data/fastmri/$split"
   fi
-  n=$(ls -1 "data/knee/$split"/*.h5 2>/dev/null | wc -l)
-  echo "[run_train] $split: $n volumes ($(readlink -f "data/knee/$split"))"
+  n=$(ls -1 "data/fastmri/$split"/*.h5 2>/dev/null | wc -l)
+  echo "[run_train] $split: $n volumes ($(readlink -f "data/fastmri/$split"))"
   if [ "$n" -eq 0 ]; then echo "[run_train] ERROR: no .h5 files in $split" >&2; exit 3; fi
 done
 
@@ -148,7 +151,7 @@ on_term() {
 }
 trap on_term TERM INT
 
-python train_wandb.py --data_path data/knee --default_root_dir output "$@" &
+python train_wandb.py --data_path data/fastmri --default_root_dir output "$@" &
 PY=$!
 wait "$PY"; RC=$?
 while [ "$RC" -gt 128 ] && kill -0 "$PY" 2>/dev/null; do wait "$PY"; RC=$?; done

@@ -1,12 +1,16 @@
-# training/ — E2E VarNet on CHTC, model 1 and model 2
+# training/ — E2E VarNet on the fastMRI brain set, CHTC
 
-Runbook for the two training runs. Read top to bottom the first time; after
+Runbook for the training runs. Read top to bottom the first time; after
 that, section 4 is the only part you come back to.
 
-*Status 2026-09-11: everything here is written and passes the local smoke
-tests (`make smoke`, `make job-smoke`) on synthetic data. Nothing in this
-directory has run on CHTC yet — no job submitted, and the subsets in section
-3b do not exist yet.*
+*Status 2026-09-18: repointed from the 2026-09 knee subsets (personal
+`/staging`, 100 GB quota) to the fastMRI **brain** multicoil set in the
+Kamilov group staging directory, which `verification/prepare_brain_staging.sh`
+transferred and SHA256-verified. The configuration is now the paper's and the
+fastMRI leaderboard scripts' (12 cascades, Adam 3e-4) instead of the demo
+script's (8 cascades, 1e-3). Green on the local smoke tests; not yet
+submitted on CHTC in this form. The knee-era jobs of 2026-09-12..14 were
+short tests and are superseded.*
 
 Nothing here modifies `fastMRI/`, `parameter_interpolation/`, or any file
 outside this directory. The job runs the `fastmri` package as installed in the
@@ -15,94 +19,163 @@ out at) through a small driver, `train_wandb.py`, that builds the same
 `VarNetModule` and `FastMriDataModule` as
 `fastmri_examples/varnet/train_varnet_demo.py`.
 
-## The two models
+## What the 2026-09-18 meeting asked for, and where it lives
 
-| Model | `accelerations` | `center_fractions` | What it is |
+| Ask | What this directory does now |
+|---|---|
+| E2E VarNet on multicoil **brain** | `dataset = brain` in `train.sub`: `brain_multicoil_train_batch_0.tar.xz` (455 volumes) and `brain_multicoil_val_batch_0.tar.xz` (460 volumes) from `/staging/groups/kamilov_group/Kamilov-SciAI-datasets/fastMRI_brain/` |
+| Acceleration rates **2, 4, 6, 8** | the `model2` preset: `--accelerations 2 4 6 8 --center_fractions 0.16 0.08 0.0533 0.04`, one pair drawn per training slice |
+| Check the training configuration (batch size, lr, ...) | "Configuration" below: 12 cascades, 18 / 8 channels, Adam 3e-4, x0.1 at epoch 40, batch 1, 50 epochs, SSIM loss. Batch size and the LR schedule are not stated in the paper; they follow the fastMRI leaderboard script |
+| Check how the acceleration mask is generated (random or uniform) | "Masks" below. Lines: equispaced (uniform spacing, random offset), density-corrected (`equispaced_fraction`). Rate: one of the four drawn uniformly at random per training slice; per volume, seeded by filename, at validation. The network is never told which |
+| What is the gain from an explicit rate scalar over the blind joint model | `../plan.md`, section "Expected gain from explicit rate conditioning" |
+
+## The presets
+
+| Preset | `accelerations` | `center_fractions` | What it is |
 |---|---|---|---|
-| **model1** | `4` | `0.08` | One network, one rate (4x). Phase A reproduction target. |
-| **model2** | `2 4 6 8` | `0.16 0.08 0.0533 0.04` | One network, four rates. For every training sample the mask function draws one (acceleration, center fraction) pair uniformly at random from the four. No explicit rate signal reaches the network: this is the "joint training, no conditioning" baseline that Phase B's DPI model will be measured against. |
+| **model2** | `2 4 6 8` | `0.16 0.08 0.0533 0.04` | **The run the meeting asked for.** One network, four rates. For every training sample the mask function draws one (acceleration, center fraction) pair uniformly at random from the four. No explicit rate signal reaches the network: this is the "joint training, no conditioning" baseline that Phase B's DPI model will be measured against. |
+| **model1** | `4` | `0.08` | One network, one rate. Optional per-rate reference (the paper trains one model per rate); the 4x point of the per-rate ceiling Phase B compares against. |
 
 The two lists are paired elementwise by `fastmri.data.subsample.MaskFunc`;
-center fractions follow the fastMRI convention of 0.32 / R.
+center fractions follow the fastMRI convention of 0.32 / R. 2x and 6x are
+not in the fastMRI challenge set; their fractions are that convention
+extended.
 
-## Both models are trained from scratch with the fastMRI defaults
+## Configuration
 
-"From scratch" means random initialisation, no pretrained weights, no
-checkpoint. The only things that differ between the two runs are the two
-mask lists above. Every other setting is the `train_varnet_demo.py` default
-from the fastMRI repo, hard-wired as the defaults of `train_wandb.py`:
+Both presets are trained from scratch (random initialisation, no pretrained
+weights, no checkpoint). The only things that differ between them are the two
+mask lists above. Everything else is a `train_wandb.py` default, compared
+here against the three sources it could follow:
 
-| Setting | Value | Flag (only if you want to change it) |
-|---|---|---|
-| Unrolled cascades | 8 | `--num_cascades` |
-| Regulariser U-Net channels / pooling layers | 18 / 4 | `--chans` / `--pools` |
-| Sensitivity-map U-Net channels / pooling layers | 8 / 4 | `--sens_chans` / `--sens_pools` |
-| Optimiser | Adam, lr 0.001, weight decay 0 | `--lr`, `--weight_decay` |
-| LR schedule | step: x0.1 at epoch 40 | `--lr_step_size`, `--lr_gamma` |
-| Loss | SSIM (fixed in `VarNetModule`) | |
-| Batch size | 1 | `--batch_size` |
-| Epochs | 50 | `--max_epochs` |
-| Mask type | `equispaced_fraction` | `--mask_type` |
-| Challenge | `multicoil` | `--challenge` |
-| Seed | 42 | `--seed` |
-| Deterministic CUDA | on | `--deterministic false` |
-| Training data | all of `multicoil_train` (`sample_rate` 1.0) | `--sample_rate` |
-| Validation data | all of `multicoil_val` | |
-| GPUs | 1 | `--gpus` |
+| Setting | **Here** | Paper (Sriram et al. 2020, sec. 4.1) | fastMRI leaderboard script (`varnet_reproduce_20201111/varnet_brain_leaderboard.py`) | `train_varnet_demo.py` (used here until 2026-09-18) | Flag |
+|---|---|---|---|---|---|
+| Unrolled cascades | **12** | 12 (T = 12, ~29.5M params + 0.5M in the SME, ~30M total) | 12 | 8 ("lower memory consumption") | `--num_cascades` |
+| Regulariser U-Net channels / pools | 18 / 4 | U-Net, width not stated | 18 / 4 | 18 / 4 | `--chans` / `--pools` |
+| Sensitivity-map U-Net channels / pools | 8 / 4 | not stated | 8 / 4 | 8 / 4 | `--sens_chans` / `--sens_pools` |
+| Optimiser, learning rate | **Adam, 3e-4** | Adam, 0.0003 | Adam, 0.0003 | Adam, 0.001 | `--lr` |
+| LR schedule | x0.1 at epoch 40 | not stated | x0.1 at epoch 40 | x0.1 at epoch 40 | `--lr_step_size`, `--lr_gamma` |
+| Weight decay / augmentation | none | none ("without any regularization or data augmentation") | none | none | `--weight_decay` |
+| Loss | SSIM | SSIM | SSIM (fixed in `VarNetModule`) | SSIM | |
+| Batch size | 1 per GPU, **1 GPU** | not stated | 1 per GPU, 32 GPUs DDP (effective 32) | 1 per GPU, 2 GPUs DDP | `--batch_size`, `--gpus` |
+| Epochs | 50 | 50 (100 on train+val for the test-set table) | 50 | 50 | `--max_epochs` |
+| Mask family | `equispaced_fraction` | equispaced M_e(m, l) and random M_r(R, f), fixed centre-line counts | `equispaced` (brain), `random` (knee) | `equispaced_fraction` | `--mask_type` |
+| Rates | 2 / 4 / 6 / 8 jointly (model2) | one model per rate | 4 and 8 jointly | 4 (default) | `--accelerations` |
+| Training data | brain `train_batch_0`, 455 of 4,469 volumes | full split | train + val combined | | `train_data=` macro |
+| Validation data | brain `val_batch_0`, 460 of 1,378 volumes | not stated | | | `val_data=` macro |
+| Seed / determinism | 42 / `deterministic=True` | | 42 / True | 42 / True | `--seed`, `--deterministic` |
 
-The one deviation from the demo script is GPUs: the demo asks for 2 with DDP,
-`train.sub` requests 1 and passes `--gpus 1`. Batch size is per GPU, so this
-halves the effective batch size from 2 to 1 and doubles the number of
-optimiser steps per epoch. Every other default is the same.
+Three things to know about that table:
+
+- **The effective batch size is the one real deviation from the leaderboard
+  recipe.** The leaderboard script ran 32 GPUs at batch 1 each, so one
+  optimiser step saw 32 slices; here one step sees 1, at the same learning
+  rate. The paper does not state its batch size, so there is no "paper value"
+  to match. 3e-4 at batch 1 is the conservative side of that gap. If the
+  training curve is clearly too slow, `extra_args="--lr 0.001"` is the demo
+  script's answer to the same problem and a one-line documented change.
+- **12 cascades fit a 24 GB GPU at batch 1.** Brain slices are up to ~20
+  coils at 640x320 (some 768x396). The per-cascade U-Net runs on the single
+  coil-combined image; only the sensitivity net and the expand/reduce
+  operators touch all coils. Estimated peak is well under 24 GB. If a job
+  dies with CUDA OOM, `gpu_mem=40000M` moves it to A100/L40-class slots, or
+  `extra_args="--num_cascades 8"` falls back to the demo figure.
+- **Everything is a flag.** `extra_args` in `train.sub` is appended verbatim
+  to `train_wandb.py`, which accepts every `pl.Trainer`, `FastMriDataModule`
+  and `VarNetModule` argument.
 
 The full command each submission resolves to, exactly as `run_train.sh` runs
 it inside the job (`train.sub` `arguments` line plus the two flags
 `run_train.sh` adds):
 
 ```bash
-# model 1
-python train_wandb.py --data_path data/knee --default_root_dir output \
-    --run_name varnet-model1 --accelerations 4 --center_fractions 0.08 \
+# model 2 (brain, four rates)
+python train_wandb.py --data_path data/fastmri --default_root_dir output \
+    --run_name varnet-brain-model2 --accelerations 2 4 6 8 --center_fractions 0.16 0.08 0.0533 0.04 \
     --mask_type equispaced_fraction --max_epochs 50 --gpus 1
 
-# model 2
-python train_wandb.py --data_path data/knee --default_root_dir output \
-    --run_name varnet-model2 --accelerations 2 4 6 8 --center_fractions 0.16 0.08 0.0533 0.04 \
+# model 1 (brain, 4x)
+python train_wandb.py --data_path data/fastmri --default_root_dir output \
+    --run_name varnet-brain-model1 --accelerations 4 --center_fractions 0.08 \
     --mask_type equispaced_fraction --max_epochs 50 --gpus 1
 ```
 
-For model 2, `create_mask_for_mask_type("equispaced_fraction", [0.16, 0.08,
-0.0533, 0.04], [2, 4, 6, 8])` builds a single `MaskFunc`; on every training
-slice it calls `choose_acceleration`, which picks an index uniformly at
-random and uses that (center fraction, acceleration) pair. The network is
-never told which one was picked.
+The `.out` log prints the resolved architecture and optimiser on its second
+`[train_wandb]` line, so a submission can be checked against this table
+without opening the checkpoint.
 
-A fresh run starts from scratch automatically: `train_wandb.py` only resumes
-when `output/checkpoints/` already holds a file, which in a new job happens
-only if you pass `resume=` or HTCondor brings back an evicted job's output.
-The first submission of each model has neither, and the `.out` log confirms
-it with `resume from: nothing (fresh run)`.
+## Masks: how the acceleration mask is generated
 
-**These are two separate training runs, done one after the other.** Each
-submission queues exactly one HTCondor job for exactly one model. Train
-model 1 to completion first (resuming as needed), then start model 2. The two
-never share a job, a checkpoint directory (`runs/model1/`, `runs/model2/`),
-or a W&B run (`varnet-model1`, `varnet-model2`). Nothing stops you queueing
-both at once, but that is not the plan.
+Everything below is `fastmri/data/subsample.py` at the pinned commit, read
+rather than assumed.
+
+**One `MaskFunc` for all rates.** `create_mask_for_mask_type("equispaced_fraction",
+[0.16, 0.08, 0.0533, 0.04], [2, 4, 6, 8])` builds a single
+`EquispacedMaskFractionFunc`. Every time it is called it:
+
+1. **Draws the rate.** `choose_acceleration()` picks an index uniformly at
+   random (`rng.randint(len(center_fractions))`) and uses that
+   (center fraction, acceleration) pair. So each of 2x/4x/6x/8x has
+   probability 1/4, independently per call. The network is not told which.
+2. **Fills the centre.** `round(num_cols * center_fraction)` contiguous
+   columns around the k-space centre are kept (the ACS lines the sensitivity
+   net reads). At 320-wide brain k-space that is 51 / 26 / 17 / 13 lines for
+   2x / 4x / 6x / 8x; at 368 wide (some scans) 59 / 29 / 20 / 15. The paper
+   used a fixed count (e.g. 30 at 4x); this is the documented "centre
+   fraction" deviation.
+3. **Places the outer lines, equispaced.** Every `adjusted_accel`-th column
+   from a random offset, where `adjusted_accel` is solved so that centre plus
+   outer lines together sample 1/R of the columns, i.e. the *realised*
+   acceleration equals the nominal R. The offset is `rng.randint(0,
+   round(adjusted_accel))`, so the pattern is shifted at random per call.
+
+The two alternatives, for the record:
+
+| `--mask_type` | Outer lines | Realised rate at nominal 4x | Who uses it |
+|---|---|---|---|
+| `equispaced_fraction` (**here**) | every ~R-th column, spacing corrected for the centre | 4.0 | fastMRI's public multicoil test masks; `train_varnet_demo.py` default |
+| `equispaced` | every R-th column, uncorrected; centre added on top | ~3.2 (0.310 of columns, measured in `verification` Tier 0) | the paper's M_e; the fastMRI brain leaderboard script |
+| `random` | each column kept with a Bernoulli probability chosen so the expected total is 1/R | 4.0 in expectation | the paper's M_r; the fastMRI knee leaderboard script and the knee challenge |
+
+`equispaced_fraction` is kept for the brain runs, and not the leaderboard
+script's `equispaced`, for one reason that matters to Phase B: the model
+will be conditioned on the nominal R, so nominal must mean realised. Under
+`equispaced` a "4x" mask and an "8x" mask are really 3.2x and 6.2x (0.310 and
+0.160 of the columns, Tier 0), and the scalar would be mislabelled. Pass `mask_type=equispaced` to reproduce the
+leaderboard convention instead.
+
+**Train versus validation.** The training transform is
+`VarNetDataTransform(mask_func=mask, use_seed=False)`: a fresh draw (rate,
+offset) for every slice, every epoch. The validation transform is
+`VarNetDataTransform(mask_func=mask)` with `use_seed=True`: the RNG is seeded
+from the filename, so every slice of a validation volume gets the same mask
+and **each validation volume is locked to one rate for the whole run**. The
+`val_metrics/ssim` Lightning logs is therefore a mean over a fixed mixture of
+the four rates (roughly a quarter of the volumes each), not a per-rate
+number. Per-rate numbers come from `../verification/` (`make verify
+MODEL=model2 ARGS='ckpt=...'`), which forces every volume to each rate in
+turn.
+
+**What the network sees of the rate.** Nothing explicit. The mask is an
+input to every cascade's data-consistency term and to the sensitivity net
+(through `num_low_frequencies`), so R is *inferable* from the input, but
+every U-Net and every `dc_weight` is shared across rates. That is the gap
+Phase B targets; `../plan.md` "Expected gain" says what to expect from
+closing it.
 
 ## Files
 
 | File | Runs where | Purpose |
 |---|---|---|
-| `train_wandb.py` | inside the job (or any `fastmri` env) | The driver. W&B logger, `last.ckpt`, auto-resume from `output/checkpoints/`. |
-| `run_train.sh` | inside the job | Job executable: extracts the tarballs, finds the splits, seeds a resume checkpoint, runs the driver, collects `output/`. |
-| `train.sub` | access point | HTCondor submit file, container universe. Model 1 defaults; model 2 via macros. |
-| `submit.sh` | access point | `./submit.sh model1\|model2 [name=value ...]`. Refuses to submit without a W&B key unless `OFFLINE=1`. |
-| `Makefile` | laptop + access point | `make build/push/smoke/job-smoke` (Docker) and `make submit-model1/submit-model2/resume/status/logs` (condor). |
+| `train_wandb.py` | inside the job (or any `fastmri` env) | The driver. W&B logger, `last.ckpt`, auto-resume from `output/checkpoints/`, leaderboard-script defaults. |
+| `run_train.sh` | inside the job | Job executable: extracts every `*multicoil_*.tar(.xz)` it is given, finds `multicoil_train` / `multicoil_val`, seeds a resume checkpoint, runs the driver, collects `output/`. Anatomy-agnostic. |
+| `train.sub` | access point | HTCondor submit file, container universe. `dataset = brain`, group staging, batch 0 of each split; every default guarded. |
+| `submit.sh` | access point | `./submit.sh model2\|model1 [name=value ...]`. Refuses to submit without a W&B key unless `OFFLINE=1`; proves with `-dry-run` that the preset reached the job ad. |
+| `Makefile` | laptop + access point | `make build/push/smoke/job-smoke/job-evict` (Docker) and `make submit-model2/submit-model1/resume/status/logs/why` (condor). |
 | `Dockerfile` | laptop (build), CHTC (run) | Lightning 1.9.5, torch 2.0.1+cu118, conda h5py, wandb, fastMRI at `91f2df4`. Pinned to `linux/amd64`. |
-| `make_subset.sh` | inside the job | One-off (section 3b): cuts `/staging` down to subsets that fit the quota. `val` extracts and re-tars N volumes; `train` streams a prefix of NYU's `train_batch_0` and re-packs the complete volumes. Validates every kept `.h5` with h5py. |
-| `subset_val.sub`, `subset_train.sub` | access point | The two CPU jobs that run `make_subset.sh`. Run once, in that order. |
-| `../.env.example` | repo root | Template for the shared `../.env` (gitignored): `WANDB_API_KEY`, `WANDB_ENTITY`, `FASTMRI_TRAIN_URL`, and verification's NYU URLs. `submit.sh` and the subset targets source `../.env` themselves. One file for both stages. |
+| `make_subset.sh`, `subset_val.sub`, `subset_train.sub` | access point | **Knee only, 2026-09** (section 3b): the repack that fit the knee splits under the 100 GB personal quota. Not used for brain. |
+| `../verification/prepare_brain_staging.sh` | CHTC transfer node | What put the brain set into group staging: 20 tarballs, ~1.37 TB, left compressed, SHA256-verified. |
+| `../.env.example` | repo root | Template for the shared `../.env` (gitignored): `WANDB_API_KEY`, `WANDB_ENTITY`, the NYU URLs. `submit.sh` sources `../.env` itself. |
 
 ## Where things run
 
@@ -110,28 +183,29 @@ both at once, but that is not the plan.
 |---|---|---|
 | Laptop (this Mac) | | Build and push the Docker image. Smoke-test on synthetic data. |
 | CHTC access point (the "VM") | `ssh apryan3@ap2001.chtc.wisc.edu` | Holds this directory, submits jobs, receives checkpoints and logs. 40 GB home quota: code only. |
-| CHTC transfer node | `ssh apryan3@transfer.chtc.wisc.edu` | Bulk data downloads into `/staging/a/apryan3/fastmri/`. |
+| CHTC transfer node | `ssh apryan3@transfer.chtc.wisc.edu` | Bulk data downloads into `/staging`. Done for brain. |
 | CHTC execute node | never directly | Pulls the image from Docker Hub, runs `run_train.sh`, is wiped when the job ends. |
 
-Personal staging is sharded by the first letter of the netid:
-`/staging/a/apryan3`, **not** `/staging/apryan3`. The group directory
-`/staging/groups/kamilov_group/Kamilov-SciAI-datasets` is not readable by this
-account as of 2026-09-10; if that changes, the `staging` macro in `train.sub`
-is the only thing to repoint.
+Two staging areas, one macro:
+
+| `staging` macro | Quota | Holds | Used by |
+|---|---|---|---|
+| `/staging/groups/kamilov_group/Kamilov-SciAI-datasets/fastMRI_brain` (**default**) | 2.5 TB, **10,000 items** | the 20 NYU brain tarballs + `SHA256`, nothing extracted | brain runs |
+| `/staging/a/apryan3/fastmri` | 100 GB | `knee_multicoil_{train,val}_subset.tar(.xz)`, the released knee checkpoint | `dataset=knee` runs, `../verification/` |
+
+The item cap on the group directory is why nothing is ever extracted there
+and why `run_train.sh` unpacks into job scratch: the brain splits are
+thousands of `.h5` files.
 
 ## 0. Before anything
 
 - **Rotate the W&B key** that is in the old `Research/inpainting.sub` git
   history (ROADMAP.md security note). Every `WANDB_API_KEY` below means the
-  new key. It is only ever exported in a shell, never written to a file in
-  this repo.
-- **Training data is the gate.** `train.sub` expects
-  `/staging/a/apryan3/fastmri/knee_multicoil_train_subset.tar.xz` and
-  `knee_multicoil_val_subset.tar`, built once by section 3b from the full
-  val tarball already staged and a streamed prefix of NYU's train tarball.
-  The full splits do not fit the 100 GB personal staging quota (val alone is
-  100.7 GB; `multicoil_train` is ~490 GB compressed). A quota increase or
-  group-directory access is the only way to train on all of it.
+  new key. It lives in the untracked `../.env` or is exported in a shell,
+  never written to a file in this repo.
+- **The brain tarballs are the gate.** `train.sub` expects
+  `brain_multicoil_train_batch_0.tar.xz` and `brain_multicoil_val_batch_0.tar.xz`
+  in the group directory (section 3a checks).
 - Docker Desktop running on the laptop, logged in to Docker Hub
   (`docker login`).
 
@@ -153,72 +227,54 @@ emulation: slow, fine for synthetic smoke tests.
 
 Use a dated tag, never `:latest`, so a rebuild cannot change what a checkpoint
 was produced with. The build ends with a self-check that imports `fastmri`,
-`WandbLogger`, and asserts Lightning is 1.x.
-
-Then set one line in `train.sub` and keep it that way in git:
-
-```
-image      = docker://<dockerhub_user>/fastmri-train:2026-09
-```
-
-It is currently `docker://genjigod/fastmri-train:2026-09`. Change it if you
-push under a different Docker Hub account; `submit.sh` only refuses to submit
-when it still says `CHANGE_ME`.
+`WandbLogger`, and asserts Lightning is 1.x. Nothing in the 2026-09-18 change
+touches the image: `train_wandb.py` is transferred with the job, not baked
+in, so the existing `docker://genjigod/fastmri-train:2026-09` is still right.
 
 ## 2. Laptop: smoke-test with no real data (minutes each, under emulation)
 
 ```bash
 make smoke        # train_wandb.py on synthetic phantoms, 1 epoch, then a rerun that MUST resume from last.ckpt
 make job-smoke    # run_train.sh exactly as HTCondor runs it, twice: fresh, then "after eviction"
+make job-evict    # SIGTERM a running job: the cleanup must still run
 ```
 
-Both generate tiny fake `multicoil_train` / `multicoil_val` directories with
-`../verification/make_synthetic_val.py`, train a 2-cascade model on CPU, and
-fail loudly if `output/checkpoints/last.ckpt` is not written or if the second
-run does not print `resume from: output/checkpoints/last.ckpt`. `make smoke`
-uses the model 2 rate list, `make job-smoke` the model 1 list, so both mask
-configurations get exercised. Green here means the image, the driver, the
-job executable, extraction, and the checkpoint/resume contract all work
-before a single GPU slot is used.
+They generate tiny fake `multicoil_train` / `multicoil_val` directories with
+`../verification/make_synthetic_val.py`, pack them as
+`synthetic_multicoil_{train,val}.tar` (named so `run_train.sh`'s
+`*multicoil_*` glob finds them, as it finds the real brain batches), train a
+2-cascade model on CPU, and fail loudly if `output/checkpoints/last.ckpt` is
+not written or if the second run does not print `resume from:
+output/checkpoints/last.ckpt`. `make smoke` uses the model 2 rate list,
+`make job-smoke` the model 1 list. Green here means the image, the driver,
+the job executable, extraction, and the checkpoint/resume contract all work
+before a single GPU slot is used. The phantoms are knee-shaped; nothing in
+the pipeline depends on that.
 
 ## 3. Copy to the access point (the "VM")
 
 Only this directory is needed on CHTC. Neither submodule is: the image
-carries its own copy of fastMRI at the pinned commit. Cloning the whole repo
-on the access point (without `--recurse-submodules`) is the simplest way.
-
-What goes up:
+carries its own copy of fastMRI at the pinned commit. `git pull` in the
+clone on the access point is the simplest way (submodules can stay
+uninitialised); or scp the files below.
 
 | Copy | Why |
 |---|---|
-| `train.sub` | submit file, with your `image =` line edited |
-| `submit.sh` | wraps `condor_submit`, applies the model presets |
+| `train.sub` | submit file |
+| `submit.sh` | wraps `condor_submit`, applies the model presets, preflight |
 | `run_train.sh` | the job executable (transferred to the execute node by HTCondor) |
 | `train_wandb.py` | the driver (listed in `transfer_input_files`) |
-| `Makefile` | for `make submit-model1` etc. Optional; `./submit.sh` works alone. |
-| `make_subset.sh`, `subset_val.sub`, `subset_train.sub` | the one-off staging repack in 3b (needs `FASTMRI_TRAIN_URL` from `../.env`) |
+| `Makefile` | for `make submit-model2` etc. Optional; `./submit.sh` works alone. |
 
-What must not go up: `synthetic/`, `jobtest/`, `output/`, `*.tar`, `*.ckpt`,
-`.make/`, `dataset_cache.pkl`. (Nor the laptop's `../.env` — create that one
-by hand on the access point from `../.env.example`.) They are laptop smoke-test leftovers.
-(`dataset_cache.pkl` is a fastMRI slice-index cache keyed by data path. One
-from a synthetic smoke run is currently committed by mistake; it is harmless
-on CHTC — the paths in it do not match, so `SliceDataset` just rebuilds — but
-it should not be there.) A `.ckpt` in the
-directory is harmless (only the one named in `resume=` is transferred), but
-the tarballs and phantoms would just waste home quota.
+What must not go up: `synthetic/`, `jobtest/`, `evicttest/`, `output/`,
+`*.tar`, `*.ckpt`, `.make/`, `dataset_cache.pkl`, and the laptop's `../.env`
+(create that one by hand on the access point from `../.env.example`).
 
 ```bash
 # laptop, from the repo root
-ssh apryan3@ap2001.chtc.wisc.edu 'mkdir -p ~/Fall26Research/training'
 scp training/train.sub training/submit.sh training/run_train.sh training/train_wandb.py training/Makefile \
-    training/make_subset.sh training/subset_val.sub training/subset_train.sub \
     apryan3@ap2001.chtc.wisc.edu:~/Fall26Research/training/
-scp .env.example apryan3@ap2001.chtc.wisc.edu:~/Fall26Research/
 ```
-
-Or, if the repo is cloned on the access point, `git pull` there. The
-submodules can stay uninitialised.
 
 Then, on the access point, one-time checks:
 
@@ -226,13 +282,27 @@ Then, on the access point, one-time checks:
 ssh apryan3@ap2001.chtc.wisc.edu
 cd ~/Fall26Research/training
 chmod +x run_train.sh submit.sh
-grep '^image' train.sub                 # must not say CHANGE_ME
-get_quotas /staging/a/apryan3           # 100 GB / 1000 items by default
-ls -la /staging/a/apryan3/fastmri/      # what is actually staged
+grep '^  image' train.sub                 # must not say CHANGE_ME
 ```
 
-Let `condor_submit` parse the file without queueing anything. This costs
-nothing and catches macro or syntax mistakes on the access point itself:
+### 3a. Check the brain data and size the job
+
+```bash
+ls -la /staging/groups/kamilov_group/Kamilov-SciAI-datasets/fastMRI_brain/
+get_quotas /staging/groups/kamilov_group/Kamilov-SciAI-datasets
+```
+
+Expect 20 `brain_*.tar.xz` files plus `SHA256`; the two the defaults use are
+`brain_multicoil_train_batch_0.tar.xz` and `brain_multicoil_val_batch_0.tar.xz`.
+Their exact sizes set `request_disk`: a fastMRI `.tar.xz` extracts to about
+1.9x, and `run_train.sh` deletes a tarball only after its extraction finishes,
+so the peak (while the second tarball extracts) is roughly
+`1.9 x train + 2.9 x val`. The `520GB` default in `train.sub` assumes two
+~100 GB batches; override with `request_disk=` if the listing says otherwise.
+Extraction alone is on the order of an hour per batch, paid again on every
+eviction restart.
+
+Let `condor_submit` parse the file without queueing anything:
 
 ```bash
 condor_submit -dry-run /dev/stdout train.sub model=model2 accelerations="2 4 6 8" \
@@ -240,102 +310,24 @@ condor_submit -dry-run /dev/stdout train.sub model=model2 accelerations="2 4 6 8
   | grep -iE "^(Arguments|TransferInput|RequestDisk|Requirements) "
 ```
 
-### 3a. Stage the data (transfer node)
+`TransferInput` must list the two brain tarballs from the group directory.
+
+### 3b. The knee subsets (2026-09, superseded)
+
+`/staging/a/apryan3/fastmri/` still holds `knee_multicoil_val_subset.tar`
+(20 of 199 val volumes) and `knee_multicoil_train_subset.tar.xz` (~120 of
+973 train volumes, the first 65 GB of NYU's `train_batch_0`), built by
+`make subset-val` / `make subset-train` because the full knee splits do not
+fit the 100 GB personal quota. They are not used by the brain runs. To train
+on them again:
 
 ```bash
-ssh apryan3@transfer.chtc.wisc.edu           # bulk data host, not the access point
-ls -la /staging/a/apryan3/fastmri/           # val tarball + checkpoint from verification/prepare_staging.sh
+./submit.sh model2 dataset=knee staging=/staging/a/apryan3/fastmri \
+    train_data=file:///staging/a/apryan3/fastmri/knee_multicoil_train_subset.tar.xz \
+    val_data=file:///staging/a/apryan3/fastmri/knee_multicoil_val_subset.tar request_disk=260GB
 ```
 
-`verification/prepare_staging.sh` fetches `knee_multicoil_val.tar.xz` from
-the NYU presigned URL and verifies it (see `verification/README.md` step 3).
-The training split ships as five batches (`knee_multicoil_train_batch_0..4.tar.xz`, ~91 GB each, same URL pattern); they would go in
-the same directory the same way once there is room for it.
-
-### 3b. Repack /staging into subsets (what actually fits under the quota)
-
-`/staging/a/apryan3` is capped at 100 GB and the full val tarball alone is
-100.7 GB. The train split (five ~91 GB batches, ~930 GB unpacked) cannot be
-staged at all without a quota increase, and that request is the last resort.
-So both splits are cut down to subsets that fit together:
-
-| File in `/staging/a/apryan3/fastmri/` | Built by | Size | Contents |
-|---|---|---|---|
-| `knee_multicoil_val_subset.tar` | `make subset-val` | ~20 GB | `multicoil_val/`, 20 of the 199 volumes, evenly spaced through the sorted list |
-| `knee_multicoil_train_subset.tar.xz` | `make subset-train` | ~65 GB | `multicoil_train/`, every complete volume in the first 65 GB of NYU's `train_batch_0` (~120 of 973) |
-
-`train.sub` defaults to these two names, so once they exist `make submit-model1`
-works with no overrides. Both jobs run `make_subset.sh` in the training image
-on a CPU slot, validate every kept `.h5` by reading it fully, and write a
-`*_subset_files.txt` next to the tarball listing exactly which volumes went in
-(plus the archive's sha256). Keep those two text files in the repo directory;
-they are the definition of the subset every model in Phase A and B trains on.
-
-**The order matters.** Staging is full, so the val subset has to come back to
-home first, the original val tarball is deleted by hand, and only then can
-the train subset be written into staging.
-
-**Step 1: val subset (about an hour, mostly extraction).**
-
-```bash
-cd ~/Fall26Research/training
-make subset-val                      # N_VAL=30 for more volumes; ~1 GB each, home is 40 GB
-condor_q -nobatch                    # < = transferring the 101 GB input, R = running
-tail -f logs/subset_val_*.out
-```
-
-When it finishes, `knee_multicoil_val_subset.tar` and `val_subset_files.txt`
-are in this directory. Check, then swap:
-
-```bash
-tail -3 val_subset_files.txt                      # sha256 and byte count
-tar -tf knee_multicoil_val_subset.tar | head -3   # multicoil_val/file...h5
-rm /staging/a/apryan3/fastmri/knee_multicoil_val.tar.xz      # the full val split; see below
-mv knee_multicoil_val_subset.tar /staging/a/apryan3/fastmri/
-get_quotas /staging/a/apryan3                     # should now show ~80 GB free
-```
-
-Deleting the full val tarball means Tier 1 of `VERIFICATION.md` (the released
-checkpoint on all 199 val volumes) can no longer run without re-downloading
-it. Run Tier 1 first if you want that number; otherwise the NYU URL can be
-used again any time before it expires (~2026-12-08) or re-requested.
-
-**Step 2: train subset (about an hour: streaming, decoding, re-packing).**
-
-NYU ships the train split as five batches. Put the presigned URL for
-`knee_multicoil_train_batch_0.tar.xz` (the line in the approval email ending
-in `--output knee_multicoil_train_batch_0.tar.xz`) in the shared `../.env`
-(`cp ../.env.example ../.env`, `chmod 600 ../.env`, paste it quoted). Then:
-
-```bash
-make subset-train                    # TRAIN_PREFIX_GB=50 to fit a smaller quota gap
-tail -f logs/subset_train_*.out
-```
-
-The job fetches only the first `TRAIN_PREFIX_GB` gigabytes of that batch
-with an HTTP range request and decodes them on the fly; nothing compressed is
-ever stored. The archive is sequential, so that prefix is the same volumes
-every time. The truncated last volume is dropped, the rest are re-packed, and
-HTCondor writes the result straight into `/staging` via `transfer_output_remaps`.
-`train_subset_files.txt` lands in this directory. If the job goes on hold
-after finishing, the output transfer hit the quota: lower `TRAIN_PREFIX_GB`,
-or free space, then `condor_release` it.
-
-Then:
-
-```bash
-ls -la /staging/a/apryan3/fastmri/
-condor_submit -dry-run /dev/stdout train.sub | grep -iE "^(TransferInput|RequestDisk) "
-```
-
-**What this costs scientifically.** Model 1 trains on ~120 volumes instead
-of 973, so its numbers will not match the paper; see "Known deviations". For
-Phase B this is fine as long as model 1, model 2 and the DPI model all train
-and validate on the same two subsets, which the `*_subset_files.txt` lists
-pin down. If the full train split is ever staged, `train_data=` and
-`request_disk=` on the command line switch a run back to it.
-
-## 4. Run the two models (access point)
+## 4. Run (access point)
 
 Every submission starts the same way:
 
@@ -348,57 +340,59 @@ export WANDB_API_KEY=...          # freshly rotated
 export WANDB_ENTITY=...           # optional
 ```
 
-### 4.1 Short test job first (model 1, one epoch, 50 batches)
+### 4.1 Short test job first (model 2, one epoch, 50 batches)
 
-Checks the image, the data path, `/dev/shm`, and the GPU before committing a
-slot for days:
+Checks the image, the group-staging transfer, the extraction, the disk
+request, `/dev/shm`, the GPU, and 12 cascades' memory on real brain slices,
+before committing a slot for days:
 
 ```bash
-make submit-model1 ARGS='max_epochs=1 extra_args="--limit_train_batches 50 --limit_val_batches 10"'
+make submit-model2 ARGS='max_epochs=1 extra_args="--limit_train_batches 50 --limit_val_batches 10"'
 make logs                          # tail -f the newest logs/*.out
 ```
 
-The `.out` must show `[run_train] multicoil_train: N volumes`,
-`resume from: nothing (fresh run)`, one epoch, and a
-`saving model to output/checkpoints/...` line. When it finishes,
-`runs/model1/<Cluster>/checkpoints/last.ckpt` must exist. That `<Cluster>`
-directory is a throwaway; delete it so it is not mistaken for a real run.
+The `.out` must show `[run_train] multicoil_train: 455 volumes`,
+`multicoil_val: 460 volumes`, the `[train_wandb]` line with
+`num_cascades=12 ... lr=0.0003`, `resume from: nothing (fresh run)`, one
+epoch, and a `saving model to output/checkpoints/...` line. When it
+finishes, `runs/brain/model2/<Cluster>/checkpoints/last.ckpt` must exist.
+That `<Cluster>` directory is a throwaway; delete it so it is not mistaken
+for a real run. Note the transfer + extraction time it reports: that is the
+fixed cost of every (re)start.
 
-### 4.2 Model 1: acceleration 4 only, from scratch
-
-```bash
-make submit-model1
-```
-
-This is `./submit.sh model1`, which submits `train.sub` with
-`model=model1 accelerations="4" center_fractions="0.08"` and no `resume=`,
-so training starts from random weights with the defaults listed at the top
-of this file. Run name and W&B run: `varnet-model1`. Checkpoints land in
-`runs/model1/<Cluster>/`. The `.out` must show
-`resume from: nothing (fresh run)` on this first submission.
-
-### 4.3 Model 2: accelerations 2, 4, 6, 8, one drawn per sample, from scratch
-
-Start after model 1 has finished (all 50 epochs, however many resubmissions
-that took). Model 2 does **not** start from model 1's weights; it is its own
-from-scratch run.
+### 4.2 Model 2: accelerations 2, 4, 6, 8, one drawn per sample, from scratch
 
 ```bash
 make submit-model2
 ```
 
-This is `./submit.sh model2`, which submits with `model=model2
-accelerations="2 4 6 8" center_fractions="0.16 0.08 0.0533 0.04"` and no
-`resume=`. Run name and W&B run: `varnet-model2`. Checkpoints land in
-`runs/model2/<Cluster>/`.
+This is `./submit.sh model2`, which submits `train.sub` with
+`model=model2 accelerations="2 4 6 8" center_fractions="0.16 0.08 0.0533 0.04"`
+and no `resume=`, so training starts from random weights with the
+configuration in the table above. Run name and W&B run: `varnet-brain-model2`.
+Checkpoints land in `runs/brain/model2/<Cluster>/`. The `.out` must show
+`resume from: nothing (fresh run)` on this first submission.
+
+### 4.3 Model 1: acceleration 4 only, from scratch (optional)
+
+```bash
+make submit-model1
+```
+
+Same, with `accelerations="4" center_fractions="0.08"`, run name
+`varnet-brain-model1`, checkpoints in `runs/brain/model1/<Cluster>/`. It does
+**not** start from model 2's weights; it is its own from-scratch run. The two
+never share a job, a checkpoint directory, or a W&B run. Queue it whenever
+there is a second slot; it is a Phase B reference point, not a prerequisite
+for model 2.
 
 ### 4.4 Overrides
 
-`make submit-model1 ARGS='...'` and `./submit.sh model1 name=value ...` are
+`make submit-model2 ARGS='...'` and `./submit.sh model2 name=value ...` are
 the same thing. Any `name=value` is a `condor_submit` macro override, so every
-knob in `train.sub` (`request_disk`, `max_epochs`, `run_name`, `train_data`,
-`val_data`, `mask_type`, `extra_args`, ...) can be set per submission without
-editing the file.
+knob in `train.sub` (`dataset`, `staging`, `train_data`, `val_data`,
+`request_disk`, `gpu_mem`, `max_epochs`, `run_name`, `mask_type`,
+`extra_args`, ...) can be set per submission without editing the file.
 
 That last sentence is only true because every default in `train.sub` is
 wrapped in `if ! defined`. `condor_submit` parses a command-line `name=value`
@@ -408,7 +402,7 @@ a run: `make submit-model2` produced a job ad reading
 `--run_name varnet-model1 --accelerations 4`, so it trained model 1's schedule
 and, because `--run_name` is also the W&B run id, logged into the existing
 `varnet-model1` run instead of its own. Any knob added to `train.sub` needs the
-same guard; `submit.sh` now dry-runs before every submission and refuses to
+same guard; `submit.sh` dry-runs before every submission and refuses to
 submit if the preset did not reach the job ad.
 
 Two exceptions, both verified with `-dry-run`: `request_cpus` and
@@ -416,26 +410,29 @@ Two exceptions, both verified with `-dry-run`: `request_cpus` and
 is read, so `if ! defined` never fires for them and guarding them would drop
 the job to 1 CPU. Override those two as `cpus=16` / `mem=64GB`.
 
-`extra_args` is appended verbatim to `train_wandb.py`,
-which accepts every `pl.Trainer`, `FastMriDataModule` and `VarNetModule`
-argument (`--num_workers`, `--sample_rate`, `--lr`, `--deterministic false`,
-...).
+`extra_args` is appended verbatim to `train_wandb.py`, which accepts every
+`pl.Trainer`, `FastMriDataModule` and `VarNetModule` argument. Ones worth
+knowing for brain:
 
-Size `request_disk` from what is actually staged: peak scratch is every
-tarball plus its extracted contents at the same time, because `run_train.sh`
-deletes a tarball only after its extraction finishes. For the section-3b
-subsets that is (65 GB train `.tar.xz` -> ~125 GB) + (20 GB val `.tar`, no
-compression) ~= 210 GB, which is what the `request_disk = 260GB` default in
-`train.sub` covers. Pointing `train_data=` at a full NYU batch instead needs
-roughly 91 + 175 GB for that file alone: override with
-`./submit.sh model1 train_data=... request_disk=400GB`.
+| `extra_args=` | Effect |
+|---|---|
+| `"--val_volume_sample_rate 0.25"` | validate on a quarter of the 460 volumes (chosen by the seeded shuffle, so the same quarter every run). Cuts per-epoch validation time; does not cut disk |
+| `"--num_workers 0"` | if the log shows "Bus error" / "insufficient shared memory" (slower) |
+| `"--num_cascades 8"` | the demo-script architecture, if 12 cascades OOM (a documented deviation) |
+| `"--lr 0.001"` | the demo-script learning rate, if batch-1 training at 3e-4 is clearly too slow |
+| `"--deterministic false"` | if an op has no deterministic CUDA kernel |
+
+A second train batch: `train_data` takes a comma-separated list and
+`run_train.sh` extracts every tarball it finds, so
+`train_data="file://.../brain_multicoil_train_batch_0.tar.xz, file://.../brain_multicoil_train_batch_1.tar.xz" request_disk=800GB`
+doubles the training set (and the extraction time and the disk).
 
 ## 5. Monitor
 
 ```bash
 make status                       # condor_q -nobatch
 make logs                         # tail -f the newest logs/*.out
-condor_q -l <Cluster> | grep -i hold    # why a job is held, if it is
+make why JOB=<Cluster>            # hold reason + log tails for a held job
 ```
 
 `stream_output = True` in `train.sub` means the `.out` file updates live:
@@ -444,20 +441,22 @@ Lightning's progress bar, the per-epoch `validation_loss`, and
 saving model to output/checkpoints/..." lines.
 
 W&B project `fastmri-varnet-train` (override with `WANDB_PROJECT` in the
-shell), run name `varnet-model1` / `varnet-model2`. The run id is the run
-name, with `resume="allow"`, so a resubmitted job continues the same W&B run
-rather than starting a new one; pass `run_name=varnet-model1-seed7` for a
-genuinely new run. `MriModule` logs `validation_loss`, `val_metrics/nmse`,
+shell), run names `varnet-brain-model2` / `varnet-brain-model1`. The run id
+is the run name, with `resume="allow"`, so a resubmitted job continues the
+same W&B run rather than starting a new one; pass
+`run_name=varnet-brain-model2-seed7` for a genuinely new run. The 2026-09
+knee runs are `varnet-model1` / `varnet-model2` in the same project and are
+unrelated. `MriModule` logs `validation_loss`, `val_metrics/nmse`,
 `val_metrics/ssim`, `val_metrics/psnr` and up to 16 target / reconstruction /
-error images per validation epoch; all of it lands in W&B through the
-logger. Checkpoints are not uploaded (`log_model=False`); they come back
-with the job. Without a key the run is written offline to
-`runs/<model>/<Cluster>/wandb/` and `wandb sync <that dir>/offline-run-*`
+error images per validation epoch (remember: a mixture over the four rates,
+see "Masks"). Checkpoints are not uploaded (`log_model=False`); they come
+back with the job. Without a key the run is written offline to
+`runs/brain/<model>/<Cluster>/wandb/` and `wandb sync <that dir>/offline-run-*`
 uploads it later.
 
 ## 6. What comes back
 
-`runs/<model>/<Cluster>/`:
+`runs/brain/<model>/<Cluster>/`:
 
 - `checkpoints/last.ckpt`: the most recent epoch. This is what resumes.
 - `checkpoints/epoch=N-step=M.ckpt`: the best `validation_loss` so far (`save_top_k=1`).
@@ -465,25 +464,25 @@ uploads it later.
 - `lightning_logs/`: TensorBoard, only with `--no_wandb`.
 
 Copy checkpoints back to the laptop with `scp` when a run is done; the
-access point's home is 40 GB and one VarNet checkpoint is a few hundred MB,
-so a handful of runs fit, a semester's worth does not.
+access point's home is 40 GB and one 12-cascade VarNet checkpoint is a few
+hundred MB, so a handful of runs fit, a semester's worth does not.
 
 ## 7. Resuming
 
-A 50-epoch multicoil run will not finish inside one GPU Lab job. Three cases:
+A 50-epoch run may not finish inside one GPU Lab job. Three cases:
 
 1. **Evicted (preempted) mid-run.** `when_to_transfer_output =
    ON_EXIT_OR_EVICT` makes HTCondor transfer `output/` back on eviction and
    deliver it into the sandbox when the same job restarts. `run_train.sh` sees
    `output/checkpoints/` already populated, `train_wandb.py` picks
    `last.ckpt`, and training continues from that epoch. The tarballs are
-   re-transferred and re-extracted, which is the price of scratch being
-   ephemeral. Nothing to do, but **confirm it once** (section 8).
+   re-transferred and re-extracted (an hour or two for brain), which is the
+   price of scratch being ephemeral. Nothing to do, but **confirm it once**
+   (section 8).
 2. **Removed because it hit the `+GPUJobLength` cap, or you removed it.** The
-   final `output/` is in `runs/<model>/<Cluster>/`. Resubmit pointing at it:
+   final `output/` is in `runs/brain/<model>/<Cluster>/`. Resubmit pointing at it:
    ```bash
-   make resume MODEL=model1 CKPT=runs/model1/<Cluster>/checkpoints/last.ckpt
-   make resume MODEL=model2 CKPT=runs/model2/<Cluster>/checkpoints/last.ckpt
+   make resume MODEL=model2 CKPT=runs/brain/model2/<Cluster>/checkpoints/last.ckpt
    ```
    `submit.sh` adds the file to `transfer_input_files`; `run_train.sh` moves
    it into `output/checkpoints/` (only if that directory is empty) and the
@@ -496,46 +495,55 @@ Lightning restores epoch, global step, optimizer and LR-scheduler state from
 the checkpoint, so a resumed run is equivalent to an uninterrupted one apart
 from data order within the interrupted epoch.
 
-## 8. Two things to verify on CHTC before trusting a multi-day run
+## 8. Things to verify on CHTC before trusting a multi-day run
 
 - **Resume after eviction actually happens.** Submit a short job
-  (`max_epochs=3`, a subset tarball), let it finish one epoch, then
+  (`max_epochs=3`), let it finish one epoch, then
   `condor_vacate_job <Cluster>` from the access point. When it restarts, the
   `.out` must show `output/checkpoints already populated` and
   `resume from: output/checkpoints/last.ckpt`. If it shows a fresh run
   instead, the fallback is case 2 above (manual `make resume`), which does
   not depend on HTCondor's evict-transfer behaviour.
-- **`/dev/shm` is big enough for 4 DataLoader workers.** One knee slice is
-  ~28 MB and the workers hand batches over shared memory. If the log shows
-  "Bus error" or "insufficient shared memory", add
+- **`/dev/shm` is big enough for 4 DataLoader workers.** A brain slice is
+  up to ~40 MB of k-space and the workers hand batches over shared memory.
+  If the log shows "Bus error" or "insufficient shared memory", add
   `extra_args="--num_workers 0"` (slower) or a smaller worker count.
-
-Also worth a glance on the first real job: `deterministic=True` (the demo
-default, kept) makes torch raise on any op without a deterministic CUDA
-kernel. The fastMRI authors ran this configuration, so it is expected to be
-fine; `extra_args="--deterministic false"` is the escape hatch.
+- **12 cascades fit the GPU.** The 4.1 test job answers this on real slices.
+  The first validation pass is the other place memory can spike (largest
+  volume in the set); `--limit_val_batches 10` in 4.1 does not cover that, so
+  watch the first full validation epoch of the real run.
+- **`deterministic=True`** (the leaderboard default, kept) makes torch raise
+  on any op without a deterministic CUDA kernel. The fastMRI authors ran this
+  configuration, so it is expected to be fine; `extra_args="--deterministic
+  false"` is the escape hatch.
 
 ## Known deviations from Sriram et al. 2020
 
-Read these before comparing any number to the paper (CLAUDE.md, ROADMAP.md):
+Read these before comparing any number to the paper (CLAUDE.md, ROADMAP.md,
+`VERIFICATION.md` sections 1 and 5.4):
 
-- `center_fractions` gives a variable number of centre lines (29 / 15 at 368
-  wide for 0.08 / 0.04) instead of the paper's fixed 30 / 16.
-- `equispaced_fraction` is the corrected-density mask family and corresponds
-  to neither of the paper's tables; `random` is the fastMRI knee leaderboard
-  convention. Pass `mask_type=random` to match the third-party reference
-  values in `VERIFICATION.md` Section 2.
-- The paper trains one model per rate. model1 matches that for 4x. model2 is
-  the repo's joint-training pattern extended to four rates and is a Phase B
-  baseline, not a paper reproduction. There is no acceleration-rate input to
-  the network in either model.
-- Validation here is the `multicoil_val` split; the paper's Table 3 numbers
-  are on a test split with no public ground truth and cannot be reproduced.
-- Under the default `/staging` quota both models train on the section-3b
-  subsets: ~120 of the 973 train volumes and 20 of the 199 val volumes. At
-  the same 50-epoch schedule that is ~8x fewer optimiser steps than the
-  paper. Every Phase A/B comparison must use the same two subsets
-  (`*_subset_files.txt`); absolute numbers are not comparable to the paper.
+- **Data.** One NYU batch per split: 455 of the 4,469 brain training volumes
+  and 460 of the 1,378 validation volumes. The paper trained on the full
+  split (and on train+val for its test-set table). Every Phase A / Phase B
+  comparison must use the same two batches; absolute numbers are not
+  comparable to the paper. The brain test split now has public ground truth
+  (`brain_multicoil_test_full`, in the group directory), so a test-set number
+  in the paper's Table 3 sense *is* computable later, unlike knee.
+- **Centre lines.** `center_fractions` gives a variable number of centre
+  lines (scales with k-space width) instead of the paper's fixed count.
+- **Mask family.** `equispaced_fraction` (realised rate = nominal) rather
+  than the paper's uncorrected M_e or the leaderboard's `equispaced`;
+  reasons under "Masks".
+- **Joint training.** The paper trains one model per rate. model1 matches
+  that for 4x. model2 is the repo's joint-training pattern extended to four
+  rates and is a Phase B baseline, not a paper reproduction. There is no
+  acceleration-rate input to the network in either model.
+- **Effective batch size.** 1 (one GPU) against the leaderboard's 32; the
+  paper does not state one. Same learning rate.
+- **2x and 6x** are not in the paper's brain results or in the fastMRI
+  challenge; their centre fractions follow the 0.32 / R convention.
+- **Validation** is a fixed mixture over rates (see "Masks"); the paper's
+  tables are per rate. Use `../verification/` for per-rate numbers.
 
 ## Without Docker
 
@@ -548,7 +556,8 @@ conda run -n Fall26Research pip install torch "pytorch-lightning==1.9.5" "torchm
     "numpy<2" h5py runstats "scikit-image<0.23" pyyaml "pandas<2.1" wandb requests tqdm
 conda run -n Fall26Research pip install --no-deps -e ../fastMRI
 conda run -n Fall26Research python train_wandb.py --data_path <dir with multicoil_train,multicoil_val> \
-    --default_root_dir output --accelerations 4 --center_fractions 0.08 --gpus 0 --no_wandb --fast_dev_run 1
+    --default_root_dir output --accelerations 2 4 6 8 --center_fractions 0.16 0.08 0.0533 0.04 \
+    --gpus 0 --no_wandb --fast_dev_run 1
 ```
 
 The Lightning 1.x requirement is the one that cannot be relaxed.
