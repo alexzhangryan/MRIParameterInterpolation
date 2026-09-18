@@ -24,18 +24,21 @@ reachable through `dataset=knee` macros.
 
 | Piece | State |
 |---|---|
-| `training/` (`train.sub`, `run_train.sh`, `train_wandb.py`, `submit.sh`) | repointed to brain batch 0 of each split, group staging, `runs/brain/<model>/`, W&B `varnet-brain-<model>`; defaults now 12 cascades / Adam 3e-4 (paper + leaderboard script) instead of the demo's 8 / 1e-3; smoke-tested locally on synthetic data. **Not yet submitted in this form.** |
+| `training/` (`train.sub`, `run_train.sh`, `train_wandb.py`, `submit.sh`) | repointed to brain batch 0 of each split, group staging (listing confirmed 2026-09-18), `runs/brain/<model>/`; model2 logs to the W&B run **"mixed acceleration brain"** (id `mixed-acceleration-brain`) by convention, `NAME='...'` / `name=` to choose, model1 to `varnet-brain-model1`; the key comes from the repo-root `.env`; a missing or rejected key is caught before extraction and **holds the job** (exit 4, `on_exit_hold`), so nothing trains without W&B unless `OFFLINE=1`; defaults now 12 cascades / Adam 3e-4 (paper + leaderboard script) instead of the demo's 8 / 1e-3; smoke-tested locally on synthetic data. **Not yet submitted in this form.** |
 | Configuration audit (meeting item 1) | `training/README.md` "Configuration": every setting against the paper, the leaderboard script, and the demo. Batch size and LR schedule are not in the paper; effective batch 1 vs the leaderboard's 32 is the one real deviation |
 | Mask audit (meeting item 3) | `training/README.md` "Masks": equispaced lines with density correction, rate drawn uniformly per training slice, per volume at validation, no rate input to the network |
 | Gain hypothesis (meeting item 4) | `plan.md` "Expected gain from explicit rate conditioning" |
-| `verification/` | unchanged; scores brain checkpoints via `val_data=` / `ckpt=` overrides (the defaults still say knee) |
+| Docker images | **must be rebuilt and pushed as `genjigod/fastmri-train:2026-09-18` and `genjigod/fastmri-verify:2026-09-18`** (both Dockerfiles now pin `wandb==0.26.1`). Found 2026-09-18 by the new preflight: the `2026-09` images' wandb 0.18.7 rejects the 86-character W&B key in `.env` on length; the key itself verifies with wandb 0.26.1. Both `.sub` files already name the new tags |
+| `verification/` | wandb pin and image tag bumped with training's; otherwise unchanged; scores brain checkpoints via `val_data=` / `ckpt=` overrides (the defaults still say knee) |
 | Knee subsets in `/staging/a/apryan3/fastmri/` | built 2026-09-12..14 (`knee_multicoil_{train,val}_subset`), used by short test jobs only, superseded |
 | Phase B (DPI) | designed in `plan.md`, no code written |
 
-The immediate next action is a CHTC session: `git pull` in
-`~/Fall26Research`, `ls` the brain directory to confirm the two batch-0
-tarballs and size `request_disk`, the 4.1 short test job, then
-`make submit-model2`. Runbook: `training/README.md` sections 3a and 4.
+The immediate next actions: on the laptop, push the rebuilt images
+(`make push IMAGE=genjigod/fastmri-train:2026-09-18` in `training/`, same
+for `verification/`); then a CHTC session: `git pull` in `~/Fall26Research`,
+`ls -la` the brain directory to size `request_disk`, the 4.1 short test job
+(which now also proves W&B end to end), then `make submit-model2`. Runbook:
+`training/README.md` sections 1, 3a and 4.
 
 <details>
 <summary>Previous status block (2026-09-11), kept for the record</summary>

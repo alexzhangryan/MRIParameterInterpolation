@@ -77,6 +77,13 @@ venv/
 .pytest_cache/
 
 # ---------------------------------------------------------------------------
+# Reference papers kept locally (copyrighted; not ours to redistribute).
+# e2evarnetpaper is the Sriram et al. 2020 PDF, saved without an extension.
+# ---------------------------------------------------------------------------
+e2evarnetpaper
+*.pdf
+
+# ---------------------------------------------------------------------------
 # OS / editor cruft
 # ---------------------------------------------------------------------------
 .DS_Store

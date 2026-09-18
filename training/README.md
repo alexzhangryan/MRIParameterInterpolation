@@ -33,8 +33,8 @@ out at) through a small driver, `train_wandb.py`, that builds the same
 
 | Preset | `accelerations` | `center_fractions` | What it is |
 |---|---|---|---|
-| **model2** | `2 4 6 8` | `0.16 0.08 0.0533 0.04` | **The run the meeting asked for.** One network, four rates. For every training sample the mask function draws one (acceleration, center fraction) pair uniformly at random from the four. No explicit rate signal reaches the network: this is the "joint training, no conditioning" baseline that Phase B's DPI model will be measured against. |
-| **model1** | `4` | `0.08` | One network, one rate. Optional per-rate reference (the paper trains one model per rate); the 4x point of the per-rate ceiling Phase B compares against. |
+| **model2** | `2 4 6 8` | `0.16 0.08 0.0533 0.04` | **The run the meeting asked for.** One network, four rates. For every training sample the mask function draws one (acceleration, center fraction) pair uniformly at random from the four. No explicit rate signal reaches the network: this is the "joint training, no conditioning" baseline that Phase B's DPI model will be measured against. W&B run **"mixed acceleration brain"** (id `mixed-acceleration-brain`). |
+| **model1** | `4` | `0.08` | One network, one rate. Optional per-rate reference (the paper trains one model per rate); the 4x point of the per-rate ceiling Phase B compares against. W&B run `varnet-brain-model1`. |
 
 The two lists are paired elementwise by `fastmri.data.subsample.MaskFunc`;
 center fractions follow the fastMRI convention of 0.32 / R. 2x and 6x are
@@ -91,12 +91,14 @@ it inside the job (`train.sub` `arguments` line plus the two flags
 ```bash
 # model 2 (brain, four rates)
 python train_wandb.py --data_path data/fastmri --default_root_dir output \
-    --run_name varnet-brain-model2 --accelerations 2 4 6 8 --center_fractions 0.16 0.08 0.0533 0.04 \
+    --run_name mixed-acceleration-brain --wandb_name 'mixed acceleration brain' \
+    --accelerations 2 4 6 8 --center_fractions 0.16 0.08 0.0533 0.04 \
     --mask_type equispaced_fraction --max_epochs 50 --gpus 1
 
 # model 1 (brain, 4x)
 python train_wandb.py --data_path data/fastmri --default_root_dir output \
-    --run_name varnet-brain-model1 --accelerations 4 --center_fractions 0.08 \
+    --run_name varnet-brain-model1 --wandb_name 'varnet-brain-model1' \
+    --accelerations 4 --center_fractions 0.08 \
     --mask_type equispaced_fraction --max_epochs 50 --gpus 1
 ```
 
@@ -170,12 +172,12 @@ closing it.
 | `train_wandb.py` | inside the job (or any `fastmri` env) | The driver. W&B logger, `last.ckpt`, auto-resume from `output/checkpoints/`, leaderboard-script defaults. |
 | `run_train.sh` | inside the job | Job executable: extracts every `*multicoil_*.tar(.xz)` it is given, finds `multicoil_train` / `multicoil_val`, seeds a resume checkpoint, runs the driver, collects `output/`. Anatomy-agnostic. |
 | `train.sub` | access point | HTCondor submit file, container universe. `dataset = brain`, group staging, batch 0 of each split; every default guarded. |
-| `submit.sh` | access point | `./submit.sh model2\|model1 [name=value ...]`. Refuses to submit without a W&B key unless `OFFLINE=1`; proves with `-dry-run` that the preset reached the job ad. |
+| `submit.sh` | access point | `./submit.sh model2\|model1 [name="W&B run name"] [key=value ...]`. Sources the repo-root `../.env`; refuses to submit without a W&B key unless `OFFLINE=1`; proves with `-dry-run` that the preset and the run name reached the job ad. |
 | `Makefile` | laptop + access point | `make build/push/smoke/job-smoke/job-evict` (Docker) and `make submit-model2/submit-model1/resume/status/logs/why` (condor). |
 | `Dockerfile` | laptop (build), CHTC (run) | Lightning 1.9.5, torch 2.0.1+cu118, conda h5py, wandb, fastMRI at `91f2df4`. Pinned to `linux/amd64`. |
 | `make_subset.sh`, `subset_val.sub`, `subset_train.sub` | access point | **Knee only, 2026-09** (section 3b): the repack that fit the knee splits under the 100 GB personal quota. Not used for brain. |
 | `../verification/prepare_brain_staging.sh` | CHTC transfer node | What put the brain set into group staging: 20 tarballs, ~1.37 TB, left compressed, SHA256-verified. |
-| `../.env.example` | repo root | Template for the shared `../.env` (gitignored): `WANDB_API_KEY`, `WANDB_ENTITY`, the NYU URLs. `submit.sh` sources `../.env` itself. |
+| `../.env.example` | repo root | Template for `../.env`, **the one secrets file, at the repo root** (gitignored): `WANDB_API_KEY`, `WANDB_ENTITY`, the NYU URLs. `submit.sh` sources `../.env` itself. No `training/.env` exists or is read. |
 
 ## Where things run
 
@@ -227,9 +229,27 @@ emulation: slow, fine for synthetic smoke tests.
 
 Use a dated tag, never `:latest`, so a rebuild cannot change what a checkpoint
 was produced with. The build ends with a self-check that imports `fastmri`,
-`WandbLogger`, and asserts Lightning is 1.x. Nothing in the 2026-09-18 change
-touches the image: `train_wandb.py` is transferred with the job, not baked
-in, so the existing `docker://genjigod/fastmri-train:2026-09` is still right.
+`WandbLogger`, and asserts Lightning is 1.x.
+
+**The image must be rebuilt for the brain runs: tag `2026-09-18`.** The
+`2026-09` image pins `wandb==0.18.7`, which rejects W&B's current
+86-character API keys before contacting the server ("API key must be 40
+characters long"); the key in `../.env` is one of those, and it verifies
+fine with wandb 0.26.1 (checked 2026-09-18). With the old image every
+submission would be held by the W&B preflight. So:
+
+```bash
+cd training
+make build push IMAGE=genjigod/fastmri-train:2026-09-18     # Dockerfile now pins wandb==0.26.1
+```
+
+`train.sub` already says `docker://genjigod/fastmri-train:2026-09-18`; a
+submission before the push fails at the container pull. `../verification/`
+has the same pin and the same problem: rebuild it as
+`genjigod/fastmri-verify:2026-09-18` before scoring anything, and set that
+tag in `verify.sub` / `verify_tier0.sub`. Nothing else in the 2026-09-18
+change touches the image: `train_wandb.py` is transferred with the job, not
+baked in.
 
 ## 2. Laptop: smoke-test with no real data (minutes each, under emulation)
 
@@ -292,8 +312,11 @@ ls -la /staging/groups/kamilov_group/Kamilov-SciAI-datasets/fastMRI_brain/
 get_quotas /staging/groups/kamilov_group/Kamilov-SciAI-datasets
 ```
 
-Expect 20 `brain_*.tar.xz` files plus `SHA256`; the two the defaults use are
-`brain_multicoil_train_batch_0.tar.xz` and `brain_multicoil_val_batch_0.tar.xz`.
+Confirmed 2026-09-18: `brain_multicoil_train_batch_0..9.tar.xz`,
+`brain_multicoil_val_batch_0..2.tar.xz`, `brain_multicoil_test_batch_0..2.tar.xz`,
+`brain_multicoil_test_full_batch_0..2.tar.xz`, `brain_fastMRI_DICOM.tar.gz`,
+`SHA256`. The two the defaults use, `brain_multicoil_train_batch_0.tar.xz` and
+`brain_multicoil_val_batch_0.tar.xz`, are there under exactly those names.
 Their exact sizes set `request_disk`: a fastMRI `.tar.xz` extracts to about
 1.9x, and `run_train.sh` deletes a tarball only after its extraction finishes,
 so the peak (while the second tarball extracts) is roughly
@@ -334,11 +357,18 @@ Every submission starts the same way:
 ```bash
 ssh apryan3@ap2001.chtc.wisc.edu
 cd ~/Fall26Research/training
-# either export them, or put them in the shared root .env
-# (cp ../.env.example ../.env; chmod 600 ../.env); submit.sh sources ../.env itself.
-export WANDB_API_KEY=...          # freshly rotated
-export WANDB_ENTITY=...           # optional
+ls -la ../.env                    # the ONE secrets file, at the repo root, mode 600
 ```
+
+**Where the W&B key lives: `~/Fall26Research/.env`, the repo root.** Not
+`training/.env`, not `verification/.env`; those do not exist and are not
+read. Both stages' `submit.sh` source `../.env` relative to themselves and
+print `W&B key: from ../.env` before submitting. Create it once on the
+access point from `../.env.example` (`cp ../.env.example ../.env; chmod
+600 ../.env`) and paste the freshly rotated key as `WANDB_API_KEY='...'`.
+Exporting the variable in the shell also works; the file wins when both are
+set. `WANDB_PROJECT` is not in the file on purpose (`train.sub` sets
+`fastmri-varnet-train`; verification sets its own).
 
 ### 4.1 Short test job first (model 2, one epoch, 50 batches)
 
@@ -351,10 +381,13 @@ make submit-model2 ARGS='max_epochs=1 extra_args="--limit_train_batches 50 --lim
 make logs                          # tail -f the newest logs/*.out
 ```
 
-The `.out` must show `[run_train] multicoil_train: 455 volumes`,
-`multicoil_val: 460 volumes`, the `[train_wandb]` line with
-`num_cascades=12 ... lr=0.0003`, `resume from: nothing (fresh run)`, one
-epoch, and a `saving model to output/checkpoints/...` line. When it
+The `.out` must show `W&B preflight OK` (before any extraction),
+`[run_train] multicoil_train: 455 volumes`, `multicoil_val: 460 volumes`, the
+`[train_wandb]` line with `num_cascades=12 ... lr=0.0003`, `resume from:
+nothing (fresh run)`, `W&B run: ... https://wandb.ai/...`, one epoch, and a
+`saving model to output/checkpoints/...` line. If instead the job goes on
+hold within a minute of starting, the W&B key is wrong: `make why
+JOB=<Cluster>` says so. When it
 finishes, `runs/brain/model2/<Cluster>/checkpoints/last.ckpt` must exist.
 That `<Cluster>` directory is a throwaway; delete it so it is not mistaken
 for a real run. Note the transfer + extraction time it reports: that is the
@@ -369,9 +402,33 @@ make submit-model2
 This is `./submit.sh model2`, which submits `train.sub` with
 `model=model2 accelerations="2 4 6 8" center_fractions="0.16 0.08 0.0533 0.04"`
 and no `resume=`, so training starts from random weights with the
-configuration in the table above. Run name and W&B run: `varnet-brain-model2`.
-Checkpoints land in `runs/brain/model2/<Cluster>/`. The `.out` must show
-`resume from: nothing (fresh run)` on this first submission.
+configuration in the table above. **W&B run: "mixed acceleration brain"**
+(project `fastmri-varnet-train`, run id `mixed-acceleration-brain`), by the
+naming convention below. It is a brand-new id, so it is its own run and
+cannot land in any of the 2026-09 `varnet-*` runs; a resubmission with
+`resume=` continues it. Checkpoints land in `runs/brain/model2/<Cluster>/`.
+The `.out` must show `W&B preflight OK`, `resume from: nothing (fresh run)`
+on this first submission, `run_name=mixed-acceleration-brain` on the
+`[train_wandb]` line, and a `W&B run: 'mixed acceleration brain' id=... https://wandb.ai/...`
+line before the first epoch.
+
+**The run name is a parameter.** `name="..."` on the command line (spaces
+allowed) is the W&B display name, and its slug (lower-cased, anything that
+is not a letter, digit, `.`, `_` or `-` turned into `-`) is the run id.
+Without it, the convention applies:
+
+| Submission | W&B display name | W&B run id |
+|---|---|---|
+| `make submit-model2` | `mixed acceleration brain` | `mixed-acceleration-brain` |
+| `make submit-model2 NAME='mixed acceleration brain v2'` | `mixed acceleration brain v2` | `mixed-acceleration-brain-v2` |
+| `./submit.sh model2 name="..."` | same as above | |
+| `make submit-model1` | `varnet-brain-model1` | `varnet-brain-model1` |
+| `... dataset=knee` | `mixed acceleration knee` / `varnet-knee-model1` | slug |
+| `... run_name=my-id` | `my-id` (or `name=` if also given) | `my-id`, taken verbatim |
+
+Same name on a resubmission means the same W&B run (that is what
+`make resume` relies on); a new name means a new run. `submit.sh` prints
+`W&B run: '<name>' id=<id> project=<project>` before it submits.
 
 ### 4.3 Model 1: acceleration 4 only, from scratch (optional)
 
@@ -388,11 +445,13 @@ for model 2.
 
 ### 4.4 Overrides
 
-`make submit-model2 ARGS='...'` and `./submit.sh model2 name=value ...` are
-the same thing. Any `name=value` is a `condor_submit` macro override, so every
+`make submit-model2 ARGS='...'` and `./submit.sh model2 key=value ...` are
+the same thing. Any `key=value` is a `condor_submit` macro override, so every
 knob in `train.sub` (`dataset`, `staging`, `train_data`, `val_data`,
 `request_disk`, `gpu_mem`, `max_epochs`, `run_name`, `mask_type`,
-`extra_args`, ...) can be set per submission without editing the file.
+`extra_args`, `allow_offline`, ...) can be set per submission without editing
+the file. `name="..."` is the exception: `submit.sh` consumes it and turns it
+into `run_name=` + `wandb_name=` (section 4.2).
 
 That last sentence is only true because every default in `train.sub` is
 wrapped in `if ! defined`. `condor_submit` parses a command-line `name=value`
@@ -441,12 +500,35 @@ Lightning's progress bar, the per-epoch `validation_loss`, and
 saving model to output/checkpoints/..." lines.
 
 W&B project `fastmri-varnet-train` (override with `WANDB_PROJECT` in the
-shell), run names `varnet-brain-model2` / `varnet-brain-model1`. The run id
-is the run name, with `resume="allow"`, so a resubmitted job continues the
-same W&B run rather than starting a new one; pass
-`run_name=varnet-brain-model2-seed7` for a genuinely new run. The 2026-09
+shell). Runs: **"mixed acceleration brain"** (id `mixed-acceleration-brain`)
+for model2 and `varnet-brain-model1` for model1 by convention, or whatever
+`name=` / `NAME=` was given (section 4.2). The run id is `run_name`, with
+`resume="allow"`, so a resubmitted job continues the same W&B run rather
+than starting a new one; a new `name=` is a genuinely new run. The 2026-09
 knee runs are `varnet-model1` / `varnet-model2` in the same project and are
-unrelated. `MriModule` logs `validation_loss`, `val_metrics/nmse`,
+unrelated.
+
+**No observability, no run.** A job never trains blind:
+
+1. `submit.sh` refuses to submit unless `WANDB_API_KEY` is set (from
+   `../.env` or the shell), or `OFFLINE=1` was given on purpose.
+2. Inside the job, **before any tarball is extracted**, `run_train.sh` runs
+   `train_wandb.py --wandb_check_only`, which verifies the key against the
+   W&B server (`wandb.login(verify=True)`, a real API call). A missing or
+   rejected key, or a `WANDB_MODE` that is not online, exits 4.
+3. In the training process, the W&B run is created eagerly and asserted to be
+   online with a URL before the first epoch (Lightning's `WandbLogger` would
+   otherwise create it lazily at the first log call). Not online exits 4.
+4. `train.sub` turns exit code 4 into a **HOLD** (`on_exit_hold`), with the
+   reason in the job ad, and `retry_until` stops `max_retries` from re-running
+   it. `make why JOB=<Cluster>` shows it; the `.err` log has the exact message.
+   `condor_release` will not help: fix the key in `../.env` and resubmit. A
+   preflight failure costs only the input transfer, nothing was extracted.
+
+`OFFLINE=1 ./submit.sh ...` (`WANDB_ALLOW_OFFLINE=1` in the job) is the one
+sanctioned way around this: the run is written offline under
+`runs/brain/<model>/<Cluster>/wandb/` and `wandb sync <that dir>/offline-run-*`
+uploads it later. The local smoke tests use it too. `MriModule` logs `validation_loss`, `val_metrics/nmse`,
 `val_metrics/ssim`, `val_metrics/psnr` and up to 16 target / reconstruction /
 error images per validation epoch (remember: a mixture over the four rates,
 see "Masks"). Checkpoints are not uploaded (`log_model=False`); they come

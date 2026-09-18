@@ -35,8 +35,11 @@
 if ! defined staging
   staging = /staging/a/apryan3/fastmri
 endif
+# 2026-09-18 tag: wandb 0.26.1, which accepts W&B's current 86-character API
+# keys (the 2026-09 tag's wandb 0.18.7 does not). Build and push with
+#   make build push IMAGE=genjigod/fastmri-verify:2026-09-18
 if ! defined image
-  image = docker://genjigod/fastmri-verify:2026-09
+  image = docker://genjigod/fastmri-verify:2026-09-18
 endif
 
 # --- what to evaluate --------------------------------------------------------

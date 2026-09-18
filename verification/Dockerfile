@@ -62,9 +62,11 @@ RUN micromamba install -y -n base -c conda-forge \
 RUN pip install --no-cache-dir \
         torch==2.0.1 torchvision==0.15.2 \
         --index-url https://download.pytorch.org/whl/cu118 \
+# wandb >= 0.26: 0.18.7 rejected W&B's current 86-character API keys
+# ("API key must be 40 characters long"). Same bump as training/, 2026-09-18.
  && pip install --no-cache-dir \
         pytorch-lightning==1.9.5 torchmetrics==0.11.4 \
-        runstats==2.0.0 wandb==0.18.7 requests tqdm pytest==7.4.4
+        runstats==2.0.0 wandb==0.26.1 requests tqdm pytest==7.4.4
 
 # fastMRI at a pinned commit, installed non-editable, no dependency resolution
 RUN git clone --quiet https://github.com/facebookresearch/fastMRI.git /opt/fastMRI \

@@ -137,8 +137,17 @@ unaffected.
 
 ```bash
 cd verification
-make build push IMAGE=<dockerhub_user>/fastmri-verify:2026-09
+make build push IMAGE=genjigod/fastmri-verify:2026-09-18
 ```
+
+**Rebuild required as of 2026-09-18.** The `2026-09` image pins
+`wandb==0.18.7`, which rejects W&B's current 86-character API keys before
+contacting the server ("API key must be 40 characters long"); the key in
+`../.env` is one of those and verifies fine with wandb 0.26.1. The
+Dockerfile now pins `wandb==0.26.1` and `verify.sub` / `verify_tier0.sub`
+name the `2026-09-18` tag, so build and push before the next submission.
+Same change, same reason, as `training/` (which additionally holds a job
+whose W&B preflight fails).
 
 `linux/amd64` for the same reasons as training (CHTC is x86_64, the cu118
 wheels and the pinned `hdf5` build only exist there); on an Apple Silicon

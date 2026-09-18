@@ -16,10 +16,16 @@
 # transfers back to runs/<Cluster>/.
 #
 # Environment (set by train.sub from the submit shell, never hardcoded here):
-#   WANDB_API_KEY   optional. Absent -> W&B offline, run saved under output/wandb
+#   WANDB_API_KEY   REQUIRED unless --no_wandb is passed or WANDB_ALLOW_OFFLINE=1.
+#                   Verified against the W&B server before any extraction; a
+#                   missing or bad key exits 4, which train.sub turns into a
+#                   HOLD (no blind multi-day runs, no retries).
+#   WANDB_ALLOW_OFFLINE  set to 1 (OFFLINE=1 ./submit.sh) to log offline on purpose
 #   WANDB_PROJECT   default fastmri-varnet-train
 #   WANDB_ENTITY    optional
 #   KEEP_TARBALL    optional. Set to 1 to keep tarballs after extraction (local runs)
+#
+# Exit codes: 3 data/extraction problem, 4 W&B not usable, otherwise python's.
 
 set -uo pipefail
 
@@ -35,15 +41,30 @@ export XDG_CACHE_HOME="$PWD/.cache"
 export MPLCONFIGDIR="$PWD/.cache/mpl"
 mkdir -p "$WANDB_CACHE_DIR" "$WANDB_CONFIG_DIR" "$TORCH_HOME"
 
-if [ -z "${WANDB_API_KEY:-}" ]; then
-  echo "[run_train] WANDB_API_KEY not set: W&B will run offline (sync later from output/wandb)"
-  export WANDB_MODE=offline
-fi
-
 echo "[run_train] host=$(hostname) image=${TRAIN_IMAGE:-?} cwd=$PWD"
 echo "[run_train] job=${_CONDOR_JOB_AD:-n/a}"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv 2>/dev/null || echo "[run_train] no nvidia-smi"
 df -h . | tail -1
+
+# ---- W&B preflight ----------------------------------------------------------
+# Before the hour-plus of tarball extraction: is W&B actually usable? The
+# driver checks --no_wandb / WANDB_ALLOW_OFFLINE, then verifies WANDB_API_KEY
+# against the server (wandb.login verify=True). A failure exits 4 here and
+# train.sub's on_exit_hold puts the job on HOLD with the reason in the ad, so
+# a mis-pasted key can never turn into days of unobserved training. The
+# training process repeats the check and additionally asserts the run it
+# created is online (has a URL) before the first epoch.
+if [ -z "${WANDB_API_KEY:-}" ] && [ "${WANDB_ALLOW_OFFLINE:-0}" != "0" ]; then
+  echo "[run_train] WANDB_API_KEY not set and WANDB_ALLOW_OFFLINE=1: W&B will run offline (sync later from output/wandb)"
+  export WANDB_MODE=offline
+fi
+python train_wandb.py --wandb_check_only --data_path data/fastmri --default_root_dir output "$@"
+RC=$?
+if [ $RC -ne 0 ]; then
+  echo "[run_train] W&B preflight failed (exit $RC); not extracting data, not training" >&2
+  echo "W&B preflight failed, rc=$RC" > output/EMPTY
+  exit $RC
+fi
 
 # ---- resume checkpoint ------------------------------------------------------
 # Two ways a checkpoint can already be here: HTCondor brought output/ back

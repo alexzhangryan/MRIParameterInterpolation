@@ -7,8 +7,10 @@
 # Same macro names, guards and directory layout as verify.sub / train.sub, so
 # logs/tier0_<Cluster>.* and runs/tier0/<Cluster>/ sit next to the model runs.
 
+# 2026-09-18 tag: wandb 0.26.1 (the 2026-09 tag's 0.18.7 rejects current
+# 86-character W&B keys). Keep in step with verify.sub.
 if ! defined image
-  image = docker://genjigod/fastmri-verify:2026-09
+  image = docker://genjigod/fastmri-verify:2026-09-18
 endif
 if ! defined model
   model = tier0

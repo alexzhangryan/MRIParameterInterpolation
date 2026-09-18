@@ -93,9 +93,12 @@ Both Docker images must be built for `linux/amd64`; the Dockerfiles pin it
 and the Makefiles pass `--platform`. A bare arm64 build fails in the conda
 layer with `hdf5 1.10.6 nompi_h6a2412b_1114 does not exist`.
 
-`training/train.sub` already points at
-`docker://genjigod/fastmri-train:2026-09`. `verification/verify.sub` still
-says `CHANGE_ME` — edit it before the first verification submit.
+`training/train.sub` points at `docker://genjigod/fastmri-train:2026-09-18`,
+which must be built and pushed first (`training/README.md` section 1): the
+older `2026-09` image's wandb 0.18.7 rejects W&B's current 86-character API
+keys, and a job without working W&B now holds itself. `verification/`
+carries the same wandb pin and needs the same rebuild before it is used
+again.
 
 ## Secrets
 

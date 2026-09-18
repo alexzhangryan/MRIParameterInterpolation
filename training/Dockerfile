@@ -52,9 +52,12 @@ RUN micromamba install -y -n base -c conda-forge \
 RUN pip install --no-cache-dir \
         torch==2.0.1 torchvision==0.15.2 \
         --index-url https://download.pytorch.org/whl/cu118 \
+# wandb >= 0.26: 0.18.7 rejected W&B's current 86-character API keys before
+# contacting the server ("API key must be 40 characters long"), which the
+# W&B preflight in train_wandb.py turns into a held job. Bumped 2026-09-18.
  && pip install --no-cache-dir \
         pytorch-lightning==1.9.5 torchmetrics==0.11.4 tensorboard==2.14.1 \
-        runstats==2.0.0 wandb==0.18.7 requests tqdm
+        runstats==2.0.0 wandb==0.26.1 requests tqdm
 
 # fastMRI at a pinned commit, installed non-editable, no dependency resolution
 RUN git clone --quiet https://github.com/facebookresearch/fastMRI.git /opt/fastMRI \

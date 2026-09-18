@@ -35,6 +35,7 @@ metrics are anatomy-agnostic (crop size and max value come from each file).
 
 import os
 import pathlib
+import sys
 from argparse import ArgumentParser
 from typing import Optional
 
@@ -85,13 +86,75 @@ def latest_checkpoint(checkpoint_dir: pathlib.Path) -> Optional[str]:
     return str(ckpts[-1]) if ckpts else None
 
 
+# Exit code for "W&B is not usable". train.sub holds the job on it
+# (on_exit_hold) instead of retrying or letting it run blind. Distinct from 3
+# (run_train.sh data errors) and from python's 1.
+WANDB_EXIT_CODE = 4
+
+
+def wandb_fail(msg: str) -> None:
+    print(f"[train_wandb] W&B PREFLIGHT FAILED: {msg}", file=sys.stderr, flush=True)
+    print(
+        f"[train_wandb] refusing to train without observability. Exit code {WANDB_EXIT_CODE} "
+        "holds the job (train.sub on_exit_hold). Fix WANDB_API_KEY in the repo-root .env and "
+        "resubmit, or OFFLINE=1 ./submit.sh ... to allow offline logging on purpose.",
+        file=sys.stderr, flush=True,
+    )
+    raise SystemExit(WANDB_EXIT_CODE)
+
+
+def wandb_preflight(args) -> None:
+    """Prove W&B is usable BEFORE any data is extracted or any epoch runs.
+
+    Checks, in order: --no_wandb was not given; WANDB_MODE is online (or
+    offline was explicitly allowed with WANDB_ALLOW_OFFLINE=1); WANDB_API_KEY
+    is set; and the key is accepted by the W&B server (wandb.login verify=True
+    makes a real API call). Anything else exits with WANDB_EXIT_CODE.
+    run_train.sh calls this through --wandb_check_only before extracting the
+    tarballs, and cli_main calls it again in the training process.
+    """
+    if not args.wandb:
+        print("[train_wandb] W&B disabled by --no_wandb (TensorBoard only)")
+        return
+    import wandb
+
+    allow_offline = os.environ.get("WANDB_ALLOW_OFFLINE", "0") not in ("", "0")
+    mode = os.environ.get("WANDB_MODE", "online")
+    if mode != "online":
+        if allow_offline:
+            print(f"[train_wandb] W&B mode {mode!r} allowed by WANDB_ALLOW_OFFLINE; "
+                  "the run is written under output/wandb for `wandb sync` later")
+            return
+        wandb_fail(f"WANDB_MODE={mode!r} but WANDB_ALLOW_OFFLINE is not set")
+
+    key = os.environ.get("WANDB_API_KEY", "")
+    if not key:
+        if allow_offline:
+            os.environ["WANDB_MODE"] = "offline"
+            print("[train_wandb] WANDB_API_KEY not set; WANDB_ALLOW_OFFLINE=1 so logging offline")
+            return
+        wandb_fail("WANDB_API_KEY is not set in the job environment (train.sub getenv copies it "
+                   "from the submitting shell, which submit.sh fills from ../.env)")
+
+    try:
+        ok = wandb.login(key=key, verify=True, relogin=True)
+    except Exception as e:  # AuthenticationError, CommError, UsageError, ...
+        wandb_fail(f"wandb.login(verify=True) raised {type(e).__name__}: {e}")
+    if not ok:
+        wandb_fail("wandb.login(verify=True) returned False")
+    print(f"[train_wandb] W&B preflight OK: key verified against "
+          f"{os.environ.get('WANDB_BASE_URL', 'https://api.wandb.ai')}, "
+          f"project={args.wandb_project} entity={args.wandb_entity or '(default)'} "
+          f"run id={args.wandb_id or args.run_name} name={args.wandb_name or args.run_name!r}")
+
+
 def build_logger(args, root: pathlib.Path):
     if not args.wandb:
         return True  # Lightning's default TensorBoardLogger under default_root_dir
     return WandbLogger(
         project=args.wandb_project,
         entity=args.wandb_entity,
-        name=args.run_name,
+        name=args.wandb_name or args.run_name,
         id=args.wandb_id or args.run_name,
         resume="allow",
         save_dir=str(root),
@@ -100,6 +163,10 @@ def build_logger(args, root: pathlib.Path):
 
 
 def cli_main(args):
+    wandb_preflight(args)
+    if args.wandb_check_only:
+        return
+
     pl.seed_everything(args.seed, workers=True)
 
     if len(args.center_fractions) != len(args.accelerations):
@@ -188,6 +255,16 @@ def cli_main(args):
         resume_from_checkpoint=None,
     )
     if args.wandb and trainer.is_global_zero:
+        # Create the W&B run NOW (WandbLogger is lazy: without this it would
+        # be created at the first log call, one epoch in) and prove it is an
+        # online run with a URL. An offline fallback here would mean a
+        # multi-day job with no observability, which is what exit code 4 is for.
+        run = logger.experiment
+        if os.environ.get("WANDB_MODE", "online") == "online":
+            if getattr(run, "offline", False) or not getattr(run, "url", None):
+                wandb_fail("the W&B run came up offline or has no URL "
+                           f"(offline={getattr(run, 'offline', None)}, url={getattr(run, 'url', None)})")
+            print(f"[train_wandb] W&B run: {run.name!r} id={run.id} {run.url}", flush=True)
         logger.log_hyperparams(
             {k: (str(v) if isinstance(v, pathlib.Path) else v) for k, v in vars(args).items()}
         )
@@ -207,8 +284,15 @@ def build_args():
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument(
         "--run_name", default="varnet", type=str,
-        help="W&B run name and, unless --wandb_id is given, the W&B run id. Keep it the "
-             "same across resubmissions of one training run so W&B continues the run.",
+        help="W&B run id (unless --wandb_id is given) and, unless --wandb_name is given, "
+             "the displayed run name. Letters, digits, - and _ only: W&B ids cannot hold "
+             "spaces. Keep it the same across resubmissions of one training run so W&B "
+             "continues the run.",
+    )
+    parser.add_argument(
+        "--wandb_name", default=None, type=str,
+        help="W&B displayed run name, may contain spaces (e.g. 'mixed acceleration brain'). "
+             "Default: --run_name.",
     )
 
     # data transform params (paired elementwise, see module docstring).
@@ -233,6 +317,9 @@ def build_args():
     parser.add_argument("--wandb_project", default=os.environ.get("WANDB_PROJECT", "fastmri-varnet-train"))
     parser.add_argument("--wandb_entity", default=os.environ.get("WANDB_ENTITY"))
     parser.add_argument("--wandb_id", default=None, help="override the W&B run id (default: --run_name)")
+    parser.add_argument("--wandb_check_only", action="store_true",
+                        help="run the W&B preflight (key verified against the server) and exit; "
+                             "run_train.sh does this before extracting any data")
 
     # data module: --data_path, --challenge, --batch_size, --num_workers, --sample_rate, ...
     parser = FastMriDataModule.add_data_specific_args(parser)

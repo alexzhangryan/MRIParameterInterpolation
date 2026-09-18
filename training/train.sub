@@ -42,8 +42,12 @@ endif
 if ! defined staging
   staging = /staging/groups/kamilov_group/Kamilov-SciAI-datasets/fastMRI_brain
 endif
+# 2026-09-18 tag: wandb 0.26.1. The 2026-09 tag's wandb 0.18.7 rejects W&B's
+# current 86-character API keys ("API key must be 40 characters long"), so
+# the W&B preflight holds every job submitted with it. Build and push with
+#   make build push IMAGE=genjigod/fastmri-train:2026-09-18
 if ! defined image
-  image = docker://genjigod/fastmri-train:2026-09
+  image = docker://genjigod/fastmri-train:2026-09-18
 endif
 
 # --- what to train -----------------------------------------------------------
@@ -75,18 +79,30 @@ endif
 if ! defined max_epochs
   max_epochs = 50
 endif
-# run_name is the W&B run NAME and the W&B run ID. Two trainings that share it
-# become one run in W&B; a resubmission of the same training must keep it.
-# Deriving it from $(dataset) and $(model) is what keeps the runs apart (and
-# keeps the brain runs out of the 2026-09 knee runs' W&B history), so it is
-# only correct as long as those two are.
+# run_name is the W&B run ID (letters, digits, - and _ only) and, unless
+# wandb_name is set, the displayed name. Two trainings that share it become
+# one run in W&B; a resubmission of the same training must keep it. The run
+# name is a PARAMETER: ./submit.sh model2 name="mixed acceleration brain"
+# sets wandb_name to that and run_name to its slug. Without name=, submit.sh
+# applies the naming convention: model2 -> "mixed acceleration <dataset>"
+# (id mixed-acceleration-<dataset>), model1 -> varnet-<dataset>-model1. The
+# default here is the fallback for a bare condor_submit. Any of these keeps
+# the brain runs out of the 2026-09 knee runs' (varnet-model1/2) W&B history.
 if ! defined run_name
   run_name = varnet-$(dataset)-$(model)
+endif
+# wandb_name may contain spaces; it is passed as one argument below.
+if ! defined wandb_name
+  wandb_name = $(run_name)
 endif
 if ! defined extra_args
   extra_args =
 endif
-arguments        = --run_name $(run_name) --accelerations $(accelerations) --center_fractions $(center_fractions) --mask_type $(mask_type) --max_epochs $(max_epochs) --gpus 1 $(extra_args)
+# HTCondor "new" argument syntax: the whole line in double quotes, and an
+# argument that contains spaces in single quotes. Only wandb_name needs that;
+# everything else splits on whitespace as before. submit.sh's preflight reads
+# the resolved string back out of the dry-run ad.
+arguments        = "--run_name $(run_name) --wandb_name '$(wandb_name)' --accelerations $(accelerations) --center_fractions $(center_fractions) --mask_type $(mask_type) --max_epochs $(max_epochs) --gpus 1 $(extra_args)"
 
 # --- container ---------------------------------------------------------------
 universe        = container
@@ -99,6 +115,8 @@ executable      = run_train.sh
 # directory has a 10,000-item cap). NYU ships the brain split as ten train
 # batches (brain_multicoil_train_batch_0..9, ~450 volumes each) and three val
 # batches (brain_multicoil_val_batch_0..2, ~460 each), all ~100 GB .tar.xz.
+# Directory listing confirmed 2026-09-18: those 13 plus test_batch_0..2,
+# test_full_batch_0..2, brain_fastMRI_DICOM.tar.gz and SHA256.
 # The defaults train on batch 0 of each: one batch is what fits in a job's
 # scratch, and it is the same 455 / 460 volumes every time, which is what a
 # Phase A / Phase B comparison needs. run_train.sh extracts every
@@ -131,11 +149,32 @@ transfer_output_files   = output
 transfer_output_remaps  = "output = runs/$(dataset)/$(model)/$(Cluster)"
 
 # --- secrets -----------------------------------------------------------------
-# Only these names are copied from the submitting shell, and only if set. The
+# Only these names are copied from the submitting shell, and only if set.
+# submit.sh puts them in the shell by sourcing the repo-root ../.env (the ONE
+# secrets file, shared with ../verification; there is no training/.env). The
 # key never appears in this file or in any committed file. It does appear in
 # the job ClassAd (condor_q -l), readable by you and CHTC admins only.
 getenv          = WANDB_API_KEY, WANDB_ENTITY, WANDB_PROJECT
-environment     = "WANDB_PROJECT=fastmri-varnet-train"
+# allow_offline=1 (OFFLINE=1 ./submit.sh) is the only way to run without a
+# working W&B connection; otherwise the job holds itself (next section).
+if ! defined allow_offline
+  allow_offline = 0
+endif
+environment     = "WANDB_PROJECT=fastmri-varnet-train WANDB_ALLOW_OFFLINE=$(allow_offline)"
+
+# --- no observability, no run -------------------------------------------------
+# run_train.sh verifies the W&B key against the server BEFORE extracting any
+# data, and train_wandb.py asserts the run it created is online before the
+# first epoch. Either failure exits 4. That exit code is turned into a HOLD
+# here, with the reason in the job ad (condor_q -af HoldReason, or make why),
+# rather than a retry (max_retries below would otherwise re-run it up to five
+# times) or a silent offline run. condor_release will not help: fix
+# WANDB_API_KEY in ../.env and resubmit (a preflight failure costs only the
+# transfer time; nothing was extracted or trained).
+on_exit_hold         = (ExitBySignal == False) && (ExitCode == 4)
+on_exit_hold_reason  = "W&B preflight failed (exit 4): key missing or rejected, or run not online. Fix WANDB_API_KEY in ../.env and resubmit; see the .err log"
+on_exit_hold_subcode = 4
+retry_until          = (ExitCode == 4)
 
 # --- resources ---------------------------------------------------------------
 # request_disk covers peak scratch during extraction: run_train.sh deletes a

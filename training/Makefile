@@ -31,6 +31,11 @@ MODEL    ?= model1
 # extra name=value macro overrides for condor_submit, e.g.
 #   make submit-model2 ARGS='max_epochs=2 extra_args="--limit_train_batches 20"'
 ARGS     ?=
+# W&B run name for `make submit-*` / `make resume` (spaces allowed). Empty =
+# the convention in submit.sh: "mixed acceleration <dataset>" for model2,
+# varnet-<dataset>-model1 for model1.
+NAME     ?=
+NAMEARG   = $(if $(NAME),name="$(NAME)")
 # ENV_FILE: the secrets file, shared by training/ and verification/. One file
 # at the repo root (see ../.env.example) so there is one key to rotate.
 ENV_FILE ?= ../.env
@@ -78,8 +83,11 @@ else
 endif
 # HOME and the cache dirs go to /tmp: the CHTC container has no writable home
 # either, so depending on one is a bug that would only show up on the cluster.
+# WANDB_ALLOW_OFFLINE=1: the local smoke tests have no key and log offline on
+# purpose. On CHTC that variable is 0 unless OFFLINE=1 ./submit.sh, and a job
+# without a working W&B connection holds itself (train.sub on_exit_hold).
 ENVFLAGS := -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e MPLCONFIGDIR=/tmp/.cache/mpl \
-            -e PYTHONUNBUFFERED=1 -e WANDB_MODE=offline
+            -e PYTHONUNBUFFERED=1 -e WANDB_MODE=offline -e WANDB_ALLOW_OFFLINE=1
 RUN      := $(DOCKER) run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
             -v "$(REPO)":/work -w /work/training $(IMAGE)
 
@@ -103,8 +111,9 @@ help:
 	@echo
 	@echo "  ACCESS POINT (ap2001.chtc.wisc.edu, WANDB_API_KEY exported):"
 	@echo "  make submit-model2   brain, accelerations 2 4 6 8, one drawn per sample (the 2026-09-18 ask)"
+	@echo "                       W&B run 'mixed acceleration brain' by convention; NAME='...' to choose"
 	@echo "  make submit-model1   brain, acceleration 4 only (per-rate reference)"
-	@echo "  make submit MODEL=model2 ARGS='max_epochs=2'"
+	@echo "  make submit MODEL=model2 NAME='mixed acceleration brain v2' ARGS='max_epochs=2'"
 	@echo "  make resume MODEL=model2 CKPT=runs/brain/<model>/<Cluster>/checkpoints/last.ckpt"
 	@echo "  make subset-val      knee only (2026-09, README 3b): val subset from the staged tarball"
 	@echo "  make subset-train    knee only: train subset streamed from NYU into personal /staging"
@@ -311,17 +320,17 @@ subset-train:
 	condor_submit subset_train.sub train_prefix_gb=$(TRAIN_PREFIX_GB)
 
 submit-model1:
-	./submit.sh model1 $(ARGS)
+	./submit.sh model1 $(NAMEARG) $(ARGS)
 
 submit-model2:
-	./submit.sh model2 $(ARGS)
+	./submit.sh model2 $(NAMEARG) $(ARGS)
 
 submit:
-	./submit.sh $(MODEL) $(ARGS)
+	./submit.sh $(MODEL) $(NAMEARG) $(ARGS)
 
 resume:
-	@test -n "$(CKPT)" || { echo "usage: make resume MODEL=model2 CKPT=runs/brain/<model>/<Cluster>/checkpoints/last.ckpt" >&2; exit 1; }
-	./submit.sh $(MODEL) resume=$(CKPT) $(ARGS)
+	@test -n "$(CKPT)" || { echo "usage: make resume MODEL=model2 CKPT=runs/brain/<model>/<Cluster>/checkpoints/last.ckpt [NAME='...']" >&2; exit 1; }
+	./submit.sh $(MODEL) resume=$(CKPT) $(NAMEARG) $(ARGS)
 
 status:
 	condor_q -nobatch
