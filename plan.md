@@ -25,6 +25,17 @@ From `parameter_interpolation/guided_diffusion/nn_ours.py:38-64` (`OurConv2d`) a
 
 ## Files to create (all new; nothing in `fastmri/` changes)
 
+> **Implemented 2026-09-19 in `dpi/` at the repo root, not in
+> `fastmri_examples/dpi_varnet/` as sketched below.** `fastMRI/` is a pinned
+> submodule this project never modifies, and a sibling directory keeps the
+> DPI code next to `training/` and `verification/`, sharing their `.env`,
+> their image and their job executable. The layout collapsed to five modules
+> (`dpi_varnet.py` holds the lambda table and the layers as well as the
+> model); `--dpi_scope` was dropped in favour of the paper's own choice of
+> duplicating every learnable tensor, with `--no_dpi_sens` kept as the one
+> ablation. The scalar source, the log-spaced lambda table and the separate
+> phi learning rate are as designed below. See `dpi/README.md`.
+
 ```
 fastmri_examples/dpi_varnet/
   __init__.py

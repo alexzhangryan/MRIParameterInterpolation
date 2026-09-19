@@ -1,0 +1,214 @@
+# train.sub: HTCondor submit file for DPI VarNet training on CHTC.
+#
+# The same job as ../training/train.sub with one thing changed: the driver
+# inside the container is train_dpi.py instead of train_wandb.py, so the
+# network is the DPI VarNet. The executable, the data, the resources, the
+# eviction handling, the W&B preflight and the hold-on-failure behaviour are
+# literally ../training's, reused rather than copied.
+#
+# Submit from this directory via ./submit.sh, which creates the log/run
+# directories, applies the preset, names the W&B run, and proves with
+# -dry-run that all of it reached the job ad.
+#
+#   ./submit.sh                            2x/4x/6x/8x brain, from scratch
+#   ./submit.sh name="dpi mixed acceleration brain v2"
+#   ./submit.sh init=../training/runs/brain/model2/123/checkpoints/last.ckpt
+#   ./submit.sh resume=runs/brain/dpi/123/checkpoints/last.ckpt
+#   ./submit.sh max_epochs=1 extra_args="--limit_train_batches 50 --limit_val_batches 10"
+
+# --- how the defaults in this file work --------------------------------------
+# Every macro is a DEFAULT ONLY, wrapped in `if ! defined`, because
+# condor_submit parses a command-line `name=value` as if it sat at the TOP of
+# this file; a plain assignment below would silently overwrite it. That bug
+# cost a three-hour run on 2026-09-13 (see ../training/train.sub).
+if ! defined dataset
+  dataset = brain
+endif
+if ! defined staging
+  staging = /staging/groups/kamilov_group/Kamilov-SciAI-datasets/fastMRI_brain
+endif
+if ! defined image
+  image = docker://genjigod/fastmri-train:2026-09-18
+endif
+# `model` names the run directory and the log files, as in ../training.
+if ! defined model
+  model = dpi
+endif
+
+# --- what to train -----------------------------------------------------------
+# Identical to the baseline `mixed acceleration brain` run: four rates paired
+# elementwise with their centre fractions, one pair drawn uniformly per
+# training slice, equispaced_fraction masks, 12 cascades, Adam 3e-4, batch 1,
+# 50 epochs, seed 42. train_dpi.py takes all of that from
+# ../training/train_wandb.py's defaults. The DPI-specific knobs below are the
+# only additions.
+if ! defined accelerations
+  accelerations = 2 4 6 8
+endif
+if ! defined center_fractions
+  center_fractions = 0.16 0.08 0.0533 0.04
+endif
+if ! defined mask_type
+  mask_type = equispaced_fraction
+endif
+if ! defined max_epochs
+  max_epochs = 50
+endif
+# The DPI knobs. accel_min/accel_max are the two ends of the interpolation:
+# lambda(2x) = 0 uses the first parameter set, lambda(8x) = 1 the second.
+# lambda_lr is the separate learning rate the paper gives phi (section 4.1).
+if ! defined accel_min
+  accel_min = 2.0
+endif
+if ! defined accel_max
+  accel_max = 8.0
+endif
+if ! defined lambda_lr
+  lambda_lr = 1e-3
+endif
+if ! defined lambda_length
+  lambda_length = 1000
+endif
+if ! defined dpi_args
+  dpi_args = --accel_min $(accel_min) --accel_max $(accel_max) --lambda_lr $(lambda_lr) --lambda_length $(lambda_length)
+endif
+# run_name is the W&B run ID (no spaces); wandb_name is the displayed name.
+# submit.sh sets both from name= or from the convention.
+if ! defined run_name
+  run_name = dpi-$(dataset)-$(model)
+endif
+if ! defined wandb_name
+  wandb_name = $(run_name)
+endif
+if ! defined extra_args
+  extra_args =
+endif
+# `init` is a trained baseline checkpoint to start BOTH parameter sets from
+# (the paper warm starts from a pretrained model). submit.sh stages it as
+# baseline_init.ckpt, which ../training/run_train.sh deliberately leaves in
+# the working directory instead of treating it as a resume point.
+if defined init
+  init_args = --init_from_baseline baseline_init.ckpt
+else
+  init_args =
+endif
+# HTCondor "new" argument syntax: the whole line double-quoted, an argument
+# containing spaces single-quoted. Only wandb_name needs that.
+arguments        = "--run_name $(run_name) --wandb_name '$(wandb_name)' --accelerations $(accelerations) --center_fractions $(center_fractions) --mask_type $(mask_type) --max_epochs $(max_epochs) --gpus 1 $(dpi_args) $(init_args) $(extra_args)"
+
+# --- container ---------------------------------------------------------------
+universe        = container
+container_image = $(image)
+# The baseline's job executable, reused unchanged. It extracts the tarballs,
+# finds the splits, runs the W&B preflight before touching the data, handles
+# the vacate signal, and collects output/. TRAIN_DRIVER tells it which python
+# driver to run.
+executable      = ../training/run_train.sh
+
+# --- input files -------------------------------------------------------------
+# Both splits come from the group staging directory and are never read from
+# there directly. The python files are the DPI modules plus the baseline
+# driver they import; HTCondor flattens them all into the job's working
+# directory, which is why the imports in train_dpi.py are plain module names.
+if ! defined train_data
+  train_data = file://$(staging)/$(dataset)_multicoil_train_batch_0.tar.xz
+endif
+if ! defined val_data
+  val_data = file://$(staging)/$(dataset)_multicoil_val_batch_0.tar.xz
+endif
+if ! defined code
+  code = ../training/train_wandb.py, train_dpi.py, dpi_varnet.py, dpi_module.py, dpi_transforms.py
+endif
+# Built from two optional fragments rather than nested conditionals: each
+# `if defined` here is flat, which is one less submit-file construct to get
+# wrong for a file that cannot be parsed anywhere but the access point.
+if defined resume
+  resume_input = , $(resume)
+else
+  resume_input =
+endif
+if defined init
+  init_input = , $(init)
+else
+  init_input =
+endif
+transfer_input_files = $(code), $(train_data), $(val_data)$(resume_input)$(init_input)
+should_transfer_files    = YES
+# ON_EXIT_OR_EVICT: an evicted job gets output/ back and resumes from
+# output/checkpoints/last.ckpt.
+when_to_transfer_output  = ON_EXIT_OR_EVICT
+
+# --- output files ------------------------------------------------------------
+transfer_output_files   = output
+transfer_output_remaps  = "output = runs/$(dataset)/$(model)/$(Cluster)"
+
+# --- secrets -----------------------------------------------------------------
+# Copied from the submitting shell, which submit.sh fills from the repo-root
+# ../.env. Never written into this file.
+getenv          = WANDB_API_KEY, WANDB_ENTITY, WANDB_PROJECT
+if ! defined allow_offline
+  allow_offline = 0
+endif
+# TRAIN_DRIVER is what makes this a DPI job rather than a baseline one.
+environment     = "WANDB_PROJECT=fastmri-varnet-train WANDB_ALLOW_OFFLINE=$(allow_offline) TRAIN_DRIVER=train_dpi.py"
+
+# --- no observability, no run -------------------------------------------------
+# Exit code 4 is "W&B is not usable" (key missing or rejected, or the run came
+# up offline). Hold rather than retry or train blind; see ../training/train.sub.
+on_exit_hold         = (ExitBySignal == False) && (ExitCode == 4)
+on_exit_hold_reason  = "W&B preflight failed (exit 4): key missing or rejected, or run not online. Fix WANDB_API_KEY in ../.env and resubmit; see the .err log"
+on_exit_hold_subcode = 4
+retry_until          = (ExitCode == 4)
+
+# --- resources ---------------------------------------------------------------
+# Same slot class as the baseline. DPI doubles the parameter count (29.9M ->
+# 59.9M) and therefore the Adam state, about 1 GB more of GPU memory in
+# total, which is noise next to the activations; the paper measures 5-9%
+# higher peak memory and under 1% more FLOPs. Checkpoints roughly double in
+# size, to about 700 MB.
+if ! defined bad_nodes
+  bad_nodes = "gpu4003.chtc.wisc.edu"
+endif
+requirements    = (Target.HasCHTCStaging == true) && !stringListMember(Target.Machine, $(bad_nodes))
+# request_cpus and request_memory are pre-seeded by condor_submit, so
+# `if ! defined` never fires for them; override as cpus= / mem=.
+if ! defined cpus
+  cpus = 8
+endif
+if ! defined mem
+  mem = 48GB
+endif
+request_cpus    = $(cpus)
+request_memory  = $(mem)
+if ! defined request_disk
+  request_disk = 520GB
+endif
+if ! defined request_gpus
+  request_gpus = 1
+endif
+if ! defined gpu_mem
+  gpu_mem = 24000M
+endif
+gpus_minimum_memory     = $(gpu_mem)
+gpus_minimum_capability = 7.0
+# This image's PyTorch has kernels for sm_37..sm_90; an sm_120 slot matches
+# and then dies at the first kernel launch.
+gpus_maximum_capability = 9.0
++WantGPULab     = true
++GPUJobLength   = "long"
+
+# --- transient node failures -------------------------------------------------
+# 6 = execute-node problem before anything ran, 13 = input transfer failed.
+# Both mean "the node, not this run"; release a few times, then stop so a
+# genuine repeatable failure still surfaces.
+max_retries     = 5
+periodic_release = (HoldReasonCode == 6 || HoldReasonCode == 13) && (NumSystemHolds < 5) && ((time() - EnteredCurrentStatus) > 300)
+
+# --- logs --------------------------------------------------------------------
+log             = logs/$(dataset)_$(model)_$(Cluster).log
+output          = logs/$(dataset)_$(model)_$(Cluster)_$(Process).out
+error           = logs/$(dataset)_$(model)_$(Cluster)_$(Process).err
+stream_output   = True
+stream_error    = True
+
+queue 1

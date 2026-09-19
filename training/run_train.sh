@@ -16,6 +16,9 @@
 # transfers back to runs/<Cluster>/.
 #
 # Environment (set by train.sub from the submit shell, never hardcoded here):
+#   TRAIN_DRIVER    the python driver to run, default train_wandb.py.
+#                   ../dpi/train.sub sets train_dpi.py (transferred with its
+#                   modules and with train_wandb.py, which it imports).
 #   WANDB_API_KEY   REQUIRED unless --no_wandb is passed or WANDB_ALLOW_OFFLINE=1.
 #                   Verified against the W&B server before any extraction; a
 #                   missing or bad key exits 4, which train.sub turns into a
@@ -29,6 +32,8 @@
 
 set -uo pipefail
 
+TRAIN_DRIVER="${TRAIN_DRIVER:-train_wandb.py}"
+[ -f "$TRAIN_DRIVER" ] || { echo "[run_train] ERROR: driver $TRAIN_DRIVER not in cwd" >&2; exit 3; }
 mkdir -p output/checkpoints data/fastmri
 
 # Keep every W&B / cache write inside scratch. CHTC containers do not have a
@@ -58,7 +63,8 @@ if [ -z "${WANDB_API_KEY:-}" ] && [ "${WANDB_ALLOW_OFFLINE:-0}" != "0" ]; then
   echo "[run_train] WANDB_API_KEY not set and WANDB_ALLOW_OFFLINE=1: W&B will run offline (sync later from output/wandb)"
   export WANDB_MODE=offline
 fi
-python train_wandb.py --wandb_check_only --data_path data/fastmri --default_root_dir output "$@"
+echo "[run_train] driver=$TRAIN_DRIVER"
+python "$TRAIN_DRIVER" --wandb_check_only --data_path data/fastmri --default_root_dir output "$@"
 RC=$?
 if [ $RC -ne 0 ]; then
   echo "[run_train] W&B preflight failed (exit $RC); not extracting data, not training" >&2
@@ -75,6 +81,9 @@ fi
 if [ -z "$(ls -A output/checkpoints)" ]; then
   for f in ./*.ckpt; do
     [ -f "$f" ] || continue
+    # baseline_*.ckpt is an INITIALISATION, not a resume point: ../dpi passes
+    # a trained model2 checkpoint under that name for --init_from_baseline.
+    case "$f" in ./baseline_*.ckpt) echo "[run_train] leaving $f in cwd (init checkpoint, not a resume)"; continue ;; esac
     echo "[run_train] seeding output/checkpoints with $f"
     mv "$f" output/checkpoints/
   done
@@ -172,7 +181,7 @@ on_term() {
 }
 trap on_term TERM INT
 
-python train_wandb.py --data_path data/fastmri --default_root_dir output "$@" &
+python "$TRAIN_DRIVER" --data_path data/fastmri --default_root_dir output "$@" &
 PY=$!
 wait "$PY"; RC=$?
 while [ "$RC" -gt 128 ] && kill -0 "$PY" 2>/dev/null; do wait "$PY"; RC=$?; done

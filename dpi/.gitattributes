@@ -1,0 +1,11 @@
+# These files execute on Linux (CHTC execute nodes, inside the container).
+# A CRLF from a Windows checkout makes bash fail on "\r", and make keeps the
+# \r in every variable, so a CRLF Makefile turns PLATFORM into "linux/amd64\r"
+# and every docker build dies on an invalid platform. Same reasoning as
+# ../training/.gitattributes.
+* text=auto eol=lf
+Makefile text eol=lf
+submit.sh text eol=lf
+train.sub text eol=lf
+*.py text eol=lf
+*.md text eol=lf

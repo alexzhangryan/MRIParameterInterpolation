@@ -162,7 +162,36 @@ def build_logger(args, root: pathlib.Path):
     )
 
 
-def cli_main(args):
+def build_transforms(args):
+    """The three data transforms. ../dpi/train_dpi.py swaps in recording ones."""
+    mask = create_mask_for_mask_type(
+        args.mask_type, args.center_fractions, args.accelerations
+    )
+    train_transform = VarNetDataTransform(mask_func=mask, use_seed=False)
+    val_transform = VarNetDataTransform(mask_func=mask)
+    test_transform = VarNetDataTransform()
+    return train_transform, val_transform, test_transform
+
+
+def build_model(args):
+    """The Lightning module. ../dpi/train_dpi.py swaps in the DPI one."""
+    return WandbSafeVarNetModule(
+        num_cascades=args.num_cascades,
+        pools=args.pools,
+        chans=args.chans,
+        sens_pools=args.sens_pools,
+        sens_chans=int(args.sens_chans),
+        lr=args.lr,
+        lr_step_size=args.lr_step_size,
+        lr_gamma=args.lr_gamma,
+        weight_decay=args.weight_decay,
+    )
+
+
+def cli_main(args, build_model=build_model, build_transforms=build_transforms):
+    """Everything around the model: W&B preflight, seeding, data module,
+    checkpointing, resume, trainer. The two hooks are how ../dpi/train_dpi.py
+    trains a different module with exactly this plumbing."""
     wandb_preflight(args)
     if args.wandb_check_only:
         return
@@ -182,12 +211,7 @@ def cli_main(args):
     # ------------
     # data
     # ------------
-    mask = create_mask_for_mask_type(
-        args.mask_type, args.center_fractions, args.accelerations
-    )
-    train_transform = VarNetDataTransform(mask_func=mask, use_seed=False)
-    val_transform = VarNetDataTransform(mask_func=mask)
-    test_transform = VarNetDataTransform()
+    train_transform, val_transform, test_transform = build_transforms(args)
 
     use_ddp = args.strategy is not None and str(args.strategy).startswith("ddp")
     data_module = FastMriDataModule(
@@ -210,17 +234,7 @@ def cli_main(args):
     # ------------
     # model
     # ------------
-    model = WandbSafeVarNetModule(
-        num_cascades=args.num_cascades,
-        pools=args.pools,
-        chans=args.chans,
-        sens_pools=args.sens_pools,
-        sens_chans=int(args.sens_chans),
-        lr=args.lr,
-        lr_step_size=args.lr_step_size,
-        lr_gamma=args.lr_gamma,
-        weight_decay=args.weight_decay,
-    )
+    model = build_model(args)
 
     # ------------
     # trainer
@@ -277,7 +291,9 @@ def cli_main(args):
         raise ValueError(f"unrecognized mode {args.mode}")
 
 
-def build_args():
+def build_parser(module_cls=VarNetModule):
+    """The full argument parser. module_cls.add_model_specific_args supplies
+    the model flags, so a VarNetModule subclass (../dpi) adds its own."""
     parser = ArgumentParser(description=__doc__.split("\n\n")[0])
 
     parser.add_argument("--mode", default="train", choices=("train", "test"))
@@ -332,7 +348,7 @@ def build_args():
     # 50 epochs, ~30M parameters), the paper's. train_varnet_demo.py instead
     # uses 8 cascades and lr 1e-3 "for lower memory consumption"; this
     # directory used those until 2026-09-18 (README "Configuration").
-    parser = VarNetModule.add_model_specific_args(parser)
+    parser = module_cls.add_model_specific_args(parser)
     parser.set_defaults(
         num_cascades=12,
         pools=4,
@@ -354,7 +370,11 @@ def build_args():
         max_epochs=50,
         default_root_dir="output",
     )
+    return parser
 
+
+def build_args(parser=None):
+    parser = parser if parser is not None else build_parser()
     args = parser.parse_args()
     if args.data_path is None:
         parser.error("--data_path is required (directory containing multicoil_train/ and multicoil_val/)")

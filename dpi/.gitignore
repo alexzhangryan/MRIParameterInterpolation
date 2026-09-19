@@ -1,0 +1,15 @@
+# job artefacts (CHTC access point)
+logs/
+runs/
+# local smoke-test artefacts (laptop)
+output/
+jobtest/
+warmtest/
+wandb/
+lightning_logs/
+*.tar
+*.tar.xz
+*.ckpt
+dataset_cache.pkl
+__pycache__/
+.pytest_cache/

@@ -6,16 +6,18 @@ Two phases (see `CLAUDE.md`, `ROADMAP.md`):
   **brain** dataset on UW-Madison CHTC (HTCondor). Started on knee; moved to
   brain on 2026-09-18 once the group staging directory held the full set.
 - **Phase B**: extend VarNet with Deep Parameter Interpolation (Park et al.,
-  CVPR 2026) to condition on acceleration rate. Designed in `plan.md`, not
-  started.
+  CVPR 2026) to condition on acceleration rate. Designed in `plan.md`,
+  implemented in `dpi/` on 2026-09-19, not yet trained.
 
 ## Status (2026-09-18)
 
 The brain set (20 NYU tarballs, ~1.37 TB) is in the Kamilov group staging
 directory, transferred and SHA256-verified. `training/` is repointed at it
 with the paper's configuration (12 cascades, Adam 3e-4) and the meeting's
-rate list (2, 4, 6, 8), and passes the local smoke tests. **The brain runs
-have not been submitted yet.** `ROADMAP.md` has the per-item checklist.
+rate list (2, 4, 6, 8), and passes the local smoke tests. `dpi/` adds the
+Phase B model on the same setup, with 21 unit tests and four smoke targets
+green. **Neither has been submitted yet.** `ROADMAP.md` has the per-item
+checklist.
 
 Next CHTC session: `git pull`, confirm the two batch-0 tarballs with `ls`,
 the one-epoch test job, then `make submit-model2` (`training/README.md`
@@ -28,6 +30,7 @@ sections 3a and 4).
 | `verification/` | Evaluate the released VarNet checkpoint on `multicoil_val` (Tiers 0 and 1 of `VERIFICATION.md`). Proves the environment and the metric code before any training. | `verification/README.md` |
 | `training/` | Train **model 2** (accelerations 2, 4, 6, 8, one drawn at random per sample; the primary run) and **model 1** (acceleration 4 only) on brain. Also holds the knee-era `/staging` repack jobs. | `training/README.md` |
 | `fastMRI/` | Submodule, `facebookresearch/fastMRI` at commit `91f2df4`. Never modified. Not needed on CHTC: the images carry their own copy. | |
+| `dpi/` | **Phase B.** VarNet conditioned on the acceleration rate by Deep Parameter Interpolation: two learnable parameter sets per tensor, interpolated by a learnable monotone lambda(R). Same training setup as `training/` by construction. | `dpi/README.md` |
 | `parameter_interpolation/` | Submodule, the DPI reference code. Phase B only. | |
 | `Claude outputs/` | Archived first draft of the verification harness, superseded by `verification/`. Do not run. | |
 

@@ -29,16 +29,19 @@ reachable through `dataset=knee` macros.
 | Mask audit (meeting item 3) | `training/README.md` "Masks": equispaced lines with density correction, rate drawn uniformly per training slice, per volume at validation, no rate input to the network |
 | Gain hypothesis (meeting item 4) | `plan.md` "Expected gain from explicit rate conditioning" |
 | Docker images | **must be rebuilt and pushed as `genjigod/fastmri-train:2026-09-18` and `genjigod/fastmri-verify:2026-09-18`** (both Dockerfiles now pin `wandb==0.26.1`). Found 2026-09-18 by the new preflight: the `2026-09` images' wandb 0.18.7 rejects the 86-character W&B key in `.env` on length; the key itself verifies with wandb 0.26.1. Both `.sub` files already name the new tags |
-| `verification/` | wandb pin and image tag bumped with training's; otherwise unchanged; scores brain checkpoints via `val_data=` / `ckpt=` overrides (the defaults still say knee) |
+| `verification/` | wandb pin and image tag bumped with training's; otherwise unchanged; scores brain checkpoints via `val_data=` / `ckpt=` overrides (the defaults still say knee). **Cannot score a DPI checkpoint yet**: it does not import the DPI model class |
 | Knee subsets in `/staging/a/apryan3/fastmri/` | built 2026-09-12..14 (`knee_multicoil_{train,val}_subset`), used by short test jobs only, superseded |
-| Phase B (DPI) | designed in `plan.md`, no code written |
+| **Phase B (DPI)** | **implemented in `dpi/` (2026-09-19).** VarNet with two parameter sets per learnable tensor and a learnable monotone lambda(R), following arXiv:2511.21028 eq. (2) and section 3.2. 21 unit tests plus four smoke targets green on synthetic data; parameter count exactly 2x the baseline plus the 1,000-entry phi. The training setup is the baseline's by construction: `train_dpi.py` calls `../training/train_wandb.py`'s `cli_main` with the model and transform hooks swapped, and the job reuses `../training/run_train.sh`. **Not yet submitted on CHTC.** Runbook: `dpi/README.md` |
 
 The immediate next actions: on the laptop, push the rebuilt images
 (`make push IMAGE=genjigod/fastmri-train:2026-09-18` in `training/`, same
 for `verification/`); then a CHTC session: `git pull` in `~/Fall26Research`,
 `ls -la` the brain directory to size `request_disk`, the 4.1 short test job
 (which now also proves W&B end to end), then `make submit-model2`. Runbook:
-`training/README.md` sections 1, 3a and 4.
+`training/README.md` sections 1, 3a and 4. The DPI run (`cd dpi && make
+submit`) uses the same image and can be queued alongside or after it; the
+two are compared per rate, which needs the verification harness taught to
+load a DPI checkpoint.
 
 <details>
 <summary>Previous status block (2026-09-11), kept for the record</summary>
