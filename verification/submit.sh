@@ -4,19 +4,24 @@
 # preset, any further name=value pairs are passed straight to condor_submit as
 # macro overrides and win over the preset.
 #
-#   ./submit.sh model1                     released weights, 4x,          on the val subset
-#   ./submit.sh model2                     released weights, 2x/4x/6x/8x, on the val subset, one pass per rate
-#   ./submit.sh model1 ckpt=../training/runs/model1/<Cluster>/checkpoints/last.ckpt run_name=verify-model1-trained
-#   ./submit.sh tier1                      the Claim A sweep: random masks 4x/8x, full 199-volume val, reference verdicts
+#   ./submit.sh model2 ckpt=../training/runs/brain/model2/<Cluster>/checkpoints/last.ckpt run_name=verify-model2-brain
+#                                          trained baseline: 2x/4x/6x/8x, one pass per rate, plus the mixed pass, brain val batch 0
+#   ./submit.sh model2 ckpt=../dpi/runs/brain/dpi/<Cluster>/checkpoints/last.ckpt run_name=verify-dpi-brain
+#                                          a DPI checkpoint, same passes; the harness detects it
+#   ./submit.sh model1                     released knee weights, 4x, on brain val batch 0 (a sanity row)
+#   ./submit.sh tier1                      the Claim A sweep: random masks 4x/8x, knee full 199-volume val, reference verdicts
 #   ./submit.sh tier0                      environment checks only, no data (verify_tier0.sub)
-#   ./submit.sh model1 volume_limit=5 extra_args="--num_workers 0"
-#   OFFLINE=1 ./submit.sh model1           skip the W&B key check, log offline
+#   ./submit.sh model2 volume_limit=5 extra_args="--num_workers 0" ckpt=...
+#   ./submit.sh model2 dataset=knee staging=/staging/a/apryan3/fastmri val_data=file:///staging/a/apryan3/fastmri/knee_multicoil_val_subset.tar request_disk=60GB
+#   OFFLINE=1 ./submit.sh model2 ...       skip the W&B key check, log offline
 #
 # model1 / model2 mirror training/submit.sh model1 / model2 exactly -- same
-# accelerations, same center fractions, same mask family, same val subset,
-# same seed -- but score a checkpoint (the released NYU leaderboard weights by
-# default) instead of training one. Together with the two training runs they
-# are the 2x2 in README "Pretrained vs. from-scratch".
+# accelerations, same center fractions, same mask family, same val data (brain
+# val batch 0 since 2026-09-18), same seed -- but score a checkpoint (the
+# released NYU knee leaderboard weights by default) instead of training one.
+# Together with the two training runs they are the 2x2 in README "Pretrained
+# vs. from-scratch". `dataset=` picks the runs/ and logs/ subdirectory as in
+# training (default brain).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -46,14 +51,27 @@ case "$MODEL" in
   # knee_multicoil_val.tar.xz is still in /staging (README "Run Tier 1 before
   # the training repack").
   tier1)  shift; WANT_ACCEL="4 8";     WANT_MASK=random
-          PRESET=(model=tier1 accelerations="$WANT_ACCEL" center_fractions="0.08 0.04" mask_type=$WANT_MASK
+          PRESET=(model=tier1 dataset=knee accelerations="$WANT_ACCEL" center_fractions="0.08 0.04" mask_type=$WANT_MASK
                   val_data="file:///staging/a/apryan3/fastmri/knee_multicoil_val.tar.xz" request_disk=320GB) ;;
   tier0)  shift; PRESET=(model=tier0); SUB=verify_tier0.sub ;;
   *) echo "usage: $0 {model1|model2|tier1|tier0} [name=value ...]" >&2; exit 2 ;;
 esac
 
+# dataset= names the runs/<dataset>/<model>/ and logs/ subtree, as in
+# training/submit.sh. The tier1 preset is knee by definition; a command-line
+# dataset= wins over everything.
+DATASET=brain
+case "$MODEL" in tier1) DATASET=knee ;; esac
+HAVE_CKPT=""
+for kv in "$@"; do
+  case "$kv" in
+    dataset=*) DATASET="${kv#dataset=}" ;;
+    ckpt=*)    HAVE_CKPT=1 ;;
+  esac
+done
+
 # the remap target's parent must exist before HTCondor writes output/ there
-mkdir -p logs "runs/$MODEL"
+mkdir -p logs "runs/$DATASET/$MODEL"
 
 if ! command -v condor_submit >/dev/null 2>&1; then
   echo "condor_submit not found: run this on ap2001.chtc.wisc.edu, not on the laptop" >&2
@@ -74,6 +92,12 @@ for kv in "$@"; do
       ;;
   esac
 done
+
+if [ -z "$HAVE_CKPT" ] && [ "$DATASET" != knee ] && [ "$MODEL" != tier0 ]; then
+  echo "note: no ckpt= given, so this scores the released fastMRI KNEE checkpoint on $DATASET data." >&2
+  echo "      To score a trained model pass ckpt=../training/runs/$DATASET/$MODEL/<Cluster>/checkpoints/last.ckpt" >&2
+  echo "      (or ../dpi/runs/$DATASET/dpi/<Cluster>/checkpoints/last.ckpt) and a run_name=." >&2
+fi
 
 if [ -z "${WANDB_API_KEY:-}" ] && [ -z "${OFFLINE:-}" ]; then
   cat >&2 <<'EOF'
@@ -134,5 +158,5 @@ fi
 echo "submitting $SUB ${PRESET[*]} $*"
 condor_submit "$SUB" "${PRESET[@]}" "$@"
 echo
-echo "watch:   condor_q -nobatch; tail -f logs/${MODEL}_*.out"
-echo "results: runs/$MODEL/<Cluster>/tier1_report.json, runs/$MODEL/<Cluster>/results.csv"
+echo "watch:   condor_q -nobatch; tail -f logs/${DATASET}_${MODEL}_*.out"
+echo "results: runs/$DATASET/$MODEL/<Cluster>/tier1_report.json, per_volume_R<N>.csv, per_volume_mixed.csv, results.csv"

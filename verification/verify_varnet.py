@@ -21,11 +21,17 @@ Typical use
       --accelerations 4 --center_fractions 0.08 \
       --mask_type equispaced_fraction --output_dir output
 
-  --state_dict accepts the released fastMRI state dict or a Lightning
-  checkpoint written by ../training/train_wandb.py. The architecture
-  (cascades, channels, pools) is read from the file, so a checkpoint trained
-  with 8 cascades and the released 12-cascade model load the same way. The
-  --num_cascades/--chans/... flags only matter with --random_init.
+  --state_dict accepts the released fastMRI state dict, a Lightning
+  checkpoint written by ../training/train_wandb.py, or one written by
+  ../dpi/train_dpi.py. The architecture (cascades, channels, pools) is read
+  from the file, so a checkpoint trained with 8 cascades and the released
+  12-cascade model load the same way. A DPI checkpoint is recognised by its
+  `lambda_table.phi` tensor; its DPI settings come from the checkpoint's
+  hyper_parameters, and the model is then given the nominal acceleration of
+  each pass exactly as DPIVarNetModule passes batch.acceleration in training
+  (`dpi_varnet.py` must be importable: ../dpi from a checkout, or transferred
+  next to this file in a job). The --num_cascades/--chans/... flags only
+  matter with --random_init.
 
 W&B
 ---
@@ -452,14 +458,79 @@ def infer_arch(state: Dict) -> Dict[str, int]:
                 sens_pools=sens_pools, sens_chans=sens_chans)
 
 
-def load_state(sd_path: Path) -> Dict:
-    """torch.load either the released state dict or a Lightning checkpoint."""
+ARCH_KEYS = ("num_cascades", "pools", "chans", "sens_pools", "sens_chans")
+# DPIVarNet constructor arguments that cannot be read back from tensor
+# shapes; DPIVarNetModule.save_hyperparameters() puts them in the checkpoint.
+DPI_HPARAMS = ("dpi_sens", "lambda_length", "accel_min", "accel_max", "lambda_spacing")
+
+
+def load_state(sd_path: Path) -> Tuple[Dict, Dict]:
+    """torch.load either the released state dict or a Lightning checkpoint.
+
+    Returns (network state dict, hyper_parameters). A Lightning checkpoint
+    from ../training or ../dpi holds the whole module, not just the network:
+    the network sits under the `varnet.` prefix, next to the SSIM loss buffer
+    (`loss.w`) and anything else the module registered. Only the `varnet.`
+    subtree is selected and its prefix stripped, so a strict load into the
+    bare network works. The released state dict is returned as is, with no
+    hyper-parameters.
+    """
     import torch
-    state = torch.load(str(sd_path), map_location="cpu")
-    if isinstance(state, dict) and "state_dict" in state:  # a Lightning checkpoint
-        state = {k[len("varnet."):] if k.startswith("varnet.") else k: v
-                 for k, v in state["state_dict"].items()}
-    return state
+    raw = torch.load(str(sd_path), map_location="cpu")
+    if isinstance(raw, dict) and "state_dict" in raw:  # a Lightning checkpoint
+        hparams = dict(raw.get("hyper_parameters") or {})
+        state = {k[len("varnet."):]: v for k, v in raw["state_dict"].items() if k.startswith("varnet.")}
+        if not state:
+            raise KeyError(f"{sd_path}: Lightning checkpoint without 'varnet.*' keys; "
+                           "not a VarNetModule / DPIVarNetModule checkpoint")
+        return state, hparams
+    return raw, {}
+
+
+def is_dpi_state(state: Dict) -> bool:
+    """A DPIVarNet state dict carries the interpolation vector; a VarNet one never does."""
+    return "lambda_table.phi" in state
+
+
+def import_dpi_varnet():
+    """`dpi_varnet` from cwd (a job sandbox, where verify.sub transfers it flat) or ../dpi (a checkout)."""
+    try:
+        import dpi_varnet  # noqa: F401
+    except ImportError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "dpi"))
+        import dpi_varnet  # noqa: F401
+    return dpi_varnet
+
+
+def build_from_state(state: Dict, hparams: Dict, sd_path: Path):
+    """Instantiate the network a state dict belongs to (VarNet or DPIVarNet) and load it strictly.
+
+    Both networks name their tensors identically (DPIVarNet keeps VarNet's
+    attribute names and adds `*_copy` and `lambda_table.phi`), so
+    infer_arch reads the sizes from either. The DPI-only settings come from
+    the checkpoint's hyper_parameters and are recorded in `arch` next to the
+    sizes, so the report says exactly what was scored.
+    """
+    from fastmri.models import VarNet
+
+    arch = infer_arch(state)
+    if is_dpi_state(state):
+        missing = [k for k in DPI_HPARAMS if k not in hparams]
+        if missing:
+            raise KeyError(f"{sd_path.name} is a DPI checkpoint but its hyper_parameters lack {missing}; "
+                           "was it written by DPIVarNetModule (which calls save_hyperparameters)?")
+        arch.update(model="dpi_varnet", **{k: hparams[k] for k in DPI_HPARAMS})
+        DPIVarNet = import_dpi_varnet().DPIVarNet
+        model = DPIVarNet(num_cascades=arch["num_cascades"], sens_chans=arch["sens_chans"],
+                          sens_pools=arch["sens_pools"], chans=arch["chans"], pools=arch["pools"],
+                          dpi_sens=bool(arch["dpi_sens"]), lambda_length=int(arch["lambda_length"]),
+                          accel_min=float(arch["accel_min"]), accel_max=float(arch["accel_max"]),
+                          lambda_spacing=str(arch["lambda_spacing"]))
+    else:
+        arch["model"] = "varnet"
+        model = VarNet(**{k: arch[k] for k in ARCH_KEYS})
+    model.load_state_dict(state, strict=True)
+    return model, arch
 
 
 def load_model(args, device):
@@ -470,8 +541,8 @@ def load_model(args, device):
 
     if args.random_init:
         log("--random_init: using an untrained model (harness smoke test only, numbers are meaningless)")
-        arch, source = cli_arch, "random_init"
-        model = VarNet(**arch)
+        arch, source = dict(cli_arch, model="varnet"), "random_init"
+        model = VarNet(**cli_arch)
     else:
         sd_path = Path(args.state_dict)
         if not sd_path.exists():
@@ -479,14 +550,12 @@ def load_model(args, device):
                 raise FileNotFoundError(
                     f"{sd_path} not found. Pass --download_state_dict or stage it via transfer_input_files.")
             download(STATE_DICT_URL, sd_path)
-        state = load_state(sd_path)
-        arch = infer_arch(state)
-        if arch != cli_arch:
+        state, hparams = load_state(sd_path)
+        model, arch = build_from_state(state, hparams, sd_path)
+        if {k: arch[k] for k in ARCH_KEYS} != cli_arch:
             log(f"architecture read from {sd_path.name}: {arch} (CLI flags {cli_arch} ignored)")
-        model = VarNet(**arch)
-        model.load_state_dict(state, strict=True)
         source = "pretrained"
-        log(f"loaded {sd_path} ({sum(p.numel() for p in model.parameters())/1e6:.2f}M params)")
+        log(f"loaded {sd_path} ({sum(p.numel() for p in model.parameters())/1e6:.2f}M params, {arch['model']})")
 
     return model.eval().to(device), arch, source
 
@@ -544,8 +613,15 @@ def crop_like_evaluate(target: np.ndarray, pred: np.ndarray) -> Tuple[np.ndarray
     return (T.center_crop(target, (side, side)), T.center_crop(pred, (side, side)))
 
 
-def run_volume(model, ds, indices: List[int], device, num_workers: int, zero_filled: bool = True):
-    """Reconstruct one volume slice by slice. Returns (target, recon, zf) as (S, H, W) numpy."""
+def run_volume(model, ds, indices: List[int], device, num_workers: int, zero_filled: bool = True,
+               acceleration: Optional[float] = None):
+    """Reconstruct one volume slice by slice. Returns (target, recon, zf) as (S, H, W) numpy.
+
+    `acceleration` is the nominal rate handed to a DPIVarNet (None for a
+    plain VarNet, which takes no rate). It is the rate the pass forced, or
+    for the mixed pass the rate the volume's own filename seed drew: the
+    same value DPIVarNetDataTransform records for that sample in training.
+    """
     import torch
     from torch.utils.data import DataLoader, Subset
     from fastmri.data import transforms as T
@@ -563,8 +639,13 @@ def run_volume(model, ds, indices: List[int], device, num_workers: int, zero_fil
             nlf = batch.num_low_frequencies
             if torch.is_tensor(nlf):
                 nlf = nlf.to(device)
-            # Same call as VarNetModule.forward, the signature the model was trained under.
-            out = model(mk, mask, nlf).cpu()
+            if acceleration is None:
+                # Same call as VarNetModule.forward, the signature the model was trained under.
+                out = model(mk, mask, nlf).cpu()
+            else:
+                # Same call as DPIVarNetModule.forward at batch size 1: one rate per forward.
+                accel = torch.tensor([float(acceleration)], device=device)
+                out = model(mk, mask, nlf, accel).cpu()
             if out.shape[-1] < crop[1]:  # brain FLAIR 203 special case, kept for parity
                 crop = (out.shape[-1], out.shape[-1])
             out = T.center_crop(out, crop)[0]
@@ -665,10 +746,22 @@ def tier1(args) -> int:
     log(f"{len(files)} volumes selected from {data_path}")
 
     model, arch, model_source = load_model(args, device)
+    # A DPI checkpoint is conditioned on the rate, so every forward below gets
+    # the nominal acceleration of its pass. lambda(R) at the scored rates is
+    # recorded with the run: it is what says whether the conditioning moved.
+    conditioned = arch.get("model") == "dpi_varnet"
+    lambda_at_rates: Dict[str, float] = {}
+    if conditioned:
+        with torch.no_grad():
+            lam = model.lambda_table(torch.tensor([float(R) for R in args.accelerations], device=device))
+        lambda_at_rates = {f"R{R}": float(v) for R, v in zip(args.accelerations, lam.tolist())}
+        log("DPI checkpoint: each pass hands the model its nominal rate; lambda(R) = "
+            + "  ".join(f"{k}={v:.4f}" for k, v in lambda_at_rates.items()))
     run_id = args.run_name or f"tier1-{model_source}-{time.strftime('%Y%m%d-%H%M%S')}"
     config = dict(vars(args), arch=arch, model_source=model_source, device=str(device),
                   n_volumes=len(files), fastmri_sha=git_sha_of(args.fastmri_repo),
-                  container_image=os.environ.get("VERIFY_IMAGE", ""))
+                  container_image=os.environ.get("VERIFY_IMAGE", ""),
+                  conditioned_on_rate=conditioned, lambda_at_rates=lambda_at_rates)
     wb = WandB(args, "tier1", run_id, config)
 
     per_rate: Dict[int, Dict] = {}
@@ -693,19 +786,21 @@ def tier1(args) -> int:
         t0 = time.time()
         for vi, fname in enumerate(files):
             idx = by_volume[fname]
-            target, recon, zf = run_volume(model, ds, idx, device, args.num_workers)
+            cf_v, R_v = rate_of(fname)
+            accel = float(R_v) if conditioned else None
+            target, recon, zf = run_volume(model, ds, idx, device, args.num_workers, acceleration=accel)
             if target.shape != recon.shape:
                 # evaluate.py would still square-crop, but a mismatch here is worth surfacing
                 log(f"note: {fname} target {target.shape} vs recon {recon.shape} (will square-crop)")
             m = volume_metrics(target, recon)
             mz = volume_metrics(target, zf)
-            cf_v, R_v = rate_of(fname)
             row = dict(fname=fname, n_slices=int(target.shape[0]), acceleration=R_v, center_fraction=cf_v,
                        **m, **{f"zf_{k}": v for k, v in mz.items()})
             rows.append(row)
 
             if vi < args.determinism_volumes:
-                _, recon2, _ = run_volume(model, ds, idx, device, args.num_workers, zero_filled=False)
+                _, recon2, _ = run_volume(model, ds, idx, device, args.num_workers, zero_filled=False,
+                                          acceleration=accel)
                 maxdiff = float(np.max(np.abs(recon - recon2)))
                 m2 = volume_metrics(target, recon2)
                 det_records.append(dict(fname=fname, max_abs_diff=maxdiff,

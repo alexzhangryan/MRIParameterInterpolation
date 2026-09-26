@@ -89,3 +89,8 @@ e2evarnetpaper
 .DS_Store
 Thumbs.db
 *.swp
+
+# verification smoke-test artefacts (toy checkpoints, brain-shaped synthetic tarball staging)
+verification/ckpttest/
+verification/.brainpack/
+verification/evicttest/

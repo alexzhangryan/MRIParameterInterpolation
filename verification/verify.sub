@@ -9,16 +9,20 @@
 # the W&B key is exported, and proves with -dry-run that the preset reached
 # the job ad.
 #
-#   ./submit.sh model1                     4x only, released weights, val subset
-#   ./submit.sh model2                     2x/4x/6x/8x, every rate scored over the val subset
-#   ./submit.sh model1 ckpt=../training/runs/model1/123/checkpoints/last.ckpt    score a checkpoint you trained
-#   ./submit.sh tier1                      the Claim A sweep: random masks 4x/8x, full 199-volume val
-#   ./submit.sh model1 volume_limit=5 extra_args="--num_workers 0"
+#   ./submit.sh model2 ckpt=../training/runs/brain/model2/123/checkpoints/last.ckpt run_name=verify-model2-brain
+#                                          the trained baseline at 2x/4x/6x/8x plus the mixed pass, brain val batch 0
+#   ./submit.sh model2 ckpt=../dpi/runs/brain/dpi/456/checkpoints/last.ckpt run_name=verify-dpi-brain
+#                                          the same for a DPI checkpoint (the harness detects it)
+#   ./submit.sh model1                     4x only, released knee weights (a knee model on brain data: a sanity row)
+#   ./submit.sh tier1                      the Claim A sweep: random masks 4x/8x, knee full 199-volume val
+#   ./submit.sh model2 volume_limit=5 extra_args="--num_workers 0" ckpt=...
+#   ./submit.sh model2 dataset=knee staging=/staging/a/apryan3/fastmri val_data=file:///staging/a/apryan3/fastmri/knee_multicoil_val_subset.tar request_disk=60GB
+#                                          the 2026-09 knee subset, for the record
 #
-# `staging` is this account's personal /staging directory on ap2001
-# (confirmed writable 2026-09-10). If access to
-# /staging/groups/kamilov_group/Kamilov-SciAI-datasets is granted later, this
-# one macro is the only thing to repoint.
+# `dataset` / `staging` default to the fastMRI brain set in the group
+# directory, as train.sub does since 2026-09-18. The knee material in this
+# account's personal staging (`knee_staging`) is only used for the released
+# knee checkpoint that `ckpt` defaults to and for the knee presets above.
 
 # --- how the defaults in this file work --------------------------------------
 # Every macro below is a DEFAULT ONLY and is wrapped in `if ! defined`. That
@@ -32,8 +36,14 @@
 # and logged into the varnet-model1 W&B run (see train.sub). So: any knob
 # meant to be overridable from the command line gets the guard, and submit.sh
 # re-checks the resolved job ad with -dry-run before it submits.
+if ! defined dataset
+  dataset = brain
+endif
 if ! defined staging
-  staging = /staging/a/apryan3/fastmri
+  staging = /staging/groups/kamilov_group/Kamilov-SciAI-datasets/fastMRI_brain
+endif
+if ! defined knee_staging
+  knee_staging = /staging/a/apryan3/fastmri
 endif
 # 2026-09-18 tag: wandb 0.26.1, which accepts W&B's current 86-character API
 # keys (the 2026-09 tag's wandb 0.18.7 does not). Build and push with
@@ -83,26 +93,30 @@ executable      = run_verify.sh
 
 # --- input files -------------------------------------------------------------
 # Large inputs live in /staging and are transferred into the job scratch by
-# HTCondor, never read directly. The default is the 20-volume val subset built
-# by ../training/README.md section 3b (subset_val.sub), the same file
-# train.sub validates against and all that fits under the 100 GB /staging
-# quota. The full 199-volume split, while it is still staged, is
-#   ./submit.sh tier1                    (preset: val_data=...knee_multicoil_val.tar.xz request_disk=320GB)
-# CHTC's size rule: osdf:///chtc/staging/<path> for 1-30 GB inputs,
-# file:///staging/<path> from 30 GB up; file:// works for both.
+# HTCondor, never read directly (and never extracted there: the group
+# directory has a 10,000-item cap). The default is NYU's
+# brain_multicoil_val_batch_0.tar.xz (460 volumes, ~100 GB compressed), the
+# same file train.sub validates against, so every checkpoint is scored on the
+# volumes it was validated on. The knee subset of 2026-09 is the
+# dataset=knee example at the top. CHTC's size rule: osdf:///chtc/staging/<path>
+# for 1-30 GB inputs, file:///staging/<path> from 30 GB up; file:// works for both.
 #
 # `ckpt` is the checkpoint to score: the released fastMRI knee model by
 # default, or a Lightning checkpoint from ../training
-# (ckpt=../training/runs/model1/<Cluster>/checkpoints/last.ckpt). run_verify.sh
-# picks up whatever *.pt / *.ckpt lands in the sandbox, and verify_varnet.py
-# reads the architecture (cascades, channels, pools) from the file itself.
+# (ckpt=../training/runs/brain/model2/<Cluster>/checkpoints/last.ckpt) or
+# from ../dpi (ckpt=../dpi/runs/brain/dpi/<Cluster>/checkpoints/last.ckpt).
+# run_verify.sh picks up whatever *.pt / *.ckpt lands in the sandbox, and
+# verify_varnet.py reads the architecture (cascades, channels, pools, and
+# for a DPI checkpoint its lambda settings) from the file itself.
+# ../dpi/dpi_varnet.py travels with the harness (HTCondor drops it flat in
+# the sandbox by basename) so a DPI checkpoint can be rebuilt there.
 if ! defined val_data
-  val_data = file://$(staging)/knee_multicoil_val_subset.tar
+  val_data = file://$(staging)/$(dataset)_multicoil_val_batch_0.tar.xz
 endif
 if ! defined ckpt
-  ckpt = file://$(staging)/knee_leaderboard_state_dict.pt
+  ckpt = file://$(knee_staging)/knee_leaderboard_state_dict.pt
 endif
-transfer_input_files = verify_varnet.py, $(val_data), $(ckpt)
+transfer_input_files = verify_varnet.py, ../dpi/dpi_varnet.py, $(val_data), $(ckpt)
 should_transfer_files    = YES
 # ON_EXIT_OR_EVICT: output/ (partial results, the W&B run) comes back even
 # when the job is evicted, the same as train.sub.
@@ -112,7 +126,7 @@ when_to_transfer_output  = ON_EXIT_OR_EVICT
 # output/tier1_report.json, output/per_volume_R<N>.csv, output/results.csv,
 # output/wandb/ (offline run if no key)
 transfer_output_files   = output
-transfer_output_remaps  = "output = runs/$(model)/$(Cluster)"
+transfer_output_remaps  = "output = runs/$(dataset)/$(model)/$(Cluster)"
 
 # --- secrets -----------------------------------------------------------------
 # Only these names are copied from the submitting shell, and only if set. The
@@ -124,10 +138,11 @@ environment     = "WANDB_PROJECT=fastmri-varnet-verify"
 # --- resources ---------------------------------------------------------------
 # Same slot class as train.sub. request_disk covers peak scratch during
 # extraction: run_verify.sh deletes a tarball only after `xz | tar` finishes,
-# so compressed + extracted coexist. The 20 GB val subset is a plain .tar
-# (extracts to ~20 GB), so 60 GB is comfortable; the full .xz split needs
-# 93.8 GB + ~192 GB (the tier1 preset passes 320GB). Size it from the tarball
-# actually staged (du -sh on /staging) and override on the command line.
+# so compressed + extracted coexist. A ~100 GB NYU .xz batch extracts to
+# roughly twice that (the knee full split: 93.8 GB + ~192 GB), hence 320 GB
+# for brain val batch 0 as for the knee tier1 preset. The 20 GB knee subset
+# is a plain .tar and is fine with request_disk=60GB. Size it from the
+# tarball actually staged (du -sh on /staging) and override on the command line.
 #
 # HasCHTCStaging selects slots that can read /staging inputs. bad_nodes is the
 # escape hatch for an execute node whose GPU stack is broken in a way that is
@@ -155,7 +170,7 @@ endif
 request_cpus    = $(cpus)
 request_memory  = $(mem)
 if ! defined request_disk
-  request_disk = 60GB
+  request_disk = 320GB
 endif
 if ! defined request_gpus
   request_gpus = 1
@@ -167,8 +182,10 @@ gpus_minimum_capability = 7.0
 # image is available for execution on the device" at the first kernel launch.
 gpus_maximum_capability = 9.0
 +WantGPULab     = true
-# Inference only: the val subset at four rates is minutes to an hour, the full
-# split a few hours, so "short" queues faster than training's "long".
+# Inference only. Brain val batch 0 through model2's five passes (R2, R4, R6,
+# R8, mixed) is about 2.5-4 h of inference after ~1-2 h of transfer and
+# extraction, inside the 12 h "short" class, which queues faster than
+# training's "long".
 if ! defined gpu_job_length
   gpu_job_length = "short"
 endif
@@ -185,9 +202,9 @@ max_retries     = 5
 periodic_release = (HoldReasonCode == 6 || HoldReasonCode == 13) && (NumSystemHolds < 5) && ((time() - EnteredCurrentStatus) > 300)
 
 # --- logs ------------------------------------------------------------------
-log             = logs/$(model)_$(Cluster).log
-output          = logs/$(model)_$(Cluster)_$(Process).out
-error           = logs/$(model)_$(Cluster)_$(Process).err
+log             = logs/$(dataset)_$(model)_$(Cluster).log
+output          = logs/$(dataset)_$(model)_$(Cluster)_$(Process).out
+error           = logs/$(dataset)_$(model)_$(Cluster)_$(Process).err
 stream_output   = True
 stream_error    = True
 

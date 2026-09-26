@@ -4,11 +4,17 @@ Runbook for evaluating a checkpoint on `multicoil_val`. It is the same
 setup as `../training/` on purpose: the same Docker recipe, the same
 `submit.sh model1|model2` presets (`make verify-model1` here is `make submit-model1` there), a `train.sub`-shaped submit file with the
 same guarded macros, the same `run_*.sh` job executable with the same
-eviction handling, the same `logs/` and `runs/<model>/<Cluster>/` layout,
-the same resources, the same shared `../.env`. The one difference is what
-runs inside the job: `verify_varnet.py` **loads a checkpoint and scores it**
-instead of training one from scratch. If you know `training/README.md`,
+eviction handling, the same `logs/` and `runs/<dataset>/<model>/<Cluster>/`
+layout, the same resources, the same shared `../.env`. The one difference is
+what runs inside the job: `verify_varnet.py` **loads a checkpoint and scores
+it** instead of training one from scratch. If you know `training/README.md`,
 sections 4 and 6 here are the new material.
+
+*Status 2026-09-25: repointed to the fastMRI **brain** val batch 0 in the
+group staging directory (the data training validates on since 2026-09-18)
+and taught to score a `../dpi/` checkpoint; both proven locally by `make
+smoke-ckpt` and `make job-smoke`. This is the harness that produces the
+per-rate numbers (ROADMAP Phase C, block A). Section 4.4 is the command.*
 
 Nothing here modifies `fastMRI/`, `parameter_interpolation/`, or any file
 outside this directory. It imports the `fastmri` package as installed in the
@@ -23,14 +29,16 @@ produced a real number yet.*
 
 | Preset | `accelerations` | `center_fractions` | `mask_type` | Data | What the job does |
 |---|---|---|---|---|---|
-| **model1** | `4` | `0.08` | `equispaced_fraction` | val subset (20 vol) | `make verify-model1`: score the checkpoint at 4x. Pairs with `training: make submit-model1`. |
-| **model2** | `2 4 6 8` | `0.16 0.08 0.0533 0.04` | `equispaced_fraction` | val subset (20 vol) | `make verify-model2`: one full pass per rate, **plus** a mixed pass that draws one rate per volume the way training validates. Pairs with `training: make submit-model2`. |
-| **tier1** | `4 8` | `0.08 0.04` | `random` | full val (199 vol) | The `VERIFICATION.md` Claim A sweep: the fastMRI knee convention the third-party reference values are keyed on. PASS / INVESTIGATE / FAIL verdicts. |
+| **model1** | `4` | `0.08` | `equispaced_fraction` | brain val batch 0 (460 vol) | `make verify-model1`: score the checkpoint at 4x. Pairs with `training: make submit-model1`. |
+| **model2** | `2 4 6 8` | `0.16 0.08 0.0533 0.04` | `equispaced_fraction` | brain val batch 0 (460 vol) | `make verify-model2`: one full pass per rate, **plus** a mixed pass that draws one rate per volume the way training validates. Pairs with `training: make submit-model2` and with `dpi: make submit`. |
+| **tier1** | `4 8` | `0.08 0.04` | `random` | knee full val (199 vol) | The `VERIFICATION.md` Claim A sweep: the fastMRI knee convention the third-party reference values are keyed on. PASS / INVESTIGATE / FAIL verdicts. |
 | **tier0** | | | | none | Environment checks + the fastMRI test suite on a GPU node. Once per image tag. |
 
 model1 / model2 are training's lists, paired elementwise by
 `fastmri.data.subsample.MaskFunc`, under training's mask family and on the
-same 20-volume val subset training validates against.
+same `brain_multicoil_val_batch_0` volumes training validates against
+(`dataset=knee` plus `staging=`/`val_data=` overrides reach the 2026-09 knee
+subset; see the examples at the top of `verify.sub`).
 
 ### Per-rate and mixed: model 2 reports both
 
@@ -73,22 +81,32 @@ it. A single-rate job (model1, tier0) skips it automatically, since there it
 would just repeat the one per-rate pass.
 
 **Which checkpoint.** By default the released fastMRI knee model
-(`knee_leaderboard_state_dict.pt`, 12 cascades) staged next to the data:
-that is "pretrained instead of trained from scratch", and it is the only
-thing with third-party reference numbers to be judged against. Pass
-`ckpt=../training/runs/model1/<Cluster>/checkpoints/last.ckpt` to score a
-checkpoint you trained instead (section 4.4). The harness reads the
-architecture (cascades, channels, pools) out of the file, so the 8-cascade
-training checkpoints and the 12-cascade released one load through the same
-path.
+(`knee_leaderboard_state_dict.pt`, 12 cascades) in personal staging: that
+is "pretrained instead of trained from scratch", and it is the only thing
+with third-party reference numbers to be judged against (on brain data it is
+only a sanity row, and `submit.sh` says so when no `ckpt=` is given). Pass
+`ckpt=../training/runs/brain/model2/<Cluster>/checkpoints/last.ckpt` to score
+the baseline you trained, or `ckpt=../dpi/runs/brain/dpi/<Cluster>/checkpoints/last.ckpt`
+for a DPI checkpoint (section 4.4). The harness reads the architecture
+(cascades, channels, pools) out of the file, so all of them load through the
+same path. A DPI checkpoint is recognised by its `lambda_table.phi` tensor:
+the harness rebuilds `DPIVarNet` from the checkpoint's hyper-parameters
+(`dpi_sens`, `lambda_length`, `accel_min`, `accel_max`, `lambda_spacing`)
+and hands every forward the nominal rate of its pass, which is exactly what
+`DPIVarNetModule` passes as `batch.acceleration` in training: the forced
+rate in an `R<N>` pass, the filename-drawn rate in the mixed pass. It also
+logs `lambda(R)` at the scored rates (`config.lambda_at_rates` in the
+report), the number that says whether the conditioning moved at all.
+`verify.sub` transfers `../dpi/dpi_varnet.py` next to the harness for this.
 
 ## Files
 
 | File | Runs where | Purpose | Training counterpart |
 |---|---|---|---|
 | `verify_varnet.py` | inside the job (or any `fastmri` env) | The harness. `tier0` (environment checks) and `tier1` (score a checkpoint). | `train_wandb.py` |
-| `run_verify.sh` | inside the job | Job executable: extracts the tarball, finds the split, finds the checkpoint, runs the harness, survives a vacate, collects `output/`. | `run_train.sh` |
-| `verify.sub` | access point | HTCondor submit file, container universe, every default guarded with `if ! defined`. Model 1 defaults; the other presets via macros. | `train.sub` |
+| `run_verify.sh` | inside the job | Job executable: extracts any `*multicoil_*.tar(.xz)` (NYU brain batch or knee), finds `multicoil_val/`, finds the checkpoint, runs the harness, survives a vacate, collects `output/`. | `run_train.sh` |
+| `verify.sub` | access point | HTCondor submit file, container universe, every default guarded with `if ! defined`. Brain val batch 0, model 1 defaults; the other presets via macros. Transfers `../dpi/dpi_varnet.py` with the harness. | `train.sub` |
+| `make_tiny_ckpt.py` | laptop | Toy `VarNetModule` and `DPIVarNetModule` checkpoints in Lightning's format, for `make smoke-ckpt` / `make job-smoke`. | |
 | `verify_tier0.sub` | access point | Tier 0 on a GPU node, no data. | |
 | `submit.sh` | access point | `./submit.sh model1\|model2\|tier1\|tier0 [name=value ...]`. Sources `../.env`, refuses to submit without a W&B key unless `OFFLINE=1`, proves with `-dry-run` that the preset reached the job ad. | `submit.sh` |
 | `Makefile` | laptop + access point | `make build/push/tier0/smoke/job-smoke/job-evict` (Docker) and `make verify-*/status/logs/why` (condor). | `Makefile` |
@@ -128,9 +146,12 @@ unaffected.
   history (ROADMAP.md security note). Put the new one in `../.env` (from
   `../.env.example`, `chmod 600`); `submit.sh` and the `make data` /
   `make tier1` targets source it. It is never written to a `.sub` file.
-- `verify.sub` expects `/staging/a/apryan3/fastmri/knee_multicoil_val_subset.tar`
-  (or the full `.tar.xz` for `tier1`) and `knee_leaderboard_state_dict.pt`
-  (section 3a).
+- `verify.sub` expects `brain_multicoil_val_batch_0.tar.xz` in the group
+  staging directory (`/staging/groups/kamilov_group/Kamilov-SciAI-datasets/fastMRI_brain/`,
+  placed there by `prepare_brain_staging.sh`) and, for the released-weights
+  default only, `knee_leaderboard_state_dict.pt` in
+  `/staging/a/apryan3/fastmri/` (section 3a). The knee presets need the knee
+  tarballs there too.
 - Docker Desktop running on the laptop, logged in to Docker Hub.
 
 ## 1. Laptop: build and push the image (once per tag)
@@ -284,13 +305,14 @@ make logs                          # tail -f the newest logs/*.out
 
 `submit.sh` first prints `job args: tier1 --run_name verify-model1
 --accelerations 4 ...` and the four resolved `Request*` values (8 CPUs,
-48 GB, 60 GB, 1 GPU), then submits. The `.out` must show
-`[run_verify] multicoil_val: 20 volumes`,
+48 GB, 320 GB, 1 GPU), then submits. The `.out` must show
+`[run_verify] multicoil_val: 460 volumes`,
 `[run_verify] checkpoint: knee_leaderboard_state_dict.pt`, `loaded ...
-(29.9M params)` and per-volume progress lines with a running SSIM. When it
-finishes, `runs/model1/<Cluster>/tier1_report.json` must exist and
-`condor_q` must not show the job held (section 5). That `<Cluster>`
-directory is a throwaway.
+(29.94M params, varnet)` and per-volume progress lines with a running SSIM.
+When it finishes, `runs/brain/model1/<Cluster>/tier1_report.json` must exist
+and `condor_q` must not show the job held (section 5). That `<Cluster>`
+directory is a throwaway. Note the fixed cost: even with `volume_limit=5`
+the job transfers and extracts the ~100 GB batch first (an hour or two).
 
 ### 4.3 The presets
 
@@ -301,27 +323,43 @@ make verify-tier1                  # accelerations="4 8"     center_fractions="0
 ```
 
 Run names and W&B runs: `verify-model1`, `verify-model2`, `verify-tier1`.
-Output lands in `runs/<preset>/<Cluster>/`. All three score the released
-checkpoint unless told otherwise.
+Output lands in `runs/<dataset>/<preset>/<Cluster>/` (`runs/brain/...` by
+default, `runs/knee/tier1/...`). All three score the released checkpoint
+unless told otherwise.
 
-### 4.4 Scoring a checkpoint you trained
+### 4.4 Scoring a checkpoint you trained: the per-rate numbers
 
 The point of matching the training setup. When `../training/` has produced
-`runs/model1/<Cluster>/checkpoints/last.ckpt`, score it under the same rate
-list and val subset it was trained against:
+`runs/brain/model2/<Cluster>/checkpoints/last.ckpt` (or `../dpi/` its
+`runs/brain/dpi/<Cluster>/checkpoints/last.ckpt`), score it under the same
+rate list and on the same val volumes it was trained against:
 
 ```bash
-make verify MODEL=model1 ARGS='ckpt=../training/runs/model1/<Cluster>/checkpoints/last.ckpt run_name=verify-model1-trained'
-make verify MODEL=model2 ARGS='ckpt=../training/runs/model2/<Cluster>/checkpoints/last.ckpt run_name=verify-model2-trained'
+# the blind baseline ("mixed acceleration brain")
+make verify MODEL=model2 ARGS='ckpt=../training/runs/brain/model2/<Cluster>/checkpoints/last.ckpt run_name=verify-model2-brain'
+# a DPI checkpoint: same command, the harness detects it
+make verify MODEL=model2 ARGS='ckpt=../dpi/runs/brain/dpi/<Cluster>/checkpoints/last.ckpt run_name=verify-dpi-brain'
 ```
+
+Each job runs five passes over the 460 volumes: R2, R4, R6, R8 (every
+volume forced to that rate) and the mixed pass (one rate per volume, as
+training validates). Budget 4 to 6 hours of wall clock once it starts: ~1-2 h
+to transfer and extract the batch, then roughly 30-45 min per pass; the
+`.out` prints `s/volume` after ten volumes, so the real figure is known
+early. It fits the default `gpu_job_length = "short"` (12 h) class.
 
 `submit.sh` checks the file exists, HTCondor transfers it into the sandbox,
 `run_verify.sh` hands whatever `*.pt` / `*.ckpt` it finds to the harness,
 and the harness prints `architecture read from last.ckpt: {'num_cascades':
-8, ...}` before loading. A trained checkpoint has no reference values, so
-its rates are "recorded only"; the invariants (determinism, beats
-zero-filled, volume count, SSIM monotone in R) still run. `run_name` is
-given explicitly so it does not continue the released-checkpoint W&B run.
+12, ..., 'model': 'varnet'}` (or `'dpi_varnet'` plus the lambda settings)
+before loading. A trained checkpoint has no reference values, so its rates
+are "recorded only"; the invariants (determinism, beats zero-filled, volume
+count, SSIM monotone in R) still run. `run_name` is given explicitly so it
+does not continue the released-checkpoint W&B run. The per-rate table for
+the meeting is read from `tier1_report.json` (`per_rate.R<N>.aggregate`)
+and the paired per-volume comparison from the two jobs'
+`per_volume_R<N>.csv` files, which list the same 460 filenames in the same
+order.
 
 ### 4.5 Overrides
 
@@ -336,10 +374,10 @@ editing the file. `extra_args` is appended verbatim to `verify_varnet.py`
 
 Resources are the training ones (8 CPUs, 48 GB, a 24 GB GPU of capability
 7.0 to 9.0) so both jobs land on the same class of slot; `request_disk`
-defaults to 60 GB for the plain-tar subset and the `tier1` preset passes
-320 GB for the `.xz` full split (93.8 GB + ~192 GB extracted coexist).
-Inference needs less than training: `mem=32GB` widens the pool of matching
-slots if the queue is slow.
+defaults to 320 GB because a ~100 GB NYU `.xz` batch and its extraction
+(about twice that) coexist until the tarball is deleted; the 20 GB knee
+subset is fine with `request_disk=60GB`. Inference needs less than
+training: `mem=32GB` widens the pool of matching slots if the queue is slow.
 
 ## 5. Monitor
 
@@ -357,8 +395,8 @@ name with `resume="allow"`, so a resubmitted job continues the same W&B run;
 pass a new `run_name` for a genuinely new one. Per-rate aggregates, the
 per-volume table, example target / reconstruction / zero-filled / error
 images, the reference comparison and every invariant land there. Without a
-key the run is written offline to `runs/<model>/<Cluster>/wandb/` and
-`wandb sync <that dir>/offline-run-*` uploads it later.
+key the run is written offline to `runs/<dataset>/<model>/<Cluster>/wandb/`
+and `wandb sync <that dir>/offline-run-*` uploads it later.
 
 **The symlink hold.** A job that finishes and then goes on hold with
 `Transfer output files failure ... Transfer of symlinks to directories is
@@ -372,10 +410,12 @@ stalled `/staging` read) are released automatically up to five times by
 
 ## 6. What comes back, and the verdicts
 
-`runs/<model>/<Cluster>/` (the job's `output/`):
+`runs/<dataset>/<model>/<Cluster>/` (the job's `output/`):
 
 - `tier1_report.json`: every check, its verdict, the config, the
-  architecture that was loaded
+  architecture that was loaded (`arch.model` is `varnet` or `dpi_varnet`;
+  for the latter `config.lambda_at_rates` holds lambda(R) at the scored
+  rates)
 - `per_volume_R<N>.csv`: SSIM / PSNR / NMSE / MSE per volume, model and
   zero-filled, one file per rate
 - `per_volume_mixed.csv`: the same columns for the mixed pass, with each

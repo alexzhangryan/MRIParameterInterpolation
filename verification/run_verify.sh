@@ -2,7 +2,7 @@
 # run_verify.sh: HTCondor job executable. Runs inside the container on the
 # execute node with the job scratch directory as cwd. Same structure as
 # ../training/run_train.sh: the same environment block, the same extract(),
-# the same data/knee/<split> layout, the same eviction handling, the same
+# the same data/fastmri/<split> layout, the same eviction handling, the same
 # output/ contract.
 #
 #   run_verify.sh tier1 [verify_varnet.py args]     score a checkpoint on multicoil_val
@@ -10,13 +10,17 @@
 #
 # Expects, in cwd (delivered by transfer_input_files):
 #   verify_varnet.py
-#   knee_multicoil_val*.tar.xz | *.tar       validation split                (tier1)
+#   dpi_varnet.py                            so a ../dpi checkpoint can be scored
+#   *multicoil_val*.tar.xz | *.tar           validation split (tier1): NYU's brain
+#                                            brain_multicoil_val_batch_0.tar.xz or a
+#                                            knee_multicoil_val*.tar(.xz); both unpack
+#                                            to a multicoil_val/ directory
 #   *.pt | *.ckpt                            the checkpoint to score. Absent -> the
 #                                            released fastMRI knee checkpoint is downloaded
 #   output/                                  optional: brought back by HTCondor after an
 #                                            eviction (when_to_transfer_output = ON_EXIT_OR_EVICT)
 # Produces output/ (report JSON, per-volume CSVs, results.csv, wandb/) which
-# verify.sub transfers back to runs/<model>/<Cluster>/.
+# verify.sub transfers back to runs/<dataset>/<model>/<Cluster>/.
 #
 # Environment (set by verify.sub from the submit shell, never hardcoded here):
 #   WANDB_API_KEY   optional. Absent -> W&B offline, run saved under output/wandb
@@ -29,7 +33,7 @@ set -uo pipefail
 TIER="${1:-tier1}"
 shift || true
 
-mkdir -p output data/knee
+mkdir -p output data/fastmri
 
 # Keep every W&B / cache write inside scratch. CHTC containers do not have a
 # writable home, and nothing here should depend on one.
@@ -56,7 +60,9 @@ if [ "$TIER" = "tier0" ]; then
 else
   # ---- data -----------------------------------------------------------------
   # Extract every tarball in cwd into data/, then expose the split directory
-  # under data/knee/ whatever depth the archive put it at.
+  # under data/fastmri/ whatever depth the archive put it at. NYU's brain and
+  # knee archives both unpack to a multicoil_val/ directory (the brain batch
+  # tarballs nest it one level down), which is all the harness needs.
   extract() {  # extract <tarball>
     echo "[run_verify] extracting $1 ($(du -h "$1" | cut -f1)) with $(nproc) threads"
     local t0; t0=$(date +%s)
@@ -71,43 +77,49 @@ else
   }
 
   shopt -s nullglob
-  TARBALLS=(knee_multicoil_*.tar.xz knee_multicoil_*.tar)
+  TARBALLS=(*multicoil_*.tar.xz *multicoil_*.tar)
   shopt -u nullglob
-  if [ ${#TARBALLS[@]} -eq 0 ] && [ ! -d data/knee/multicoil_val ]; then
-    echo "[run_verify] ERROR: no knee_multicoil_*.tar(.xz) in cwd and no data/knee/multicoil_val" >&2
+  if [ ${#TARBALLS[@]} -eq 0 ] && [ ! -d data/fastmri/multicoil_val ]; then
+    echo "[run_verify] ERROR: no *multicoil_*.tar(.xz) in cwd and no data/fastmri/multicoil_val" >&2
     exit 3
   fi
   for t in "${TARBALLS[@]}"; do extract "$t"; done
+  # AppleDouble sidecars (`._<name>.h5`) from a tarball made on macOS would
+  # match the harness's *.h5 glob and fail in h5py. NYU's archives have none;
+  # a laptop-made test archive might. Cheap to drop, so always do.
+  find data -name '._*' -type f -delete 2>/dev/null || true
 
   for split in multicoil_val; do
-    if [ ! -d "data/knee/$split" ]; then
-      found="$(find data -mindepth 1 -maxdepth 4 -type d -name "$split" -not -path "data/knee/*" | head -n1)"
+    if [ ! -d "data/fastmri/$split" ]; then
+      found="$(find data -mindepth 1 -maxdepth 4 -type d -name "$split" -not -path "data/fastmri/*" | head -n1)"
       if [ -z "$found" ]; then
         echo "[run_verify] ERROR: no $split directory found after extraction" >&2
         find data -maxdepth 3 -type d | head -50 >&2
         exit 3
       fi
-      ln -s "$PWD/$found" "data/knee/$split"
+      ln -s "$PWD/$found" "data/fastmri/$split"
     fi
-    n=$(ls -1 "data/knee/$split"/*.h5 2>/dev/null | wc -l)
-    echo "[run_verify] $split: $n volumes ($(readlink -f "data/knee/$split"))"
+    n=$(ls -1 "data/fastmri/$split"/*.h5 2>/dev/null | wc -l)
+    echo "[run_verify] $split: $n volumes ($(readlink -f "data/fastmri/$split"))"
     if [ "$n" -eq 0 ]; then echo "[run_verify] ERROR: no .h5 files in $split" >&2; exit 3; fi
   done
 
   # ---- checkpoint -----------------------------------------------------------
   # Whatever verify.sub's `ckpt` macro delivered: the released state dict by
-  # default, or a Lightning checkpoint from ../training. verify_varnet.py
-  # reads the architecture from the file, so both load the same way.
+  # default, or a Lightning checkpoint from ../training or ../dpi.
+  # verify_varnet.py reads the architecture from the file, so all three load
+  # the same way (a DPI checkpoint needs dpi_varnet.py next to the harness,
+  # which verify.sub transfers).
   shopt -s nullglob
   CKPTS=()
   for f in *.pt *.ckpt; do [ -f "$f" ] && CKPTS+=("$f"); done   # regular files only
   shopt -u nullglob
   if [ ${#CKPTS[@]} -eq 0 ]; then
     echo "[run_verify] no *.pt / *.ckpt staged: will download the released checkpoint from dl.fbaipublicfiles.com"
-    TIER_ARGS=(--data_path data/knee/multicoil_val --state_dict knee_leaderboard_state_dict.pt --download_state_dict)
+    TIER_ARGS=(--data_path data/fastmri/multicoil_val --state_dict knee_leaderboard_state_dict.pt --download_state_dict)
   else
     echo "[run_verify] checkpoint: ${CKPTS[0]} ($(du -h "${CKPTS[0]}" | cut -f1))"
-    TIER_ARGS=(--data_path data/knee/multicoil_val --state_dict "${CKPTS[0]}")
+    TIER_ARGS=(--data_path data/fastmri/multicoil_val --state_dict "${CKPTS[0]}")
   fi
 fi
 

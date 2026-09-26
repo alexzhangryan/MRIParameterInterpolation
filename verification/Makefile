@@ -1,6 +1,6 @@
 # Makefile: driver for VarNet evaluation on CHTC. The same targets as
 # ../training/Makefile, run in the same two places:
-#   laptop (needs Docker):        make build push tier0 smoke job-smoke job-evict
+#   laptop (needs Docker):        make build push tier0 smoke smoke-ckpt job-smoke job-evict
 #   ap2001.chtc.wisc.edu:         make verify-tier0 verify-model1 verify-model2 verify-tier1 status logs why
 #
 #   make local-run       everything laptop-side from scratch, in one go
@@ -122,22 +122,24 @@ help:
 	@echo "VarNet evaluation on CHTC (IMAGE=$(IMAGE))"
 	@echo
 	@echo "  LAPTOP (Docker):"
-	@echo "  make local-run       build, tier0, smoke, job-smoke, job-evict from scratch"
+	@echo "  make local-run       build, tier0, smoke, smoke-ckpt, job-smoke, job-evict from scratch"
 	@echo "  make build           build the image for $(PLATFORM) (cached)"
 	@echo "  make push IMAGE=<user>/fastmri-verify:2026-09   publish for CHTC"
 	@echo "  make tier0           environment + metric invariants (+ fastMRI pytest); real verdicts"
 	@echo "  make smoke           verify_varnet.py on synthetic data with a random model"
-	@echo "  make job-smoke       run_verify.sh the way HTCondor will, with an offline W&B run"
+	@echo "  make smoke-ckpt      score toy VarNetModule and DPIVarNetModule checkpoints (both kinds must load)"
+	@echo "  make job-smoke       run_verify.sh the way HTCondor will: brain-named .tar.xz, DPI ckpt, offline W&B"
 	@echo "  make job-evict       SIGTERM a running job: the eviction cleanup must run"
 	@echo "  make shell           interactive shell in the image, repo mounted at /work"
 	@echo
 	@echo "  ACCESS POINT (ap2001.chtc.wisc.edu, WANDB_API_KEY in ../.env or exported):"
 	@echo "  make verify-tier0    environment checks on a GPU node, once per image tag"
-	@echo "  make verify-model1   released weights, 4x,          val subset   (= training: make submit-model1)"
-	@echo "  make verify-model2   released weights, 2x/4x/6x/8x, val subset: one pass per rate,"
+	@echo "  make verify-model1   released knee weights, 4x, brain val batch 0   (= training: make submit-model1)"
+	@echo "  make verify-model2   2x/4x/6x/8x on brain val batch 0: one pass per rate (pass ckpt=, see below),"
 	@echo "                       plus a mixed pass (one rate per volume) comparable to training's val_metrics"
 	@echo "  make verify-tier1    Claim A sweep: random masks 4x/8x on the FULL val split (before the repack)"
-	@echo "  make verify MODEL=model1 ARGS='ckpt=../training/runs/model1/<Cluster>/checkpoints/last.ckpt run_name=verify-model1-trained'"
+	@echo "  make verify MODEL=model2 ARGS='ckpt=../training/runs/brain/model2/<Cluster>/checkpoints/last.ckpt run_name=verify-model2-brain'"
+	@echo "  make verify MODEL=model2 ARGS='ckpt=../dpi/runs/brain/dpi/<Cluster>/checkpoints/last.ckpt run_name=verify-dpi-brain'"
 	@echo "  make status          condor_q for your jobs"
 	@echo "  make logs            tail the newest job .out"
 	@echo "  make why JOB=<Cluster>   hold reason + log tails for a held job"
@@ -188,7 +190,7 @@ push: build
 .PHONY: check-eol
 check-eol:
 	@bad=""; \
-	for f in Makefile Dockerfile run_verify.sh submit.sh prepare_staging.sh verify.sub verify_tier0.sub verify_varnet.py make_synthetic_val.py; do \
+	for f in Makefile Dockerfile run_verify.sh submit.sh prepare_staging.sh verify.sub verify_tier0.sub verify_varnet.py make_synthetic_val.py make_tiny_ckpt.py; do \
 	  if LC_ALL=C grep -qU "$$(printf '\r')" "$$f" 2>/dev/null; then bad="$$bad $$f"; fi; \
 	done; \
 	if [ -n "$$bad" ]; then \
@@ -206,8 +208,28 @@ $(SYNTH)/multicoil_val: make_synthetic_val.py | build
 	    --volumes $(VOLUMES) --slices $(SLICES) --seed 2
 	@touch $@
 
+# COPYFILE_DISABLE: macOS bsdtar otherwise adds AppleDouble `._<name>.h5`
+# sidecars for files carrying extended attributes (a bind-mounted Docker
+# output directory gets com.apple.provenance), which the harness's *.h5
+# glob would then hand to h5py. Harmless on Linux.
 knee_multicoil_val_synthetic.tar: $(SYNTH)/multicoil_val
-	tar -cf $@ -C $(SYNTH) multicoil_val
+	COPYFILE_DISABLE=1 tar -cf $@ -C $(SYNTH) multicoil_val
+
+# The brain-shaped twin: NYU's batch tarballs are named
+# brain_multicoil_val_batch_<n>.tar.xz and nest multicoil_val/ one level
+# down. job-smoke uses this one so the glob and the split discovery in
+# run_verify.sh are proven on the layout the real job sees.
+brain_multicoil_val_batch_synthetic.tar.xz: $(SYNTH)/multicoil_val
+	rm -rf .brainpack && mkdir -p .brainpack/brain_multicoil_val_batch_synthetic
+	cp -R $(SYNTH)/multicoil_val .brainpack/brain_multicoil_val_batch_synthetic/
+	COPYFILE_DISABLE=1 tar -cf - -C .brainpack brain_multicoil_val_batch_synthetic | xz -T0 -0 > $@
+	rm -rf .brainpack
+
+# --- toy checkpoints ---------------------------------------------------------
+# Untrained VarNetModule and DPIVarNetModule checkpoints in Lightning's
+# on-disk format, at $(SMOKE_ARCH) size. See make_tiny_ckpt.py.
+ckpttest/tiny_dpi.ckpt: make_tiny_ckpt.py | build
+	$(RUN) python make_tiny_ckpt.py --out ckpttest $(SMOKE_ARCH)
 
 # --- tier 0 -----------------------------------------------------------------
 # Real verdicts: a failure here means the image is wrong and nothing produced
@@ -236,22 +258,53 @@ smoke: build check-eol synthetic
 	@echo "smoke passed: the harness ran end to end. Reference-comparison and"
 	@echo "beats_zero_filled FAILs are expected here: random weights, fake data."
 
+# --- smoke: checkpoint loading -----------------------------------------------
+# The two checkpoint kinds a real job scores, at toy size: a VarNetModule
+# checkpoint (whose state dict also carries loss.w, which must not reach the
+# strict load) and a DPIVarNetModule checkpoint (detected, rebuilt from its
+# hyper_parameters, and handed the rate of each pass). Pass condition: a
+# report whose `arch.model` names the right network, and the determinism
+# invariant passing, which for the DPI model proves the rate argument reaches
+# the forward deterministically. Verdicts on random weights are meaningless.
+.PHONY: smoke-ckpt
+smoke-ckpt: build check-eol synthetic ckpttest/tiny_dpi.ckpt
+	@for c in tiny_varnet:varnet tiny_dpi:dpi_varnet; do \
+	  f=$${c%%:*}; want=$${c##*:}; rm -rf output; \
+	  $(RUN) python verify_varnet.py tier1 --data_path $(SYNTH)/multicoil_val --output_dir output \
+	      --fastmri_repo /opt/fastMRI --run_name smoke-$$f --state_dict ckpttest/$$f.ckpt \
+	      --accelerations 2 4 6 8 --center_fractions 0.16 0.08 0.0533 0.04 --mask_type equispaced_fraction \
+	      --num_workers 0 --determinism_volumes 1 --image_volumes 0 --no_wandb $(CPUFLAG) $(EXTRA) || true; \
+	  test -s output/tier1_report.json || { echo "FAILED: $$f.ckpt: no output/tier1_report.json" >&2; exit 1; }; \
+	  grep -q "\"model\": \"$$want\"" output/tier1_report.json || { echo "FAILED: $$f.ckpt was not scored as $$want" >&2; exit 1; }; \
+	  grep -q "\"name\": \"R4_determinism\", *\"status\": \"pass\"" output/tier1_report.json \
+	    || python3 -c "import json,sys; r=json.load(open('output/tier1_report.json')); \
+	         ok=[c for c in r['invariants'] if c['name']=='R4_determinism' and c['status']=='pass']; sys.exit(0 if ok else 1)" \
+	    || { echo "FAILED: $$f.ckpt: R4_determinism did not pass" >&2; exit 1; }; \
+	  echo "ok: $$f.ckpt loaded as $$want, determinism passed"; \
+	done
+	@echo
+	@echo "smoke-ckpt passed: both checkpoint kinds load and score."
+
 # --- smoke: the job executable ----------------------------------------------
 # run_verify.sh does what the harness does not: tarball extraction, split
-# discovery, checkpoint discovery, the output/ contract. W&B runs offline
-# here rather than being disabled so the run directory and its latest-run
-# symlink exist, and the check at the end proves run_verify.sh removed the
-# symlink -- HTCondor puts a job on hold if one is left in output/.
+# discovery, checkpoint discovery, the output/ contract. It runs on the
+# brain-shaped .tar.xz and the toy DPI checkpoint, i.e. the exact sandbox a
+# CHTC job sees (dpi_varnet.py flat next to the harness, as verify.sub
+# transfers it). W&B runs offline here rather than being disabled so the run
+# directory and its latest-run symlink exist, and the check at the end proves
+# run_verify.sh removed the symlink -- HTCondor puts a job on hold if one is
+# left in output/.
 .PHONY: job-smoke
-job-smoke: build check-eol knee_multicoil_val_synthetic.tar
+job-smoke: build check-eol brain_multicoil_val_batch_synthetic.tar.xz ckpttest/tiny_dpi.ckpt
 	rm -rf jobtest && mkdir -p jobtest
-	cp verify_varnet.py run_verify.sh knee_multicoil_val_synthetic.tar jobtest/
+	cp verify_varnet.py run_verify.sh ../dpi/dpi_varnet.py brain_multicoil_val_batch_synthetic.tar.xz ckpttest/tiny_dpi.ckpt jobtest/
 	-$(DOCKER) run --rm --platform $(PLATFORM) --shm-size=$(SHM) $(GPUFLAG) $(USERFLAG) $(ENVFLAGS) \
 	    -e KEEP_TARBALL=1 -e WANDB_MODE=offline \
 	    -v "$(REPO)":/work -w /work/verification/jobtest $(IMAGE) \
 	    bash run_verify.sh tier1 --run_name job-smoke --accelerations 4 --center_fractions 0.08 \
-	        --mask_type equispaced_fraction --volume_limit $(VOLUMES) $(SMOKE_ARCH) $(SMOKE_RUN) $(CPUFLAG) $(EXTRA)
+	        --mask_type equispaced_fraction --volume_limit $(VOLUMES) --num_workers 0 --image_volumes 0 $(CPUFLAG) $(EXTRA)
 	@test -s jobtest/output/tier1_report.json || { echo "FAILED: run_verify.sh produced no output/tier1_report.json" >&2; exit 1; }
+	@grep -q '"model": "dpi_varnet"' jobtest/output/tier1_report.json || { echo "FAILED: the DPI checkpoint was not scored as dpi_varnet inside the job layout" >&2; exit 1; }
 	@if [ -n "$$(find jobtest/output -type l)" ]; then \
 	  echo "FAILED: symlinks left under jobtest/output (HTCondor would hold the job):" >&2; \
 	  find jobtest/output -type l >&2; exit 1; fi
@@ -311,6 +364,7 @@ local-run:
 	"$(MAKE)" build
 	"$(MAKE)" tier0
 	"$(MAKE)" smoke
+	"$(MAKE)" smoke-ckpt
 	"$(MAKE)" job-smoke
 	"$(MAKE)" job-evict
 	@echo
@@ -473,7 +527,7 @@ shell: build
 
 .PHONY: clean distclean
 clean:
-	rm -rf output results synthetic jobtest evicttest knee_multicoil_val_synthetic.tar
+	rm -rf output results synthetic jobtest evicttest ckpttest .brainpack knee_multicoil_val_synthetic.tar brain_multicoil_val_batch_synthetic.tar.xz
 
 distclean: clean
 	rm -rf .make logs runs

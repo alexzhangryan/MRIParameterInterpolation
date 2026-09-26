@@ -203,9 +203,18 @@ start, before reading anything into the metrics.
 `val_metrics/ssim` is a mixture over the four rates (`../training/README.md`,
 "Masks"), so it is comparable with the baseline run's but says nothing per
 rate. Per-rate numbers come from `../verification/`, which forces every
-volume to each rate in turn. Scoring a DPI checkpoint there needs the DPI
-model class, which `verify_varnet.py` does not import yet: that is the next
-piece of work, not something this directory does.
+volume to each rate in turn and (since 2026-09-25) scores a DPI checkpoint
+the same way as the baseline's: it detects `lambda_table.phi`, rebuilds
+`DPIVarNet` from the checkpoint's hyper-parameters and hands each pass its
+nominal rate, exactly as `DPIVarNetModule` does with `batch.acceleration`.
+On the access point:
+
+    cd ../verification
+    make verify MODEL=model2 ARGS='ckpt=../dpi/runs/brain/dpi/<Cluster>/checkpoints/last.ckpt run_name=verify-dpi-brain'
+
+`../verification/README.md` section 4.4 has the details and the baseline's
+matching command; the two jobs' `per_volume_R<N>.csv` files line up volume
+by volume for the paired comparison.
 
 Before believing any difference, `../VERIFICATION.md` section 6: the
 seed-to-seed standard deviation has to be measured, and a difference under

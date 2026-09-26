@@ -10,7 +10,49 @@ Phase A exists to get a working, correctly-instrumented baseline before touching
 
 ---
 
-## Where this actually stands (2026-09-18)
+## Where this actually stands (2026-09-24)
+
+Supervisor feedback on the first reported result (message of 2026-09-24,
+signed "Chicago") set four items. Two are answers, two are experiment
+blocks; the meeting happens after (3) and (4) are done.
+
+| # | Ask | Status / where the plan lives |
+|---|---|---|
+| 1 | Is the result on the official evaluation data the benchmark relies on? | **Answered by email (draft in Gmail, 2026-09-24).** Short version: yes for the split (NYU's `brain_multicoil_val`, batch 0, scored with `fastmri.evaluate`), no for the leaderboard test split, which has no public leaderboard since 2023. Full wording below, "Answer to item 1" |
+| 2 | Performance per acceleration rate, reported at next week's meeting | Per-rate passes of `verification/` (R2/R4/R6/R8 forced on every volume) on the baseline checkpoint; the DPI checkpoint needs the harness taught to load `DPIVarNetModule`. Plan: Phase C, block A |
+| 3 | Several DPI variants | Variant grid and priority order in `plan.md`, "DPI variant grid (2026-09-24)". Needs `--dpi_scope` re-added to `dpi/` (designed in `plan.md`, dropped at implementation). Plan: Phase C, block B |
+| 4 | Add NV-Raw2insights-MRI (SDUM) as a baseline at a matched parameter count, identical input setup, implementation checked against their code | Architecture chosen and parameter-counted: their 12-cascade Restormer narrowed to widths 64/128 lands at **29.93M vs VarNet's 29.94M**. Table, parity checklist and correctness test in `plan.md`, "Matched-parameter SDUM baseline". Plan: Phase C, block C |
+
+Nothing in the repo changed for these items yet: this is planning. The
+experiment state is what the 2026-09-18 block below says, plus whatever has
+been submitted on CHTC since (the repo holds no run outputs; W&B is the
+record).
+
+### Answer to item 1 (as drafted for the email)
+
+- The reported number is on the **official fastMRI brain multicoil
+  validation split**: NYU's `brain_multicoil_val_batch_0.tar.xz`, 460 of the
+  1,378 validation volumes, unmodified files, scored with fastMRI's own
+  `fastmri.evaluate` code (SSIM per slice averaged over the volume, PSNR and
+  NMSE per volume, on the RSS target with the standard centre crop). That is
+  the data and the metric code the fastMRI papers and leaderboard used.
+- It is **not** the benchmark's test split. The leaderboard test split has
+  no public leaderboard any more (fastmri.org moved to NYU in April 2023 and
+  the boards were not rebuilt), so no one can score on it today. The brain
+  test split's ground truth was released later (`brain_multicoil_test_full`,
+  in our group directory), so a test-split number in the sense of the E2E
+  VarNet paper's Table 3 is computable here once we want it.
+- Two things make the absolute number not comparable to published tables:
+  training used one NYU batch (455 of 4,469 training volumes), and the masks
+  are `equispaced_fraction` (realised rate equals the nominal R) rather than
+  the leaderboard script's uncorrected `equispaced`. The validation mixture
+  Lightning logs is one rate drawn per volume; per-rate numbers are item 2.
+- All models in the comparison (blind VarNet, DPI, the SDUM baseline) train
+  and validate on the same two batches with the same per-volume mask seed, so
+  the comparisons are paired even though the absolute numbers are not the
+  paper's.
+
+## Previous status (2026-09-18)
 
 **The dataset changed.** Group-directory access came through and the full
 fastMRI **brain** multicoil set (20 NYU tarballs, ~1.37 TB, compressed) is in
@@ -29,7 +71,7 @@ reachable through `dataset=knee` macros.
 | Mask audit (meeting item 3) | `training/README.md` "Masks": equispaced lines with density correction, rate drawn uniformly per training slice, per volume at validation, no rate input to the network |
 | Gain hypothesis (meeting item 4) | `plan.md` "Expected gain from explicit rate conditioning" |
 | Docker images | **must be rebuilt and pushed as `genjigod/fastmri-train:2026-09-18` and `genjigod/fastmri-verify:2026-09-18`** (both Dockerfiles now pin `wandb==0.26.1`). Found 2026-09-18 by the new preflight: the `2026-09` images' wandb 0.18.7 rejects the 86-character W&B key in `.env` on length; the key itself verifies with wandb 0.26.1. Both `.sub` files already name the new tags |
-| `verification/` | wandb pin and image tag bumped with training's; otherwise unchanged; scores brain checkpoints via `val_data=` / `ckpt=` overrides (the defaults still say knee). **Cannot score a DPI checkpoint yet**: it does not import the DPI model class |
+| `verification/` | wandb pin and image tag bumped with training's; at the time could not score a DPI checkpoint and its job executable only matched knee tarball names. Both fixed 2026-09-25 (Phase C block A) |
 | Knee subsets in `/staging/a/apryan3/fastmri/` | built 2026-09-12..14 (`knee_multicoil_{train,val}_subset`), used by short test jobs only, superseded |
 | **Phase B (DPI)** | **implemented in `dpi/` (2026-09-19).** VarNet with two parameter sets per learnable tensor and a learnable monotone lambda(R), following arXiv:2511.21028 eq. (2) and section 3.2. 21 unit tests plus four smoke targets green on synthetic data; parameter count exactly 2x the baseline plus the 1,000-entry phi. The training setup is the baseline's by construction: `train_dpi.py` calls `../training/train_wandb.py`'s `cli_main` with the model and transform hooks swapped, and the job reuses `../training/run_train.sh`. **Not yet submitted on CHTC.** Runbook: `dpi/README.md` |
 
@@ -205,6 +247,103 @@ Rough plan to adapt it to VarNet:
 
 ---
 
+## Phase C (2026-09-24): per-rate reporting, DPI variants, SDUM baseline
+
+Ordered so that the per-rate report (item 2) is ready for next week's
+meeting while the two longer blocks run.
+
+### Block A: per-rate performance (item 2, report next week)
+
+- [x] (2026-09-25) `verification/` scores a DPI checkpoint and runs on the
+  brain data: `verify_varnet.py` detects `lambda_table.phi`, rebuilds
+  `DPIVarNet` from the checkpoint's `hyper_parameters` and passes each
+  pass's nominal rate into the forward; `run_verify.sh` accepts NYU's
+  `brain_multicoil_val_batch_0.tar.xz` (its glob was knee-only and would
+  have exited after the 100 GB transfer); `verify.sub` defaults to brain
+  val batch 0 in group staging, `request_disk = 320GB`, transfers
+  `../dpi/dpi_varnet.py`, and files output under `runs/brain/<model>/`.
+  Also fixed: a Lightning checkpoint's `loss.w` buffer reached the strict
+  load, so scoring any trained checkpoint (not only DPI) would have failed.
+  Proven by `make smoke-ckpt` and `make job-smoke` on toy checkpoints of
+  both kinds; the real command is `verification/README.md` section 4.4
+- [ ] Score the baseline (`mixed acceleration brain`) and every finished DPI
+  checkpoint with `make verify MODEL=model2 ARGS='ckpt=...'`: SSIM / PSNR /
+  NMSE at R = 2, 4, 6, 8, every volume forced to each rate, plus the mixed
+  pass that matches the training-time `val_metrics/ssim`
+- [ ] Report as one table (rows: model, columns: rate x metric) plus the
+  paired per-volume differences DPI minus baseline at each rate from the
+  `per_volume_R<N>.csv` files (`VERIFICATION.md` section 6.3: Wilcoxon over
+  volumes, median difference and interval). Also the zero-filled row, so the
+  scale of the gains is visible
+- [ ] State the caveat in the report: one seed per model, so sigma is
+  unknown; anything under the eventual 2-sigma band is provisional
+  (`VERIFICATION.md` section 6.2). The three-seed baseline is block D
+- [ ] Sanity invariant before showing it: SSIM falls monotonically from 2x to
+  8x for every model, and `lambda/R4`, `lambda/R6` moved off the initial line
+  in W&B for the DPI run
+
+### Block B: DPI variants (item 3)
+
+Grid and priority in `plan.md`, "DPI variant grid (2026-09-24)". Code
+change needed first: re-add `--dpi_scope {full, shallow, io, dc, none}` to
+`dpi/` as designed in `plan.md` sections 1 and 2 (the implementation kept
+only `full` plus `--no_dpi_sens`). The unit tests already listed there
+(equivalence at init per scope, parameter counts per scope, gradient flow)
+extend the existing 21.
+
+- [ ] `--dpi_scope` in `dpi_varnet.py` / `dpi_module.py` with per-scope
+  parameter-count tests matching the table in `plan.md` section 2
+- [ ] Submit in priority order (each is a 50-epoch model2-sized run, one GPU):
+  1. `full`, warm-started from the blind checkpoint (`INIT=...`)
+  2. `io` (the light variant, +0.14% parameters)
+  3. `dc` (one scalar per cascade, the cheapest test of the hypothesis)
+  4. `full --no_dpi_sens`
+  5. `shallow`, only if `io` is clearly below `full`
+  6. `--accel_min 4 --accel_max 8` on `full` (two independent sets, the
+     per-rate ceiling inside one model)
+- [ ] Every variant goes through block A's scoring; the table grows a row per
+  variant
+
+### Block C: SDUM baseline at matched parameters (item 4)
+
+Design in `plan.md`, "Matched-parameter SDUM baseline (NV-Raw2insights-MRI)".
+The chosen architecture is their 12-cascade Restormer at widths 64/128 with
+their universal conditioning on, 29.93M parameters against VarNet's 29.94M;
+its conditioning-off twin is the second row.
+
+- [ ] `sdum/` sibling directory: port `restormer_mri` and
+  `Cascaded_SkipConnected_MRI_Recon` (Apache-2.0) behind a fastMRI-style
+  `forward(masked_kspace, mask, num_low_frequencies, acceleration)`, as a
+  third `build_model` hook of `training/train_wandb.py`, reusing
+  `run_train.sh`. Data, masks, loss, optimiser, epochs, seed and W&B stay the
+  baseline's by construction, exactly as `dpi/` does it
+- [ ] Add `monai`, `timm`, `einops` to `training/Dockerfile` (new image tag);
+  the verification image gets the same so block A can score it
+- [ ] **Correctness test against their code** (the supervisor's explicit
+  ask): (i) instantiate the port at their released `small` configuration and
+  assert its `state_dict` keys and shapes equal the released
+  `nv_raw2insights_mri_small` checkpoint's; (ii) load those weights into both
+  their unmodified `scripts/inference.py` path and the port, run the example
+  case that ships in their repo through both, and assert the outputs match
+  to float tolerance; (iii) on a fastMRI slice, assert the port's ACS region
+  and z-score normalisation equal theirs. (i) and (ii) are what proves the
+  port is their model and not a look-alike
+- [ ] Submit `sdum-uc` (conditioning on) and `sdum-blind` (conditioning off),
+  model2 rate list, from scratch, 50 epochs, Adam 3e-4 batch 1 (the
+  baseline's optimiser, stated deviation from their Muon; see `plan.md`)
+- [ ] Score both through block A; add to the per-rate table. The comparison
+  the paper needs: VarNet-blind vs SDUM-blind (architecture), SDUM-uc vs
+  SDUM-blind (their embedding-style conditioning), DPI vs SDUM-uc
+  (conditioning mechanism at equal parameters), and the unseen-rate probe at
+  3x / 5x / 10x, where SDUM's label lookup has no index for an unseen rate
+  and DPI's lambda interpolates
+
+### Block D: seed variance (gates every claim above)
+
+- [ ] Baseline model2 at seeds 1337 and 2024 in addition to 42
+  (`VERIFICATION.md` section 6.1); report sigma per rate. Queue these behind
+  blocks B and C on the GPU queue, but before the paper's numbers are final
+
 ## Known risks / things likely to slow this down
 
 - fastMRI approval timeline is undocumented — start Phase 0 today regardless of what else is ready
@@ -225,4 +364,4 @@ Rough plan to adapt it to VarNet:
 - Your prior CHTC recipe (reference): `Research/Dockerfile`, `Research/diffusion.sub`, `Research/submit.sh` on your Desktop
 
 ---
-*Last updated: 2026-09-18*
+*Last updated: 2026-09-24*

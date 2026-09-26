@@ -202,3 +202,180 @@ Question from the 2026-09-18 meeting: what do we expect to gain by giving VarNet
 | DPI > per-rate | Suspect leakage or a mask / scalar mismatch before believing it (per-rate models see only their own rate's data, so DPI gaining from shared data is possible but should be small). |
 
 **Two things that make the measurement honest.** First, `equispaced_fraction` masks: the realised rate equals the nominal R, so the scalar the network is conditioned on is the acceleration the data actually has (under the leaderboard's uncorrected `equispaced`, "4x" is ~3.2x and the label would be wrong). Second, every model in the comparison (blind, per-rate, DPI, and any embedding baseline) trains on the same `brain_multicoil_train_batch_0` and is scored on the same `brain_multicoil_val_batch_0` volumes with the same mask seed, so the paired test compares reconstructions of the same slices under the same masks.
+
+## DPI variant grid (2026-09-24)
+
+Requested by the supervisor on 2026-09-24 ("check several DPI variants").
+The implementation in `dpi/` kept only the paper's own choice (every
+learnable tensor duplicated) plus `--no_dpi_sens`; the scope flag designed in
+sections 1 and 2 above is the first thing to re-add, because three of the
+variants below are scopes. Parameter overheads are the section 2 table
+(measured on the real 12-cascade VarNet).
+
+| Variant | Flag(s) | Extra parameters | What it tests | Priority |
+|---|---|---|---|---|
+| full, from scratch | default | +100% (29.94M) | the paper's mechanism as-is; **already the first DPI run** | running |
+| full, warm start | `INIT=<blind ckpt>` | +100% | the paper's actual recipe (both sets start from a trained model); also the fix if lambda does not move from scratch | 1 |
+| io (light) | `--dpi_scope io` | +0.14% (41k) | first ConvBlock + final 1x1 + `dc_weight`: does conditioning the layers that touch the aliased image suffice? | 2 |
+| dc | `--dpi_scope dc` | +0.003% (1,012) | only the data-consistency step size varies with R; the cheapest possible test of the hypothesis (Ada-MoDL conditions exactly this) | 3 |
+| full, no sens | `--no_dpi_sens` | +98.4% | is the sensitivity-map net's share of the gain material? ACS width spans 4x across the rate list | 4 |
+| shallow | `--dpi_scope shallow` | +3.2% (946k) | the step between io and full; run only if io is clearly below full | 5 |
+| independent sets | `--accel_min 4 --accel_max 8` | +100% | lambda(4)=0, lambda(8)=1 exactly: two disjoint models inside one, i.e. the per-rate ceiling with shared data loading (2x and 6x then clamp to the endpoints, so read those columns as extrapolation) | 6 |
+| lambda lr | `--lambda_lr 1e-2` on full | 0 | sensitivity of the schedule; only if `lambda/R4`, `lambda/R6` are flat at 1e-3 | as needed |
+| linear spacing | `--lambda_spacing linear` | 0 | whether log2(R) indexing matters; low value, last | 7 |
+| none (control) | `--dpi_scope none` | 0 | must track the blind baseline to seed noise; a free sanity check of the driver, not a result | with block D |
+
+Every variant is a model2-sized run (brain batch 0, rates 2/4/6/8, 12
+cascades, 50 epochs, one GPU) and is scored per rate through
+`verification/` (ROADMAP Phase C, block A). The reading rules are the
+"Expected gain" table above: the interesting outcomes are `io` or `dc`
+matching `full` (the gain is cheap) and `full` matching the independent-sets
+ceiling (one interpolation path is enough).
+
+## Matched-parameter SDUM baseline (NV-Raw2insights-MRI), 2026-09-24
+
+Requested by the supervisor on 2026-09-24: add
+[NVIDIA-Medtech/NV-Raw2insights-MRI](https://github.com/NVIDIA-Medtech/NV-Raw2insights-MRI)
+to the baselines, pick an architecture with a parameter count close to
+ours, keep the input setup identical, and check the implementation against
+their code. The repo is the release of SDUM (Wang et al.,
+[arXiv:2512.17137](https://arxiv.org/abs/2512.17137)), already in the
+related-work table above as the embedding-style conditioning we did not
+take. Code read on 2026-09-24 (clone at `main`, Apache-2.0 code, NVIDIA Open
+Model License weights).
+
+### What their model is, from the code
+
+`scripts/models/latent_recon.py::create_mri_recon_model` builds
+`Cascaded_SkipConnected_MRI_Recon`, a list of `num_cascades` copies of
+`restormer_mri` (`scripts/models/restormer/restormer.py`). Each cascade:
+
+- a coil-sensitivity U-Net (`CoilSensitivityModel_DCAE`, complex BasicUNet,
+  features 12/24/48/96/192, instance norm, 1.10M parameters) run on the ACS
+  image; **per cascade** unless `use_single_csm`, in which case only cascade
+  0 has one and passes the maps on (the fastMRI VarNet pattern);
+- sensitivity reduce to one complex image, z-scored (`complex_zscore`, the
+  transform does this per sample), then a two-level Restormer: 3x3 stem,
+  `num_blocks` transformer blocks per level (MDTA channel attention + gated
+  depthwise FFN), PixelUnshuffle down / PixelShuffle up, `num_refinement`
+  blocks, 3x3 output conv; residual add to the cascade input;
+- soft data consistency in k-space, either a scalar `dc_weight` (VarNet's) or
+  a learnable 768x768 per-mask-type `dc_weight_map`
+  (`use_dc_weight_map`);
+- **universal conditioning** (`time_cond`, `label_cond`): sinusoidal
+  embedding of the cascade index, plus a sinusoidal embedding of one
+  integer label `mask_idx*|M|*|A| + acc_idx*|A| + acq_idx` (mask family,
+  acceleration, acquisition), each through a 2-layer MLP, summed, and added
+  as a spatially broadcast bias inside every block's FFN. With one mask
+  family and one acquisition the label is just the **index** of the rate in
+  the config list (0..3 for 2/4/6/8), scaled by 10 before the sinusoid. An
+  acceleration not in the list gets index -1. This matters for the
+  unseen-rate probe: DPI's lambda(R) is a function of R, theirs is a lookup;
+- optional cascade skips (`enable_cas_skips`, deep features passed between
+  cascades), gradient checkpointing per cascade, bf16 autocast.
+
+Released configurations (`configs/`): `small` T=6, `base` T=18, `large`
+T=34, all at channels 256/512, blocks 3/6, heads 1/2, refinement 2,
+`mlp_ratio` 3, LayerNorm, `num_frames` 5 (cine temporal window), per-cascade
+CSM, mask-specific `dc_weight_map`. Note that the **released `small` config
+has conditioning off** (`time_cond`/`label_cond` absent, default False);
+only `base` turns it on. Training: SSIM loss (`ssim_l1` for small), Muon
+(base) or AdamW at 1e-5 with cosine decay and weight decay 1e-3, batch 1 per
+GPU with adaptive micro-batching, bf16, 160 epochs of post-training on
+CMRxRecon; the paper's brain results are for a model pretrained on
+CMRxRecon 2024/2025 plus fastMRI brain jointly. Their `calmetric` scores
+per slice after 99.5-percentile normalisation of both images, which is the
+CMRxRecon convention and not fastMRI's; we do not use it.
+
+### Parameter counts and the pick
+
+Counted on 2026-09-24 by instantiating their unmodified code
+(`create_mri_recon_model`) under the fastMRI setting: `num_frames` 1 (static
+2D, so the stem takes 2 channels, not 10), one mask family, one acquisition
+label. The released numbers (230M/760M/1.4B) are the cine setting with 5
+frames and three mask families, which is why the first row is below 230M.
+
+| Configuration | Cascades | Widths | CSM | DC | Conditioning | Total | of which CSM / emb |
+|---|---|---|---|---|---|---|---|
+| their `small`, as released | 6 | 256/512 | per cascade | 768x768 map | off | 207.2M | 6.6M / 0 |
+| their T=1 (paper Table D.1 row, 42.2M in the cine setting) | 1 | 256/512 | 1 | map | off | 34.5M | 1.1M / 0 |
+| same, conditioning on | 1 | 256/512 | 1 | map | on | 38.8M | 1.1M / 4.2M |
+| **SDUM-12, the pick** | **12** | **64/128** | **single** | **scalar** | **on** | **29.93M** | 1.1M / 3.2M |
+| SDUM-12, conditioning off (the blind twin) | 12 | 64/128 | single | scalar | off | 26.7M | 1.1M / 0 |
+| SDUM-12, per-cascade CSM | 12 | 64/128 | per cascade | scalar | on | 42.0M | 13.2M / 3.2M |
+| SDUM-12 at 80/160, per-cascade CSM | 12 | 80/160 | per cascade | scalar | on | 57.8M | 13.2M / 5.0M |
+| SDUM-6 at 96/192 | 6 | 96/192 | single | scalar | on | 33.0M | 1.1M / 3.6M |
+| SDUM-12 at 64/128 with their DC map | 12 | 64/128 | single | map | on | 37.0M | 1.1M / 3.2M |
+
+Reference: VarNet 29,936,966; DPI full 59,874,932.
+
+**Pick: SDUM-12 at widths 64/128, single CSM, scalar DC, conditioning on
+(29.93M, within 0.03% of VarNet).** Reasons, in order: same unroll depth as
+VarNet (12 cascades), so the comparison is regulariser-vs-regulariser rather
+than depth-vs-width; same sensitivity-map arrangement as VarNet (one
+estimator feeding every cascade) and a scalar DC weight, so the only
+architectural differences are the Restormer block and the conditioning;
+everything else is a config value in their code (`channels`, `num_cascades`,
+`use_single_csm`, `use_dc_weight_map`, `time_cond`, `label_cond`), so the
+port changes no model code. Its conditioning-off twin (26.7M) is the second
+row: it isolates their embedding-style conditioning at fixed architecture,
+which is the same +0.38 dB ablation their paper reports (Table 3f) and the
+class of baseline DPI's own paper compares against. The paper-native T=1
+(34.5M / 38.8M) is the fallback if a single-cascade comparison is wanted;
+it is the smallest configuration the authors themselves report, but one
+unrolled step against twelve is not the comparison the paper needs.
+
+If the DPI comparison should be at DPI's count rather than VarNet's, the
+80/160 per-cascade-CSM row (57.8M) is the match for 59.9M; it is a second
+run, not a replacement.
+
+### Input setup: what "identical" means here, and what is deliberately not
+
+Enforced the way `dpi/` enforces it: `sdum/train_sdum.py` calls
+`training/train_wandb.py::cli_main` with only `build_model` replaced, so
+everything below the model is the baseline's code path, not a copy.
+
+| Kept identical (baseline's) | Their code does instead | Decision |
+|---|---|---|
+| data: `brain_multicoil_train_batch_0` / `val_batch_0`, fastMRI h5 | CMRxRecon `.mat` + JSON descriptors; their `FastMRIReader` exists but is not wired into `train.py` | ours |
+| masks: fastMRI `EquispacedMaskFractionFunc`, rates 2/4/6/8, centre fractions 0.16/0.08/0.0533/0.04, one draw per slice in training, filename-seeded per volume at validation | their `EquispacedKspaceMask` is the same fraction-corrected formula, but drawn by MONAI's RNG, so the per-volume masks would differ | ours, so every model sees the same mask on the same slice |
+| scalar fed to the model: nominal R from the recording mask function | `acc_factor` from the mask filename | ours; mapped to their `acc_idx` in the wrapper |
+| loss: fastMRI `SSIMLoss` on the centre-cropped RSS, `data_range = attrs["max"]` | SSIM (base) / SSIM+L1 (small), `data_range` from `max` attr when present, on RSS after their post-processing | ours; same loss as the VarNet and DPI runs |
+| metrics: `fastmri.evaluate` per volume via `verification/` | `calmetric`, per slice after 99.5-percentile normalisation | ours |
+| optimiser: Adam 3e-4, x0.1 at epoch 40, batch 1, 50 epochs, fp32, no weight decay, no augmentation | Muon or AdamW 1e-5 cosine, wd 1e-3, bf16, adaptive micro-batch, k-space augmentations (off in `small`), 160 epochs | ours, **stated deviation**: the comparison is "same training recipe as VarNet", and Muon is theirs to tune. A Muon run is an optional extra if SDUM-12 looks undertrained at epoch 50 |
+| in-model normalisation | complex z-score of the coil-combined image per sample (in their transform) | keep theirs inside the wrapper: it is part of the architecture, as `NormUnet`'s normalisation is part of VarNet |
+| ACS extraction for the sensitivity net | `get_acs_region` grows a box from the mask centre; fastMRI uses `num_low_frequencies` | keep theirs, and assert on real masks that both give the same ACS width (they should: the centre block is contiguous) |
+| gradient checkpointing per cascade, cascade skips | on | keep on: neither changes the function, only memory and the skip path (skips are part of the architecture) |
+
+### Correctness check against their code (the supervisor's condition)
+
+1. **Key/shape equality.** Instantiate the port at their released `small`
+   configuration (T=6, 256/512, 5 frames, 3 mask types) and assert the
+   `state_dict` keys and shapes equal the `nv_raw2insights_mri_small`
+   checkpoint's (auto-downloaded from Hugging Face by their code).
+2. **Output equality on their example.** Load those weights into their
+   unmodified `scripts/inference.py` path and into the port, run the example
+   case that ships in `example/` through both, assert `allclose` at fp32.
+   This is the test that the port is their network and not a rewrite of it.
+3. **Config sweep.** Assert the port's parameter count equals theirs for the
+   pick and for the blind twin (table above), from the same config dict.
+4. **Input parity on fastMRI.** One brain slice through the wrapper: the ACS
+   width their `get_acs_region` finds equals `num_low_frequencies` from the
+   recording mask function; the label index equals the position of R in the
+   rate list; and the output shape and centre crop match what
+   `VarNetModule` hands the loss.
+5. **Smoke.** `make smoke` / `make job-smoke` on synthetic phantoms, as
+   `dpi/` does, before any GPU time.
+
+### What it needs
+
+- `sdum/` sibling of `dpi/`: the two ported modules (with their Apache
+  headers and a pointer to the commit), `sdum_module.py` (a `VarNetModule`
+  subclass with the wrapper as `self.varnet`, `acceleration` threaded as in
+  `DPIVarNetModule`), `train_sdum.py`, `train.sub`, `Makefile`, tests.
+- `monai`, `timm`, `einops` in `training/Dockerfile` and
+  `verification/Dockerfile`; new image tag.
+- Memory: MDTA attention is over channels, so cost is linear in pixels; at
+  widths 64/128, batch 1, 640x320 with checkpointing, it fits the 24 GB
+  slots the VarNet run uses. Measure on the short test job before the real
+  submit.
