@@ -19,7 +19,7 @@ blocks; the meeting happens after (3) and (4) are done.
 | # | Ask | Status / where the plan lives |
 |---|---|---|
 | 1 | Is the result on the official evaluation data the benchmark relies on? | **Answered by email (draft in Gmail, 2026-09-24).** Short version: yes for the split (NYU's `brain_multicoil_val`, batch 0, scored with `fastmri.evaluate`), no for the leaderboard test split, which has no public leaderboard since 2023. Full wording below, "Answer to item 1" |
-| 2 | Performance per acceleration rate, reported at next week's meeting | Per-rate passes of `verification/` (R2/R4/R6/R8 forced on every volume) on the baseline checkpoint; the DPI checkpoint needs the harness taught to load `DPIVarNetModule`. Plan: Phase C, block A |
+| 2 | Performance per acceleration rate, reported at next week's meeting | **Done 2026-09-29 — `RESULTS.md`.** DPI trades accuracy from high rates to low rates: wins R2/R4, loses R6/R8, all significant except R8 NMSE. Paired Wilcoxon over 460 volumes per `VERIFICATION.md` 6.3. Provisional until block D measures sigma |
 | 3 | Several DPI variants | Variant grid and priority order in `plan.md`, "DPI variant grid (2026-09-24)". Needs `--dpi_scope` re-added to `dpi/` (designed in `plan.md`, dropped at implementation). Plan: Phase C, block B |
 | 4 | Add NV-Raw2insights-MRI (SDUM) as a baseline at a matched parameter count, identical input setup, implementation checked against their code | Architecture chosen and parameter-counted: their 12-cascade Restormer narrowed to widths 64/128 lands at **29.93M vs VarNet's 29.94M**. Table, parity checklist and correctness test in `plan.md`, "Matched-parameter SDUM baseline". Plan: Phase C, block C |
 
@@ -27,6 +27,23 @@ Nothing in the repo changed for these items yet: this is planning. The
 experiment state is what the 2026-09-18 block below says, plus whatever has
 been submitted on CHTC since (the repo holds no run outputs; W&B is the
 record).
+
+### Since 2026-09-24
+
+- **Item 2 is done** — per-rate results in `RESULTS.md`, regenerable with
+  `verification/paired_from_wandb.py`. Headline: DPI makes a rate-dependent
+  trade rather than a uniform gain, and the learned lambda's saturation
+  explains it, which reorders block B toward the lambda reparameterisation.
+- `blind r8 brain` (the per-rate ceiling baseline, accelerations [8]) **crashed
+  at epoch 20/50** on 2026-09-29 after 11.1 h. W&B reports `crashed` for any run
+  that stops heartbeating without a clean exit, which is also what a CHTC
+  eviction looks like, so check the `.err`/`.log` on `ap2001` before
+  resubmitting; checkpoint-resume should pick it up at epoch 20 if it was an
+  eviction.
+- Claude cannot reach CHTC non-interactively (password + Duo), so cluster-side
+  facts in this file come from W&B or from a human-run shell. `ControlMaster`
+  must not be used for the `chtc` host: mux is broken in Git Bash OpenSSH on
+  Windows and silently breaks logins.
 
 ### Answer to item 1 (as drafted for the email)
 
@@ -266,21 +283,40 @@ meeting while the two longer blocks run.
   load, so scoring any trained checkpoint (not only DPI) would have failed.
   Proven by `make smoke-ckpt` and `make job-smoke` on toy checkpoints of
   both kinds; the real command is `verification/README.md` section 4.4
-- [ ] Score the baseline (`mixed acceleration brain`) and every finished DPI
-  checkpoint with `make verify MODEL=model2 ARGS='ckpt=...'`: SSIM / PSNR /
-  NMSE at R = 2, 4, 6, 8, every volume forced to each rate, plus the mixed
-  pass that matches the training-time `val_metrics/ssim`
-- [ ] Report as one table (rows: model, columns: rate x metric) plus the
-  paired per-volume differences DPI minus baseline at each rate from the
-  `per_volume_R<N>.csv` files (`VERIFICATION.md` section 6.3: Wilcoxon over
-  volumes, median difference and interval). Also the zero-filled row, so the
-  scale of the gains is visible
-- [ ] State the caveat in the report: one seed per model, so sigma is
-  unknown; anything under the eventual 2-sigma band is provisional
-  (`VERIFICATION.md` section 6.2). The three-seed baseline is block D
-- [ ] Sanity invariant before showing it: SSIM falls monotonically from 2x to
-  8x for every model, and `lambda/R4`, `lambda/R6` moved off the initial line
-  in W&B for the DPI run
+- [x] (2026-09-28/29) Scored the baseline (`mixed acceleration brain`) and the
+  first DPI checkpoint: W&B runs `verify-model2-brain` and `verify-dpi-brain`,
+  460 volumes / 7270 slices of brain val batch 0, every volume forced to
+  R = 2, 4, 6, 8 plus the mixed pass
+- [x] (2026-09-29) **Reported in `RESULTS.md`** — one table per metric, the
+  paired per-volume differences DPI minus baseline at each rate per
+  `VERIFICATION.md` section 6.3 (Wilcoxon signed-rank, median difference and
+  bootstrap interval alongside the mean-of-means), and the zero-filled row.
+  Regenerate for any new variant with
+  `python verification/paired_from_wandb.py --treatment <run> --markdown`,
+  which reads the `R<N>/per_volume` tables straight from W&B — no run outputs
+  on disk and no `wandb` package needed
+- [x] (2026-09-29) Caveat stated in `RESULTS.md`: one seed per model, sigma
+  unknown, everything provisional under the eventual 2-sigma band
+  (`VERIFICATION.md` section 6.2). The paired test controls volume difficulty
+  and mask seed but NOT training-seed variance, and these effects are small
+  enough that block D could erase or reverse them
+- [x] (2026-09-29) Sanity invariants pass: SSIM falls monotonically 2x->8x for
+  both models (baseline 0.973530 > 0.957180 > 0.946674 > 0.937724; DPI
+  0.974122 > 0.957327 > 0.946489 > 0.937547), and `lambda/R4` = 0.657,
+  `lambda/R6` = 0.847 moved off the initial line
+
+**Result (2026-09-29): DPI makes a rate-dependent trade, not a wash.** It wins
+at R2 (+0.253 dB PSNR, 460/460 volumes) and R4 (+0.039 dB), loses at R6
+(-0.047 dB) and R8 (-0.023 dB); every direction is significant except R8 NMSE
+(p = 0.063). The mixed pass reads only +0.051 dB because the gains and losses
+nearly cancel. **The learned lambda explains it:** lambda at R2/R4/R6/R8 =
+0.000 / 0.657 / 0.847 / 1.000 — two thirds of the range is spent between R2 and
+R4, and R6/R8 are compressed into the top 15%, so DPI wins where lambda is
+spread out and loses where it saturates. The cumulative softmax guarantees
+monotonicity but nothing constrains spacing. **This reorders block B: the
+lambda reparameterisation attacks the measured cause, whereas the scope
+ablations mainly attack the 3.9x cost (101.7 h vs 26.4 h).** Full numbers,
+method and caveats: `RESULTS.md`.
 
 ### Block B: DPI variants (item 3)
 
@@ -364,4 +400,4 @@ its conditioning-off twin is the second row.
 - Your prior CHTC recipe (reference): `Research/Dockerfile`, `Research/diffusion.sub`, `Research/submit.sh` on your Desktop
 
 ---
-*Last updated: 2026-09-24*
+*Last updated: 2026-09-29*

@@ -9,6 +9,14 @@ Context for any Claude Code session working in this repo.
 Part of ongoing work with Prof. Kamilov's Computational Imaging Group.
 
 **Current phase:** see `ROADMAP.md` for the live checklist — check it before assuming what's done.
+Measured results live in `RESULTS.md`.
+
+**Read `ROADMAP.md` as the first action of a session, and update it as the last one.**
+It is the handoff document and the only context that survives a cleared conversation.
+Do not reconstruct state from `git log` or the filesystem while an unread roadmap sits
+there. On 2026-09-29 a stale copy cost a whole session: it claimed nothing had run on
+CHTC and that Phase B had no code, when DPI had been implemented on 09-19 and the
+project had already moved to brain data.
 
 **Key facts to keep in mind:**
 - Compute: UW-Madison CHTC, HTCondor scheduler (NOT Slurm), access point `ap2001.chtc.wisc.edu`
