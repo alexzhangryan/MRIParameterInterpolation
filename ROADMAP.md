@@ -34,12 +34,22 @@ record).
   `verification/paired_from_wandb.py`. Headline: DPI makes a rate-dependent
   trade rather than a uniform gain, and the learned lambda's saturation
   explains it, which reorders block B toward the lambda reparameterisation.
-- `blind r8 brain` (the per-rate ceiling baseline, accelerations [8]) **crashed
-  at epoch 20/50** on 2026-09-29 after 11.1 h. W&B reports `crashed` for any run
-  that stops heartbeating without a clean exit, which is also what a CHTC
-  eviction looks like, so check the `.err`/`.log` on `ap2001` before
-  resubmitting; checkpoint-resume should pick it up at epoch 20 if it was an
-  eviction.
+- `blind r8 brain` (cluster 11380824, the per-rate ceiling baseline,
+  accelerations [8]) **stopped at epoch 20/50 after 11.80 h, killed by SIGTERM**
+  (`ExitBySignal=true`, `ExitSignal=15`, `NumJobStarts=1`). Not a crash and not
+  an eviction: val loss fell monotonically to 0.06671 by epoch 18, the `.err`
+  ends clean, and memory (39.2/48 GB) and disk (405/520 GB) were both inside
+  their requests. `last.ckpt` is intact, so it is resumable.
+  **Repo bug this exposed:** `train.sub`'s `on_exit_hold = (ExitBySignal ==
+  False) && (ExitCode == 4)` is false for a signal kill, so a runtime-cap
+  SIGTERM neither holds nor requeues the job - it just leaves the queue as
+  "Completed" with no resubmission. The eviction-resume contract does not cover
+  this case. Needs a policy for signal exits (and note `+GPUJobLength = "long"`
+  is already set, so a 11.8 h kill on a GPU Lab slot is itself unexplained -
+  check `LastRemoteHost` / whether the attribute reached the job ad).
+  When resuming, take the argument list from `condor_history 11380824 -af Args`:
+  `model1` defaults to `accelerations=4 center_fractions=0.08`, and the rate
+  config comes from arguments, not from the checkpoint. Detail in `RESULTS.md`.
 - Claude cannot reach CHTC non-interactively (password + Duo), so cluster-side
   facts in this file come from W&B or from a human-run shell. `ControlMaster`
   must not be used for the `chtc` host: mux is broken in Git Bash OpenSSH on

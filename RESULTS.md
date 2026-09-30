@@ -152,15 +152,56 @@ did not work."
 - Baseline competence (section 6.4): beats zero-filled by 8.5-11.1 dB at every
   rate.
 
-## Open
+## Open: the R8 per-rate ceiling baseline is unfinished
 
-`blind r8 brain` (the per-rate ceiling baseline, accelerations [8],
-center_fractions [0.04]) **crashed at epoch 20 of 50** — created
-2026-09-29T00:08:53Z, last heartbeat 2026-09-29T11:15:09Z, 11.1 h compute,
-val_loss 0.0669 / SSIM 0.9330 / PSNR 35.69 at the cut.
+`blind r8 brain` (cluster 11380824, accelerations [8], center_fractions [0.04])
+**stopped at epoch 20 of 50**, so the per-rate ceiling row is not yet available.
 
-W&B reports `crashed` for any run that stops heartbeating without a clean exit,
-which is also what a CHTC eviction looks like (`varnet-model1` carries the same
-state from 2026-09-13). Check the job's `.err`/`.log` on `ap2001` before
-resubmitting; if it was an eviction, checkpoint-resume should pick it up at
-epoch 20.
+**Cause, confirmed 2026-09-29 from the job ad — not a crash and not an
+eviction:**
+
+```
+ExitBySignal = true   ExitSignal = 15 (SIGTERM)   NumJobStarts = 1
+RemoteWallClockTime = 42491 s = 11.80 h
+RequestMemory 49152 MB / MemoryUsage 39212 MB   (80%, fine)
+RequestDisk 545259520 KB / DiskUsage 425000000 KB   (78%, fine)
+```
+
+Training was healthy to the last line: validation loss fell monotonically
+0.10269 -> 0.06671 by epoch 18 and was still improving; the `.err` log ends
+mid-stream after `Epoch 19, global step 144320` with no traceback and no CUDA
+error. Memory and disk were both well inside their requests. The job was killed
+on a clock at 11.8 h.
+
+**`train.sub` has no requeue path for a signal kill.** Its guard is
+
+```
+on_exit_hold = (ExitBySignal == False) && (ExitCode == 4)
+```
+
+which is false for a SIGTERM, so the job was neither held nor requeued — it
+simply left the queue as JobStatus 4 ("Completed"). `when_to_transfer_output =
+ON_EXIT_OR_EVICT` did bring `output/` back, so `last.ckpt` and
+`epoch=18-step=137104.ckpt` (344 MB each) are intact and a resume is possible;
+nothing restarted it automatically. The eviction-resume contract that was tested
+in 2026-09-12's `b246100` covers eviction, not a runtime-cap SIGTERM.
+
+**Unexplained and worth one check:** `train.sub` already sets
+`+GPUJobLength = "long"` (7 days), so a kill at 11.8 h should not have happened
+on a GPU Lab slot. Get `LastRemoteHost`, `GPUJobLength` and `WantGPULab` off the
+job ad to see whether the attributes reached the ad and which machine it ran on;
+`requirements` does not restrict to GPU Lab nodes, so a slot with its own
+retirement time is one candidate.
+
+**To resume,** take the exact argument list off the job ad
+(`condor_history 11380824 -af Args`) rather than reconstructing it: `model1`
+defaults to `accelerations=4 center_fractions=0.08`, and while the checkpoint
+restores model hyperparameters, the rate and mask configuration comes from the
+arguments — so a resume that omits them would silently retrain at R4. Only the
+partial epoch 20 is lost, roughly 20 minutes of the 11.8 hours.
+
+A timezone note, since it caused a false lead: the wandb run directory
+(`run-20260929_000852`) is stamped **UTC** while the HTCondor log
+(`06:15:45`) is **Central**. 00:08 UTC Sep 29 is 19:08 CDT Sep 28, so the run
+spans 19:08 -> 06:15 = 11 h 07 m, consistent with both W&B's `_runtime` (11.08 h)
+and Condor's `RemoteWallClockTime` (11.80 h). One continuous run.
