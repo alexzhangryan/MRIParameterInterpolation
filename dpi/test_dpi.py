@@ -419,3 +419,212 @@ def test_seeded_validation_transform_locks_a_volume_to_one_rate():
         for s in range(5)
     }
     assert len(rates) == 1, f"one volume drew several rates: {rates}"
+
+
+# ------------------------------------------------------------- dpi_scope ---
+# The narrower scopes. Each is a variant of the grid in plan.md ("DPI variant
+# grid"); the parameter counts below come from that document's table, derived
+# by hand from the architecture, so these tests are a real oracle rather than
+# a recording of whatever the code happens to do.
+PAPER_CONFIG = dict(num_cascades=12, sens_chans=8, sens_pools=4, chans=18, pools=4)
+
+# (extra per cascade, extra in the sensitivity U-Net), plan.md section 2.
+SCOPE_EXTRA = {
+    "full": (2454339, 484898),
+    "shallow": (77475, 15394),
+    "io": (3279, 738),
+    "dc": (1, 0),
+    "none": (0, 0),
+}
+
+
+@pytest.mark.parametrize("scope", ["full", "shallow", "io", "dc", "none"])
+def test_parameter_counts_per_scope(scope):
+    """Every scope duplicates exactly the tensors plan.md says it does.
+
+    Checked on the real 12-cascade configuration, because the overheads are
+    what justify the variants: if `io` is not actually 0.14%, the result it is
+    meant to support is not the result it reports.
+    """
+    per_cascade, in_sens = SCOPE_EXTRA[scope]
+    length = 1000
+    model = DPIVarNet(**PAPER_CONFIG, dpi_scope=scope, lambda_length=length)
+    summary = dpi_param_summary(model)
+
+    baseline_params = sum(p.numel() for p in VarNet(**PAPER_CONFIG).parameters())
+    assert summary["base"] == baseline_params
+
+    assert summary["copies"] == 12 * per_cascade + in_sens
+    # phi is a parameter only when there is something for lambda to
+    # interpolate; the "none" control must match the baseline exactly.
+    assert summary["phi"] == (0 if scope == "none" else length)
+    if scope == "none":
+        assert summary["total"] == baseline_params
+
+
+@pytest.mark.parametrize("scope", ["full", "shallow", "io", "dc", "none"])
+def test_scope_equals_baseline_at_init_for_every_rate(scope):
+    """Test 1 (equivalence at initialisation) holds for every scope.
+
+    A scope only decides which tensors have a copy; while each copy equals
+    its base tensor, eq. (2) collapses to the baseline whatever lambda is.
+    """
+    torch.manual_seed(0)
+    baseline = VarNet(**SMALL)
+    dpi = DPIVarNet(**SMALL, dpi_scope=scope, lambda_length=64)
+    load_baseline_state_dict(dpi, baseline.state_dict(), strip_prefix="")
+
+    kspace, mask, nlf = masked_input()
+    with torch.no_grad():
+        want = baseline(kspace, mask, nlf)
+        scale = float(want.abs().max())
+        for rate in RATES:
+            got = dpi(kspace, mask, nlf, accel(rate))
+            rel = float((want - got).abs().max()) / scale
+            assert rel < 1e-5, f"scope={scope} R={rate}: relative difference {rel:.2e}"
+
+
+@pytest.mark.parametrize("scope", ["full", "shallow", "io", "dc", "none"])
+def test_scope_state_dict_stays_baseline_compatible(scope):
+    """Narrowing the scope must not rename or drop a baseline tensor.
+
+    This is what keeps one verification harness and one warm-start path
+    working for every variant: the baseline keys are always present verbatim,
+    and the only additions are the copies this scope created plus phi.
+    """
+    baseline_keys = set(VarNet(**SMALL).state_dict().keys())
+    dpi_keys = set(
+        DPIVarNet(**SMALL, dpi_scope=scope, lambda_length=64).state_dict().keys()
+    )
+
+    assert baseline_keys <= dpi_keys, sorted(baseline_keys - dpi_keys)[:8]
+    new = dpi_keys - baseline_keys
+    unexplained = [k for k in new if not (k.endswith("_copy") or k == "lambda_table.phi")]
+    assert not unexplained, unexplained[:8]
+    # phi stays in the state dict even as a buffer under "none": it is how
+    # verify_varnet.is_dpi_state recognises a DPI checkpoint at all.
+    assert "lambda_table.phi" in new
+
+
+def test_io_scope_duplicates_exactly_the_intended_layers():
+    """The `io` scope is a specific claim about which layers matter, so name them.
+
+    First ConvBlock of each U-Net, the final 1x1 projection, and dc_weight --
+    and nothing else. The head ConvBlock sits behind that projection and is
+    deliberately NOT duplicated, which is the one case where a scope splits an
+    nn.Sequential the baseline treats as one unit.
+    """
+    model = DPIVarNet(**SMALL, dpi_scope="io", lambda_length=64)
+    copies = sorted(n for n, _ in model.named_parameters() if n.endswith("_copy"))
+
+    cascade0 = [n for n in copies if n.startswith("cascades.0.")]
+    assert cascade0 == [
+        "cascades.0.dc_weight_copy",
+        "cascades.0.model.unet.down_sample_layers.0.layers.0.weight_copy",
+        "cascades.0.model.unet.down_sample_layers.0.layers.4.weight_copy",
+        "cascades.0.model.unet.up_conv.1.1.bias_copy",
+        "cascades.0.model.unet.up_conv.1.1.weight_copy",
+    ]
+    # up_conv.{n-1}.0 is the head ConvBlock: present in the model, no copy.
+    assert "cascades.0.model.unet.up_conv.1.0.layers.0.weight_copy" not in copies
+    assert any(n.startswith("sens_net.") for n in copies), "sens net follows the scope"
+
+
+def test_dc_scope_duplicates_only_the_step_sizes():
+    model = DPIVarNet(**SMALL, dpi_scope="dc", lambda_length=64)
+    copies = sorted(n for n, _ in model.named_parameters() if n.endswith("_copy"))
+    assert copies == ["cascades.0.dc_weight_copy", "cascades.1.dc_weight_copy"]
+
+
+def test_none_scope_is_the_baseline_network():
+    """The control: identical to VarNet in parameters, and rate-blind.
+
+    phi becomes a buffer, so there is no parameter without a gradient (which
+    DDP rejects) and the parameter count matches the baseline exactly. lambda
+    is still computed; it simply multiplies nothing.
+    """
+    model = DPIVarNet(**SMALL, dpi_scope="none", lambda_length=64)
+    assert not [n for n, _ in model.named_parameters() if n.endswith("_copy")]
+    assert "lambda_table.phi" not in dict(model.named_parameters())
+    assert "lambda_table.phi" in dict(model.named_buffers())
+
+    baseline_params = sum(p.numel() for p in VarNet(**SMALL).parameters())
+    assert sum(p.numel() for p in model.parameters()) == baseline_params
+
+    # rate-blind by construction: no copy anywhere, so lambda cannot change
+    # the output even once training has moved the weights.
+    torch.manual_seed(0)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(torch.randn_like(p) * 0.05)
+    kspace, mask, nlf = masked_input()
+    with torch.no_grad():
+        assert torch.equal(
+            model(kspace, mask, nlf, accel(2.0)), model(kspace, mask, nlf, accel(8.0))
+        )
+
+
+@pytest.mark.parametrize("scope", ["full", "shallow", "io", "dc"])
+def test_every_copy_a_scope_creates_receives_gradient(scope):
+    """No scope may create a parameter that never trains.
+
+    cascades.0.dc_weight is the documented exception (the first cascade data
+    consistency term is identically zero, in the baseline too), so that one
+    name is skipped.
+    """
+    torch.manual_seed(0)
+    dpi = DPIVarNet(**SMALL, dpi_scope=scope, lambda_length=64)
+    # Separate the two sets first: at init the copies are equal, which is the
+    # one situation where phi legitimately has a zero gradient.
+    with torch.no_grad():
+        for name, p in dpi.named_parameters():
+            if name.endswith("_copy"):
+                p.add_(torch.randn_like(p) * 0.1)
+
+    kspace, mask, nlf = masked_input()
+    dpi.zero_grad()
+    dpi(kspace, mask, nlf, accel(4.0)).sum().backward()
+
+    assert float(dpi.lambda_table.phi.grad.abs().sum()) > 0, "phi must train"
+    for name, p in dpi.named_parameters():
+        if not name.endswith("_copy") or name == "cascades.0.dc_weight_copy":
+            continue
+        assert p.grad is not None, name
+        assert float(p.grad.abs().sum()) > 0, name
+
+
+@pytest.mark.parametrize("scope", ["shallow", "io", "dc", "none"])
+def test_narrow_scopes_are_cheaper_than_full(scope):
+    """Sanity ordering, so a mis-specified flag table cannot pass unnoticed."""
+    full = dpi_param_summary(DPIVarNet(**SMALL, lambda_length=64))["copies"]
+    narrow = dpi_param_summary(
+        DPIVarNet(**SMALL, dpi_scope=scope, lambda_length=64)
+    )["copies"]
+    assert narrow < full
+
+
+def test_unknown_scope_is_rejected():
+    with pytest.raises(ValueError, match="dpi_scope"):
+        DPIVarNet(**SMALL, dpi_scope="everything", lambda_length=64)
+
+
+def test_scope_survives_a_checkpoint_round_trip():
+    """A scoped checkpoint must rebuild as the same network.
+
+    This is the contract verification/verify_varnet.py depends on: it reads
+    dpi_scope out of hyper_parameters (defaulting to "full" for checkpoints
+    written before the flag existed) and rebuilds DPIVarNet from it, then
+    loads the state dict strictly.
+    """
+    torch.manual_seed(0)
+    original = DPIVarNet(**SMALL, dpi_scope="io", lambda_length=64)
+    state = original.state_dict()
+
+    rebuilt = DPIVarNet(**SMALL, dpi_scope="io", lambda_length=64)
+    rebuilt.load_state_dict(state, strict=True)
+
+    # the wrong scope must fail loudly rather than silently drop the copies
+    with pytest.raises(RuntimeError):
+        DPIVarNet(**SMALL, dpi_scope="full", lambda_length=64).load_state_dict(
+            state, strict=True
+        )

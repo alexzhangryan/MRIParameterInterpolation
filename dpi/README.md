@@ -8,7 +8,30 @@ mechanics are right; `../VERIFICATION.md` is what decides whether the result
 means anything.
 
 *Status 2026-09-19: implemented, 21 unit tests and four local smoke targets
-green on synthetic data. Not yet submitted on CHTC.*
+green on synthetic data.*
+
+*Status 2026-09-28: `--dpi_scope` added (Phase C block B, the supervisor's
+"several DPI variants" ask), with per-scope tests and a `make scope-smoke`
+target. The parameter counts every scope produces match the table derived by
+hand in `plan.md` section 2 exactly. **`make local-run` green** (`test` 49
+passed, `smoke`, `scope-smoke`, `job-smoke`, `warm-smoke`), and
+`verification`'s four toy checkpoints — baseline, DPI full, DPI io, and one
+with no `dpi_scope` hyper-parameter — all load and score with the right
+scope. `job-smoke` is the one that matters most: the scope line appears under
+`../training/run_train.sh`, the executable HTCondor actually runs, both on a
+fresh run and after a simulated eviction. Not yet run on a GPU slot. `full`
+is the default and is what every earlier checkpoint is, so nothing already
+trained or queued changes behaviour. No image rebuild is needed: the DPI code
+is transferred with the job, not baked in.*
+
+*Bug found and fixed while testing the above: `on_fit_start` reported the
+parameter summary with `self.print`, which routes through
+`TQDMProgressBar.print` — and that method **silently discards the message**
+when no progress bar is active, which is always the case at fit start. So the
+`[dpi] ...` line this file has promised since 2026-09-19 never actually
+appeared in any job log, including the DPI runs already on the cluster. It now
+uses `rank_zero_info`, and `make scope-smoke` greps for it, so it cannot
+regress unnoticed. Nothing about training was affected — only the log line.*
 
 ## What DPI does, and what it is here
 
@@ -76,10 +99,11 @@ directory, the same two batches the baseline trains and validates on.
 | `dpi_transforms.py` | same | Recording mask functions for all five fastMRI families, `DPIVarNetSample` (the baseline's eight fields plus `acceleration`), and `DPIVarNetDataTransform`. |
 | `dpi_module.py` | same | `DPIVarNetModule`: the baseline Lightning module with the DPI network, `batch.acceleration` threaded through each step, `lambda/R{2,4,6,8}` logged each validation epoch, and phi in its own optimiser group. |
 | `train_dpi.py` | inside the job | The driver: `../training/train_wandb.py` with the two hooks swapped. |
-| `test_dpi.py` | laptop | 21 checks of the DPI mechanics. `make test`. |
+| `test_dpi.py` | laptop | 49 checks of the DPI mechanics, including every `--dpi_scope`. `make test`. |
+| `divergence.py` | laptop, one checkpoint | How far the two parameter sets separated in training, per layer family (the measured scope table), plus lambda at each trained rate. No data, no GPU. `make divergence CKPT=...`. Run it on a finished `full` checkpoint before queueing a narrow scope. |
 | `train.sub` | access point | HTCondor submit file. `../training/run_train.sh` as the executable, `TRAIN_DRIVER=train_dpi.py`, the DPI flags. |
 | `submit.sh` | access point | `./submit.sh [name="..."] [init=...] [key=value ...]`. Sources `../.env`, refuses to submit without a W&B key unless `OFFLINE=1`, proves with `-dry-run` that the preset and the DPI driver reached the job ad. |
-| `Makefile` | laptop + access point | `make test/smoke/job-smoke/warm-smoke/local-run` and `make submit/resume/status/logs/why`. |
+| `Makefile` | laptop + access point | `make test/smoke/scope-smoke/job-smoke/warm-smoke/local-run`, `make divergence CKPT=...`, and `make submit [SCOPE=io]/resume/status/logs/why`. |
 
 Nothing in `fastMRI/`, `parameter_interpolation/` or `../training/`'s
 behaviour is modified. `../training/train_wandb.py` and `run_train.sh` grew
@@ -108,6 +132,13 @@ environment plus pytest):
 | phi is in its own optimiser group at its own lr, and every parameter is in exactly one group | the paper's separate learning rate |
 | the transform records the rate the mask function drew, and its other eight fields are bit-identical to the baseline transform's | the scalar is the true nominal rate, and the data is otherwise untouched |
 | a seeded validation volume draws one rate | matches how the baseline validates |
+| **per scope:** parameter counts match `plan.md` section 2 on the real 12-cascade config | a variant that does not duplicate what it claims to is not the variant being reported |
+| **per scope:** equivalence to the baseline at init, and baseline state-dict keys still verbatim | one warm-start path and one verification harness for every variant |
+| **per scope:** every copy a scope creates receives gradient | no scope may create a parameter that never trains |
+| `io` duplicates exactly the named layers, by state-dict key | the `io` claim is about specific layers, so the test names them instead of counting |
+| `dc` duplicates only the step sizes | the cheapest variant is really only that |
+| `none` has no copies, phi is a buffer, parameter count equals VarNet, and the output is identical at 2x and 8x | the control is rate-blind by construction, not just by convention |
+| an unknown scope raises, and a scoped checkpoint refuses to load into a different scope | a typo cannot silently train `full` under a variant's name |
 
 Beyond the tests, measured on a 12-step synthetic run: the two sets start
 identical, diverge (max abs difference 2.4e-3 after 12 steps), lambda moves,
@@ -123,20 +154,67 @@ At the real architecture (12 cascades, 18/8 channels), measured:
 
 A DPI checkpoint is about 240 MB of weights, roughly twice the baseline's.
 
+## `--dpi_scope`: which tensors get a second parameter set
+
+The paper duplicates every learnable tensor, which is `full`, the default and
+what the first DPI run trained. The narrower scopes exist because the
+hypothesis is specifically about the layers whose input statistics change
+with R: a scope that matches `full` at 0.14% of the extra parameters is a
+much stronger claim than `full` on its own. Priority order and what each one
+tests: `plan.md`, "DPI variant grid (2026-09-24)".
+
+| `--dpi_scope` | Duplicates | Extra parameters | vs `full` |
+|---|---|---|---|
+| `full` (default) | every learnable tensor, as the paper does | 29,937,966 | 100% |
+| `shallow` | the two shallowest U-Net levels (down + up), the final 1x1, `dc_weight` | 946,094 | 3.16% |
+| `io` | the first ConvBlock, the final 1x1, `dc_weight` | 41,086 | 0.14% |
+| `dc` | only each cascade's data-consistency step size | 1,012 | 0.003% |
+| `none` | nothing: the control, which must track the blind baseline | 0 | 0% |
+
+Counts include phi (1,000) and are for the real 12-cascade configuration.
+They are not measurements of this code: they were derived by hand from the
+architecture in `plan.md` section 2 first, and
+`test_parameter_counts_per_scope` asserts the code reproduces them, so a
+wrong flag table fails the tests rather than silently redefining the variant.
+
+Two details worth knowing before reading a variant's numbers:
+
+- **`io` splits the U-Net head.** The last up level is
+  `nn.Sequential(ConvBlock, Conv2d(1x1))`; `io` duplicates the 1x1 projection
+  but not the ConvBlock behind it. That is deliberate — the projection scales
+  the whole regulariser output — and it is the one place a scope cuts inside
+  a unit the baseline treats as one.
+- **`none` makes phi a buffer, not a parameter.** With nothing to interpolate,
+  a learnable phi would be a parameter that never receives a gradient (which
+  DDP rejects) and would leave the control 1,000 parameters heavier than the
+  baseline it is supposed to match. It stays in the state dict, which is what
+  lets the verification harness still recognise the checkpoint as DPI and
+  score it through the same path.
+
+`--no_dpi_sens` is orthogonal and still applies: it sets the sensitivity-map
+U-Net to `none` while the cascades keep the chosen scope.
+
 ## Local checks before submitting
 
 ```bash
 cd dpi
-make test          # the 21 mechanics checks
+make test          # the mechanics checks, including every scope
 make smoke         # train_dpi.py on synthetic phantoms, then a rerun that must resume
+make scope-smoke   # each --dpi_scope trains and checkpoints through the CLI
 make job-smoke     # ../training/run_train.sh with TRAIN_DRIVER=train_dpi.py, twice (fresh + evicted)
 make warm-smoke    # train a baseline checkpoint, then start DPI from it
-make local-run     # all four
+make local-run     # all five
 ```
 
 They need no W&B key and no real data. `make local-run` green means the
 model, the transform, the driver, the job executable, the resume contract
 and the warm start all work before a GPU slot is used.
+
+`scope-smoke` is the one that matters for a variant: it greps the job log for
+the model reporting the scope it actually built (`[dpi] scope io: base ... +
+copies ...`), which is what catches a flag that never arrived — the same class
+of bug as the 2026-09-13 submit-macro incident, and one that would otherwise
+look like a variant result instead of a rerun of `full`.
 
 ## Run on CHTC
 
@@ -164,10 +242,14 @@ make submit
 ```
 
 The `.out` must show, in order: `driver=train_dpi.py`, `W&B preflight OK`,
-`multicoil_train: 455 volumes`, `[dpi] parameters: base 29,936,... + copies
+`multicoil_train: 455 volumes`, `[dpi] scope full: base 29,936,... + copies
 29,936,... + phi 1,000`, `from scratch (both parameter sets randomly
 initialised, identical)`, and a `W&B run: 'dpi mixed acceleration brain'`
 line with a URL.
+
+(The `[dpi] scope ...` line only reaches the log from 2026-09-28 on — before
+that `self.print` swallowed it, see the status note at the top. A job started
+with older code will not have it, which says nothing about that run.)
 
 **W&B run:** `dpi mixed acceleration brain` (id
 `dpi-mixed-acceleration-brain`) in project `fastmri-varnet-train`, next to
@@ -191,6 +273,33 @@ unfilled parameters are the copies and phi, then sets each copy to its base
 tensor, so training starts exactly at the baseline for every rate.
 
 **Resuming** is the baseline's: `make resume CKPT=runs/brain/dpi/<Cluster>/checkpoints/last.ckpt`.
+For a variant, pass its scope too, so the run directory and W&B run match:
+`make resume SCOPE=io CKPT=runs/brain/dpi-io/<Cluster>/checkpoints/last.ckpt`.
+
+**Variants (`--dpi_scope`).** `SCOPE=` is all that changes; everything else is
+the same run:
+
+```bash
+make submit SCOPE=io          # runs/brain/dpi-io/, W&B "dpi io mixed acceleration brain"
+make submit SCOPE=dc
+make submit SCOPE=none        # the control
+```
+
+Anything but `full` also moves the `model` macro to `dpi-<scope>`, so each
+variant gets its own run directory, its own log files and its own W&B run
+rather than landing on the full run's. `submit.sh` refuses to submit if
+`--dpi_scope <scope>` did not reach the job ad, alongside the existing checks
+on the run name, the rate list and the DPI driver.
+
+Submission order is `plan.md`'s priority list: warm-started `full` first, then
+`io`, `dc`, `full --no_dpi_sens`, `shallow`, and the `--accel_min 4
+--accel_max 8` independent-sets probe. Each is a 50-epoch model2-sized run on
+one GPU, and each is scored per rate through `../verification/`.
+
+Before reading any variant's numbers, check its `.out` line
+`[dpi] scope <scope>: base N + copies M + phi 1,000` against the table above.
+`copies` is the variant's identity; if it says 29,937,966 the run was `full`
+whatever the W&B run is called.
 
 ## Reading the result
 

@@ -26,11 +26,12 @@ from argparse import ArgumentParser
 
 import torch
 from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
 
 from fastmri.data import transforms
 from fastmri.pl_modules import VarNetModule
 
-from dpi_varnet import DPIVarNet, dpi_param_summary
+from dpi_varnet import DPI_SCOPES, DPIVarNet, dpi_param_summary
 
 # The W&B-safe image logging lives in ../training/train_wandb.py. Inside a
 # job every transferred file sits in one flat directory, so the plain import
@@ -56,6 +57,7 @@ class DPIVarNetModule(_BaseModule):
         lr_step_size: int = 40,
         lr_gamma: float = 0.1,
         weight_decay: float = 0.0,
+        dpi_scope: str = "full",
         dpi_sens: bool = True,
         lambda_lr: float = 1e-3,
         lambda_length: int = 1000,
@@ -91,6 +93,7 @@ class DPIVarNetModule(_BaseModule):
             sens_pools=sens_pools,
             chans=chans,
             pools=pools,
+            dpi_scope=dpi_scope,
             dpi_sens=dpi_sens,
             lambda_length=lambda_length,
             accel_min=accel_min,
@@ -199,16 +202,21 @@ class DPIVarNetModule(_BaseModule):
         for name, param in self.named_parameters():
             (lambda_params if "lambda_table" in name else backbone_params).append(param)
 
-        optim = torch.optim.Adam(
-            [
-                {
-                    "params": backbone_params,
-                    "lr": self.lr,
-                    "weight_decay": self.weight_decay,
-                },
-                {"params": lambda_params, "lr": self.lambda_lr, "weight_decay": 0.0},
-            ]
-        )
+        groups = [
+            {
+                "params": backbone_params,
+                "lr": self.lr,
+                "weight_decay": self.weight_decay,
+            }
+        ]
+        # Under dpi_scope "none" phi is a buffer, not a parameter, so there is
+        # no second group to make: the control must be the baseline optimiser
+        # exactly, not the baseline plus an empty group.
+        if lambda_params:
+            groups.append(
+                {"params": lambda_params, "lr": self.lambda_lr, "weight_decay": 0.0}
+            )
+        optim = torch.optim.Adam(groups)
         # StepLR scales every group, so phi's rate decays with the backbone's
         # at epoch 40. That is a choice, not the paper's: the paper holds phi
         # at a constant 1e-3 throughout.
@@ -218,15 +226,31 @@ class DPIVarNetModule(_BaseModule):
         return [optim], [scheduler]
 
     def on_fit_start(self):
+        # rank_zero_info, not self.print: LightningModule.print routes through
+        # TQDMProgressBar.print, which silently drops the message when no
+        # progress bar is active -- and at on_fit_start none exists yet. That
+        # is why this line never appeared in a job log before 2026-09-28,
+        # despite dpi/README.md promising it since 2026-09-19. It is the only
+        # record of which scope a run actually built, so it has to survive.
         summary = dpi_param_summary(self.varnet)
-        self.print(
-            f"[dpi] parameters: base {summary['base']:,} + copies {summary['copies']:,} "
-            f"+ phi {summary['phi']:,} = {summary['total']:,}"
+        rank_zero_info(
+            f"[dpi] scope {self.varnet.dpi_scope}: base {summary['base']:,} "
+            f"+ copies {summary['copies']:,} + phi {summary['phi']:,} "
+            f"= {summary['total']:,}"
         )
 
     @staticmethod
     def add_model_specific_args(parent_parser):  # pragma: no-cover
         parser = VarNetModule.add_model_specific_args(parent_parser)
+        parser.add_argument(
+            "--dpi_scope",
+            default="full",
+            choices=DPI_SCOPES,
+            help="which learnable tensors get a second parameter set. full (the "
+                 "paper: all of them), shallow, io (first ConvBlock + final 1x1 + "
+                 "dc_weight), dc (only the data-consistency step size), none "
+                 "(control: must track the blind baseline)",
+        )
         parser.add_argument(
             "--no_dpi_sens",
             dest="dpi_sens",

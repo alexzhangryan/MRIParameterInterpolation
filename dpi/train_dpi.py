@@ -75,6 +75,7 @@ def build_dpi_model(args):
         lr_step_size=args.lr_step_size,
         lr_gamma=args.lr_gamma,
         weight_decay=args.weight_decay,
+        dpi_scope=args.dpi_scope,
         dpi_sens=args.dpi_sens,
         lambda_lr=args.lambda_lr,
         lambda_length=args.lambda_length,

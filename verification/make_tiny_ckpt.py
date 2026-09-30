@@ -7,8 +7,15 @@ Writes, from untrained modules at a toy size, in the format
 ../training/train_wandb.py and ../dpi/train_dpi.py actually produce
 (Lightning's `state_dict` plus `hyper_parameters`):
 
-    <out>/tiny_varnet.ckpt    VarNetModule      (the baseline's checkpoint)
-    <out>/tiny_dpi.ckpt       DPIVarNetModule   (a ../dpi checkpoint)
+    <out>/tiny_varnet.ckpt      VarNetModule     (the baseline's checkpoint)
+    <out>/tiny_dpi.ckpt         DPIVarNetModule  (a ../dpi checkpoint, scope full)
+    <out>/tiny_dpi_io.ckpt      DPIVarNetModule  (--dpi_scope io: only some
+                                 tensors have a `_copy`, so the rebuild has to
+                                 read dpi_scope out of hyper_parameters)
+    <out>/tiny_dpi_legacy.ckpt  the same as tiny_dpi.ckpt with `dpi_scope`
+                                 deleted from hyper_parameters, which is what
+                                 the DPI runs launched before 2026-09-28 wrote.
+                                 verify_varnet.py must still score it, as full.
 
 They exist so verify_varnet.py's checkpoint path can be exercised without a
 trained model: the `varnet.` subtree selection (a module checkpoint also
@@ -46,14 +53,25 @@ def main() -> int:
     arch = dict(num_cascades=args.num_cascades, pools=args.pools, chans=args.chans,
                 sens_pools=args.sens_pools, sens_chans=args.sens_chans)
     modules = (
-        ("tiny_varnet.ckpt", VarNetModule(**arch)),
-        ("tiny_dpi.ckpt", DPIVarNetModule(**arch, lambda_length=args.lambda_length)),
+        ("tiny_varnet.ckpt", VarNetModule(**arch), None),
+        ("tiny_dpi.ckpt", DPIVarNetModule(**arch, lambda_length=args.lambda_length), None),
+        ("tiny_dpi_io.ckpt",
+         DPIVarNetModule(**arch, lambda_length=args.lambda_length, dpi_scope="io"), None),
+        # A checkpoint from before --dpi_scope existed: same network as
+        # tiny_dpi.ckpt, but hyper_parameters has no dpi_scope key. The DPI
+        # runs already on the cluster are exactly this, so the harness has to
+        # keep scoring them (as full, which is what they are).
+        ("tiny_dpi_legacy.ckpt",
+         DPIVarNetModule(**arch, lambda_length=args.lambda_length), "dpi_scope"),
     )
     args.out.mkdir(parents=True, exist_ok=True)
-    for name, module in modules:
+    for name, module, drop_hparam in modules:
+        hparams = dict(module.hparams)
+        if drop_hparam:
+            hparams.pop(drop_hparam, None)
         ckpt = {
             "state_dict": module.state_dict(),
-            "hyper_parameters": dict(module.hparams),
+            "hyper_parameters": hparams,
             "pytorch-lightning_version": pl.__version__,
         }
         path = args.out / name

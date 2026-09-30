@@ -174,7 +174,11 @@ environment     = "WANDB_PROJECT=fastmri-varnet-train WANDB_ALLOW_OFFLINE=$(allo
 on_exit_hold         = (ExitBySignal == False) && (ExitCode == 4)
 on_exit_hold_reason  = "W&B preflight failed (exit 4): key missing or rejected, or run not online. Fix WANDB_API_KEY in ../.env and resubmit; see the .err log"
 on_exit_hold_subcode = 4
-retry_until          = (ExitCode == 4)
+# ExitBySignal guard: a job killed by a signal has no ExitCode, so a bare
+# (ExitCode == 4) is UNDEFINED, which makes max_retries' on_exit_remove
+# UNDEFINED and the job leaves the queue instead of retrying. 2026-09-29:
+# cluster 11380824 got SIGTERM at epoch 20 of 50 and was dropped that way.
+retry_until          = (ExitBySignal == False) && (ExitCode == 4)
 
 # --- resources ---------------------------------------------------------------
 # request_disk covers peak scratch during extraction: run_train.sh deletes a

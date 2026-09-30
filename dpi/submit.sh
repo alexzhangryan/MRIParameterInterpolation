@@ -7,6 +7,9 @@
 #   ./submit.sh init=../training/runs/brain/model2/<Cluster>/checkpoints/last.ckpt
 #                                          warm start both parameter sets from
 #                                          the trained baseline
+#   ./submit.sh scope=io                   a variant from the plan.md grid; gets
+#                                          its own runs/brain/dpi-io/, logs and
+#                                          W&B run "dpi io mixed acceleration brain"
 #   ./submit.sh resume=runs/brain/dpi/<Cluster>/checkpoints/last.ckpt
 #   ./submit.sh max_epochs=1 extra_args="--limit_train_batches 50 --limit_val_batches 10"
 #   OFFLINE=1 ./submit.sh                  log offline instead of holding on a bad key
@@ -33,6 +36,8 @@ DATASET=brain
 NAME=""
 USER_RUN_NAME=""
 INIT=""
+SCOPE="full"
+USER_MODEL=""
 PASS=()
 for kv in "$@"; do
   case "$kv" in
@@ -40,9 +45,28 @@ for kv in "$@"; do
     name=*)     NAME="${kv#name=}" ;;
     run_name=*) USER_RUN_NAME="${kv#run_name=}"; PASS+=("$kv") ;;
     init=*)     INIT="${kv#init=}" ;;
+    # scope=io is shorthand for dpi_scope=io plus a variant-specific model
+    # name, so the run directory, the log files and the W&B run are its own.
+    # dpi_scope=io works too and is passed straight through.
+    scope=*)      SCOPE="${kv#scope=}"; PASS+=("dpi_scope=$SCOPE") ;;
+    dpi_scope=*)  SCOPE="${kv#dpi_scope=}"; PASS+=("$kv") ;;
+    model=*)      USER_MODEL="${kv#model=}"; PASS+=("$kv") ;;
     *)          PASS+=("$kv") ;;
   esac
 done
+case "$SCOPE" in
+  full|shallow|io|dc|none) ;;
+  *) echo "scope must be one of full shallow io dc none, got '$SCOPE'" >&2; exit 2 ;;
+esac
+# model names the run directory and the log files. "dpi" for the paper's full
+# scope (the first run, whose paths already exist), "dpi-<scope>" otherwise.
+if [ -n "$USER_MODEL" ]; then
+  MODEL="$USER_MODEL"
+elif [ "$SCOPE" = "full" ]; then
+  MODEL="dpi"
+else
+  MODEL="dpi-$SCOPE"
+fi
 # ${arr[@]+"${arr[@]}"}: under set -u, bash < 4.4 treats an empty array
 # expansion as an unbound variable.
 set -- ${PASS[@]+"${PASS[@]}"}
@@ -52,6 +76,7 @@ slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+
 # The naming convention when no name= is given, alongside the baseline's
 # "mixed acceleration brain".
 DEFAULT_NAME="dpi mixed acceleration $DATASET"
+[ "$SCOPE" = "full" ] || DEFAULT_NAME="dpi $SCOPE mixed acceleration $DATASET"
 if [ -n "$USER_RUN_NAME" ]; then
   WANT_NAME="$USER_RUN_NAME"
   NAME_MACROS=()
@@ -63,11 +88,11 @@ else
   NAME_MACROS=(run_name="$WANT_NAME" wandb_name="$NAME")
 fi
 
-PRESET=(model=dpi accelerations="2 4 6 8" center_fractions="0.16 0.08 0.0533 0.04"
+PRESET=(model="$MODEL" accelerations="2 4 6 8" center_fractions="0.16 0.08 0.0533 0.04"
         ${NAME_MACROS[@]+"${NAME_MACROS[@]}"})
 [ -n "${OFFLINE:-}" ] && PRESET+=(allow_offline=1)
 
-mkdir -p logs "runs/$DATASET/dpi"
+mkdir -p logs "runs/$DATASET/$MODEL"
 
 if ! command -v condor_submit >/dev/null 2>&1; then
   echo "condor_submit not found: run this on ap2001.chtc.wisc.edu, not on the laptop" >&2
@@ -136,6 +161,9 @@ case "$ARGS_LINE" in *"--run_name $WANT_NAME "*) ;; *) fail="$fail --run_name $W
 case " $* " in *" accelerations="*) ;; *)
   case "$ARGS_LINE" in *"--accelerations 2 4 6 8 "*) ;; *) fail="$fail --accelerations 2 4 6 8" ;; esac ;;
 esac
+# The scope is the variant: a dropped --dpi_scope trains `full` again under a
+# variant's name and W&B run, which looks like a result and is not one.
+case "$ARGS_LINE" in *"--dpi_scope $SCOPE "*) ;; *) fail="$fail --dpi_scope $SCOPE" ;; esac
 # The whole point of this submit file: the DPI driver must be the one that runs.
 case "$(grep -m1 -E '^Environment *=' "$DRY" || true)" in
   *TRAIN_DRIVER=train_dpi.py*) ;;
@@ -156,5 +184,6 @@ echo "submitting $SUB ${PRESET[*]} $*"
 condor_submit "$SUB" "${PRESET[@]}" "$@"
 echo
 echo "W&B run:     '${NAME:-$WANT_NAME}'  id=$WANT_NAME  project=${WANDB_PROJECT:-fastmri-varnet-train}${OFFLINE:+  (OFFLINE=1: logging offline)}"
-echo "watch:       condor_q -nobatch; tail -f logs/${DATASET}_dpi_*.out"
-echo "checkpoints: runs/$DATASET/dpi/<Cluster>/checkpoints/last.ckpt  (resume=... to continue)"
+echo "dpi scope:   $SCOPE"
+echo "watch:       condor_q -nobatch; tail -f logs/${DATASET}_${MODEL}_*.out"
+echo "checkpoints: runs/$DATASET/$MODEL/<Cluster>/checkpoints/last.ckpt  (resume=... to continue)"

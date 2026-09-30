@@ -127,7 +127,7 @@ help:
 	@echo "  make push IMAGE=<user>/fastmri-verify:2026-09   publish for CHTC"
 	@echo "  make tier0           environment + metric invariants (+ fastMRI pytest); real verdicts"
 	@echo "  make smoke           verify_varnet.py on synthetic data with a random model"
-	@echo "  make smoke-ckpt      score toy VarNetModule and DPIVarNetModule checkpoints (both kinds must load)"
+	@echo "  make smoke-ckpt      score toy checkpoints: baseline, DPI full, DPI io, pre-dpi_scope DPI"
 	@echo "  make job-smoke       run_verify.sh the way HTCondor will: brain-named .tar.xz, DPI ckpt, offline W&B"
 	@echo "  make job-evict       SIGTERM a running job: the eviction cleanup must run"
 	@echo "  make shell           interactive shell in the image, repo mounted at /work"
@@ -226,7 +226,8 @@ brain_multicoil_val_batch_synthetic.tar.xz: $(SYNTH)/multicoil_val
 	rm -rf .brainpack
 
 # --- toy checkpoints ---------------------------------------------------------
-# Untrained VarNetModule and DPIVarNetModule checkpoints in Lightning's
+# Untrained VarNetModule and DPIVarNetModule checkpoints (full, io, and one
+# without a dpi_scope hparam) in Lightning's
 # on-disk format, at $(SMOKE_ARCH) size. See make_tiny_ckpt.py.
 ckpttest/tiny_dpi.ckpt: make_tiny_ckpt.py | build
 	$(RUN) python make_tiny_ckpt.py --out ckpttest $(SMOKE_ARCH)
@@ -268,14 +269,19 @@ smoke: build check-eol synthetic
 # the forward deterministically. Verdicts on random weights are meaningless.
 .PHONY: smoke-ckpt
 smoke-ckpt: build check-eol synthetic ckpttest/tiny_dpi.ckpt
-	@for c in tiny_varnet:varnet tiny_dpi:dpi_varnet; do \
-	  f=$${c%%:*}; want=$${c##*:}; rm -rf output; \
+	@for c in tiny_varnet:varnet:- tiny_dpi:dpi_varnet:full tiny_dpi_io:dpi_varnet:io tiny_dpi_legacy:dpi_varnet:full; do \
+	  f=$${c%%:*}; rest=$${c#*:}; want=$${rest%%:*}; scope=$${rest##*:}; rm -rf output; \
 	  $(RUN) python verify_varnet.py tier1 --data_path $(SYNTH)/multicoil_val --output_dir output \
 	      --fastmri_repo /opt/fastMRI --run_name smoke-$$f --state_dict ckpttest/$$f.ckpt \
 	      --accelerations 2 4 6 8 --center_fractions 0.16 0.08 0.0533 0.04 --mask_type equispaced_fraction \
 	      --num_workers 0 --determinism_volumes 1 --image_volumes 0 --no_wandb $(CPUFLAG) $(EXTRA) || true; \
 	  test -s output/tier1_report.json || { echo "FAILED: $$f.ckpt: no output/tier1_report.json" >&2; exit 1; }; \
 	  grep -q "\"model\": \"$$want\"" output/tier1_report.json || { echo "FAILED: $$f.ckpt was not scored as $$want" >&2; exit 1; }; \
+	  if [ "$$scope" != "-" ]; then \
+	    grep -q "\"dpi_scope\": \"$$scope\"" output/tier1_report.json \
+	      || { echo "FAILED: $$f.ckpt was not rebuilt with dpi_scope $$scope (the report says otherwise)" >&2; \
+	           grep -m1 dpi_scope output/tier1_report.json >&2; exit 1; }; \
+	  fi; \
 	  grep -q "\"name\": \"R4_determinism\", *\"status\": \"pass\"" output/tier1_report.json \
 	    || python3 -c "import json,sys; r=json.load(open('output/tier1_report.json')); \
 	         ok=[c for c in r['invariants'] if c['name']=='R4_determinism' and c['status']=='pass']; sys.exit(0 if ok else 1)" \
@@ -283,7 +289,7 @@ smoke-ckpt: build check-eol synthetic ckpttest/tiny_dpi.ckpt
 	  echo "ok: $$f.ckpt loaded as $$want, determinism passed"; \
 	done
 	@echo
-	@echo "smoke-ckpt passed: both checkpoint kinds load and score."
+	@echo "smoke-ckpt passed: baseline, DPI full, DPI io and a pre-dpi_scope DPI checkpoint all load and score."
 
 # --- smoke: the job executable ----------------------------------------------
 # run_verify.sh does what the harness does not: tarball extraction, split

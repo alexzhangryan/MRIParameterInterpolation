@@ -76,6 +76,7 @@ class LambdaTable(nn.Module):
         accel_min: float = 2.0,
         accel_max: float = 8.0,
         spacing: str = "log",
+        learnable: bool = True,
     ):
         super().__init__()
         if length < 2:
@@ -91,7 +92,18 @@ class LambdaTable(nn.Module):
         # phi: the learnable vector of section 3.2; randn init as in the
         # reference code (NormalizedSoftmaxApprox), which makes softmax(phi)
         # nearly uniform and lambda nearly linear at the start.
-        self.phi = nn.Parameter(torch.randn(length))
+        #
+        # learnable=False registers phi as a buffer instead, for dpi_scope
+        # "none": with no duplicated tensor anywhere, lambda multiplies
+        # nothing, so phi would be a parameter that never receives a gradient
+        # (an unused parameter under DDP) and would make the control's
+        # parameter count differ from the baseline VarNet's by S. It stays in
+        # the state dict either way, which is what lets the verification
+        # harness recognise a DPI checkpoint.
+        if learnable:
+            self.phi = nn.Parameter(torch.randn(length))
+        else:
+            self.register_buffer("phi", torch.randn(length))
         self.register_buffer(
             "cum", torch.tril(torch.ones(length, length)), persistent=False
         )
@@ -122,6 +134,81 @@ class LambdaTable(nn.Module):
         with respect to R, which is data.
         """
         return self.table()[self.index(accel)]
+
+
+# ---------------------------------------------------------------------------
+# which layers get a second parameter set
+# ---------------------------------------------------------------------------
+# The paper duplicates every learnable tensor ("full"). The narrower scopes
+# exist because the hypothesis is specifically about layers whose input
+# statistics change with R, and a scope that matches "full" at 0.14% of the
+# extra parameters is a much stronger result than "full" alone. Overheads on
+# the real 12-cascade VarNet (plan.md section 2, reproduced by
+# test_parameter_counts_per_scope):
+#
+#   scope    | down      | bottleneck | up             | final 1x1 | dc | extra
+#   ---------|-----------|------------|----------------|-----------|----|---------
+#   full     | all       | yes        | all            | yes       | y  | +100%
+#   shallow  | levels 01 | no         | levels 01      | yes       | y  | +3.2%
+#   io       | level 0   | no         | none           | yes       | y  | +0.14%
+#   dc       | none      | no         | none           | no        | y  | +0.003%
+#   none     | none      | no         | none           | no        | n  | 0
+#
+# "io" is the light default of the design: the first ConvBlock is the only
+# layer reading the aliased coil-combined image directly, the final 1x1
+# projection scales the regulariser output, and dc_weight is the
+# data-consistency step size -- the knob a hand-tuned unrolled solver retunes
+# per rate (Ada-MoDL conditions exactly this). "none" is the control: it must
+# track the blind baseline to seed noise.
+DPI_SCOPES = ("full", "shallow", "io", "dc", "none")
+
+
+def unet_dpi_flags(
+    scope: str, num_pool_layers: int
+) -> Tuple[List[bool], bool, List[bool], bool]:
+    """Per-layer duplication flags for one U-Net: (down, bottleneck, up, final).
+
+    `down` is indexed shallowest-first, as `Unet.down_sample_layers` is.
+    `up` is indexed DEEPEST-first, as `Unet.up_conv` / `up_transpose_conv`
+    are, so U-Net level 0 (the shallowest, the one carrying the head) is the
+    last entry. `final` is the 1x1 projection inside that head, which is why
+    it is separate from `up[-1]`: scope "io" duplicates the projection but
+    not the ConvBlock it sits behind.
+    """
+    if scope not in DPI_SCOPES:
+        raise ValueError(f"dpi_scope must be one of {DPI_SCOPES}, got {scope!r}")
+
+    n = num_pool_layers
+    if scope == "full":
+        return [True] * n, True, [True] * n, True
+    if scope == "shallow":
+        # levels 0 and 1, i.e. the two shallowest: down[0], down[1] and, in
+        # the deepest-first up lists, the last two entries.
+        down = [i < 2 for i in range(n)]
+        up = [(n - 1 - i) < 2 for i in range(n)]
+        return down, False, up, True
+    if scope == "io":
+        return [i < 1 for i in range(n)], False, [False] * n, True
+    # "dc" and "none" duplicate nothing inside the U-Net; they differ only in
+    # dc_weight, which is not a U-Net layer (see dc_dpi_flag).
+    return [False] * n, False, [False] * n, False
+
+
+def dc_dpi_flag(scope: str) -> bool:
+    """Whether each cascade's data-consistency weight gets a second copy."""
+    if scope not in DPI_SCOPES:
+        raise ValueError(f"dpi_scope must be one of {DPI_SCOPES}, got {scope!r}")
+    return scope != "none"
+
+
+def scope_duplicates_anything(scope: str) -> bool:
+    """False only for the control, where lambda has nothing to interpolate.
+
+    Independent of `dpi_sens`, which only ever switches the sensitivity net
+    off: with any scope but "none" the cascades still hold copies.
+    """
+    down, bottleneck, up, final = unet_dpi_flags(scope, 4)
+    return dc_dpi_flag(scope) or any(down) or bottleneck or any(up) or final
 
 
 # ---------------------------------------------------------------------------
@@ -261,11 +348,16 @@ class DPIUnetHead(nn.ModuleList):
     """
 
     def __init__(self, in_chans: int, out_chans: int, final_chans: int, drop_prob: float,
-                 dpi: bool = True):
+                 dpi: bool = True, dpi_final: Optional[bool] = None):
+        # The two children are flagged separately: scope "io" duplicates the
+        # 1x1 projection (it scales the whole regulariser output) but not the
+        # ConvBlock feeding it.
+        if dpi_final is None:
+            dpi_final = dpi
         super().__init__(
             [
                 DPIConvBlock(in_chans, out_chans, drop_prob, dpi=dpi),
-                DPIConv2d(out_chans, final_chans, kernel_size=1, stride=1, dpi=dpi),
+                DPIConv2d(out_chans, final_chans, kernel_size=1, stride=1, dpi=dpi_final),
             ]
         )
 
@@ -287,7 +379,7 @@ class DPIUnet(nn.Module):
         chans: int = 32,
         num_pool_layers: int = 4,
         drop_prob: float = 0.0,
-        dpi: bool = True,
+        scope: str = "full",
     ):
         super().__init__()
         self.in_chans = in_chans
@@ -295,25 +387,47 @@ class DPIUnet(nn.Module):
         self.chans = chans
         self.num_pool_layers = num_pool_layers
         self.drop_prob = drop_prob
+        self.scope = scope
+
+        # down is shallowest-first, up is deepest-first, matching the baseline
+        # ModuleLists this mirrors.
+        down_dpi, bottleneck_dpi, up_dpi, final_dpi = unet_dpi_flags(
+            scope, num_pool_layers
+        )
 
         self.down_sample_layers = nn.ModuleList(
-            [DPIConvBlock(in_chans, chans, drop_prob, dpi=dpi)]
+            [DPIConvBlock(in_chans, chans, drop_prob, dpi=down_dpi[0])]
         )
         ch = chans
-        for _ in range(num_pool_layers - 1):
-            self.down_sample_layers.append(DPIConvBlock(ch, ch * 2, drop_prob, dpi=dpi))
+        for i in range(num_pool_layers - 1):
+            self.down_sample_layers.append(
+                DPIConvBlock(ch, ch * 2, drop_prob, dpi=down_dpi[i + 1])
+            )
             ch *= 2
-        self.conv = DPIConvBlock(ch, ch * 2, drop_prob, dpi=dpi)
+        self.conv = DPIConvBlock(ch, ch * 2, drop_prob, dpi=bottleneck_dpi)
 
         self.up_conv = nn.ModuleList()
         self.up_transpose_conv = nn.ModuleList()
-        for _ in range(num_pool_layers - 1):
-            self.up_transpose_conv.append(DPITransposeConvBlock(ch * 2, ch, dpi=dpi))
-            self.up_conv.append(DPIConvBlock(ch * 2, ch, drop_prob, dpi=dpi))
+        for i in range(num_pool_layers - 1):
+            self.up_transpose_conv.append(
+                DPITransposeConvBlock(ch * 2, ch, dpi=up_dpi[i])
+            )
+            self.up_conv.append(DPIConvBlock(ch * 2, ch, drop_prob, dpi=up_dpi[i]))
             ch //= 2
 
-        self.up_transpose_conv.append(DPITransposeConvBlock(ch * 2, ch, dpi=dpi))
-        self.up_conv.append(DPIUnetHead(ch * 2, ch, self.out_chans, drop_prob, dpi=dpi))
+        self.up_transpose_conv.append(
+            DPITransposeConvBlock(ch * 2, ch, dpi=up_dpi[num_pool_layers - 1])
+        )
+        self.up_conv.append(
+            DPIUnetHead(
+                ch * 2,
+                ch,
+                self.out_chans,
+                drop_prob,
+                dpi=up_dpi[num_pool_layers - 1],
+                dpi_final=final_dpi,
+            )
+        )
 
     def forward(self, image: torch.Tensor, lam: torch.Tensor) -> torch.Tensor:
         stack = []
@@ -357,7 +471,7 @@ class DPINormUnet(nn.Module):
         in_chans: int = 2,
         out_chans: int = 2,
         drop_prob: float = 0.0,
-        dpi: bool = True,
+        scope: str = "full",
     ):
         super().__init__()
         self.unet = DPIUnet(
@@ -366,7 +480,7 @@ class DPINormUnet(nn.Module):
             chans=chans,
             num_pool_layers=num_pools,
             drop_prob=drop_prob,
-            dpi=dpi,
+            scope=scope,
         )
 
     def complex_to_chan_dim(self, x: torch.Tensor) -> torch.Tensor:
@@ -438,7 +552,8 @@ class DPISensitivityModel(nn.Module):
     ACS lines it sees spans a factor of four across the 2x-8x rate list
     (center fractions 0.16 to 0.04), so the map-estimation problem it solves
     is genuinely different at each rate. `dpi_sens=False` on DPIVarNet leaves
-    it as a single parameter set for the ablation.
+    it as a single parameter set for the ablation (scope "none" here), while
+    any other scope applies to this U-Net exactly as it does to a cascade's.
     """
 
     def __init__(
@@ -449,7 +564,7 @@ class DPISensitivityModel(nn.Module):
         out_chans: int = 2,
         drop_prob: float = 0.0,
         mask_center: bool = True,
-        dpi: bool = True,
+        scope: str = "full",
     ):
         super().__init__()
         self.mask_center = mask_center
@@ -459,7 +574,7 @@ class DPISensitivityModel(nn.Module):
             in_chans=in_chans,
             out_chans=out_chans,
             drop_prob=drop_prob,
-            dpi=dpi,
+            scope=scope,
         )
 
     def chans_to_batch_dim(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
@@ -567,7 +682,8 @@ class DPIVarNet(nn.Module):
     Same architecture, attribute names and arithmetic as
     fastmri.models.varnet.VarNet; the additions are the `lambda_table`, the
     `acceleration` forward argument, and a second copy of every learnable
-    tensor.
+    tensor `dpi_scope` selects (default "full": all of them, as the paper
+    does; see DPI_SCOPES for the narrower variants).
 
     One lambda per forward call, as in the paper ("a single scalar per
     batch"). The Lightning module splits a batch whose samples have
@@ -583,6 +699,7 @@ class DPIVarNet(nn.Module):
         chans: int = 18,
         pools: int = 4,
         mask_center: bool = True,
+        dpi_scope: str = "full",
         dpi_sens: bool = True,
         lambda_length: int = 1000,
         accel_min: float = 2.0,
@@ -590,22 +707,31 @@ class DPIVarNet(nn.Module):
         lambda_spacing: str = "log",
     ):
         super().__init__()
+        if dpi_scope not in DPI_SCOPES:
+            raise ValueError(
+                f"dpi_scope must be one of {DPI_SCOPES}, got {dpi_scope!r}"
+            )
+        self.dpi_scope = dpi_scope
 
         self.lambda_table = LambdaTable(
             length=lambda_length,
             accel_min=accel_min,
             accel_max=accel_max,
             spacing=lambda_spacing,
+            learnable=scope_duplicates_anything(dpi_scope),
         )
         self.sens_net = DPISensitivityModel(
             chans=sens_chans,
             num_pools=sens_pools,
             mask_center=mask_center,
-            dpi=dpi_sens,
+            scope=dpi_scope if dpi_sens else "none",
         )
         self.cascades = nn.ModuleList(
             [
-                DPIVarNetBlock(DPINormUnet(chans, pools), dpi=True)
+                DPIVarNetBlock(
+                    DPINormUnet(chans, pools, scope=dpi_scope),
+                    dpi=dc_dpi_flag(dpi_scope),
+                )
                 for _ in range(num_cascades)
             ]
         )

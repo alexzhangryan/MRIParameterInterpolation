@@ -462,6 +462,11 @@ ARCH_KEYS = ("num_cascades", "pools", "chans", "sens_pools", "sens_chans")
 # DPIVarNet constructor arguments that cannot be read back from tensor
 # shapes; DPIVarNetModule.save_hyperparameters() puts them in the checkpoint.
 DPI_HPARAMS = ("dpi_sens", "lambda_length", "accel_min", "accel_max", "lambda_spacing")
+# Added to dpi/ after the first DPI runs were launched, so it is read with a
+# default rather than required: a checkpoint written before --dpi_scope existed
+# duplicated every learnable tensor, which is exactly what "full" means. Kept
+# out of DPI_HPARAMS so those older checkpoints still score.
+DPI_HPARAM_DEFAULTS = {"dpi_scope": "full"}
 
 
 def load_state(sd_path: Path) -> Tuple[Dict, Dict]:
@@ -520,9 +525,11 @@ def build_from_state(state: Dict, hparams: Dict, sd_path: Path):
             raise KeyError(f"{sd_path.name} is a DPI checkpoint but its hyper_parameters lack {missing}; "
                            "was it written by DPIVarNetModule (which calls save_hyperparameters)?")
         arch.update(model="dpi_varnet", **{k: hparams[k] for k in DPI_HPARAMS})
+        arch.update({k: hparams.get(k, v) for k, v in DPI_HPARAM_DEFAULTS.items()})
         DPIVarNet = import_dpi_varnet().DPIVarNet
         model = DPIVarNet(num_cascades=arch["num_cascades"], sens_chans=arch["sens_chans"],
                           sens_pools=arch["sens_pools"], chans=arch["chans"], pools=arch["pools"],
+                          dpi_scope=str(arch["dpi_scope"]),
                           dpi_sens=bool(arch["dpi_sens"]), lambda_length=int(arch["lambda_length"]),
                           accel_min=float(arch["accel_min"]), accel_max=float(arch["accel_max"]),
                           lambda_spacing=str(arch["lambda_spacing"]))

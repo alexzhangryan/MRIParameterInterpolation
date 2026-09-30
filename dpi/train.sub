@@ -13,6 +13,7 @@
 #   ./submit.sh                            2x/4x/6x/8x brain, from scratch
 #   ./submit.sh name="dpi mixed acceleration brain v2"
 #   ./submit.sh init=../training/runs/brain/model2/123/checkpoints/last.ckpt
+#   ./submit.sh scope=io                   the light variant (plan.md grid)
 #   ./submit.sh resume=runs/brain/dpi/123/checkpoints/last.ckpt
 #   ./submit.sh max_epochs=1 extra_args="--limit_train_batches 50 --limit_val_batches 10"
 
@@ -69,8 +70,20 @@ endif
 if ! defined lambda_length
   lambda_length = 1000
 endif
+# dpi_scope picks which learnable tensors get a second parameter set:
+#   full     every one of them, the paper's own choice (the default)
+#   shallow  the two shallowest U-Net levels, +3.2%
+#   io       first ConvBlock + final 1x1 + dc_weight, +0.14%
+#   dc       only the data-consistency step sizes, +0.003%
+#   none     nothing; the control, which must track the blind baseline
+# submit.sh takes scope=io and also points model= at dpi-io, so a variant gets
+# its own run directory, log files and W&B run rather than landing on top of
+# the full run's.
+if ! defined dpi_scope
+  dpi_scope = full
+endif
 if ! defined dpi_args
-  dpi_args = --accel_min $(accel_min) --accel_max $(accel_max) --lambda_lr $(lambda_lr) --lambda_length $(lambda_length)
+  dpi_args = --dpi_scope $(dpi_scope) --accel_min $(accel_min) --accel_max $(accel_max) --lambda_lr $(lambda_lr) --lambda_length $(lambda_length)
 endif
 # run_name is the W&B run ID (no spaces); wandb_name is the displayed name.
 # submit.sh sets both from name= or from the convention.
@@ -158,7 +171,8 @@ environment     = "WANDB_PROJECT=fastmri-varnet-train WANDB_ALLOW_OFFLINE=$(allo
 on_exit_hold         = (ExitBySignal == False) && (ExitCode == 4)
 on_exit_hold_reason  = "W&B preflight failed (exit 4): key missing or rejected, or run not online. Fix WANDB_API_KEY in ../.env and resubmit; see the .err log"
 on_exit_hold_subcode = 4
-retry_until          = (ExitCode == 4)
+# ExitBySignal guard: see ../training/train.sub (signal deaths must retry).
+retry_until          = (ExitBySignal == False) && (ExitCode == 4)
 
 # --- resources ---------------------------------------------------------------
 # Same slot class as the baseline. DPI doubles the parameter count (29.9M ->

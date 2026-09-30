@@ -27,6 +27,11 @@ NAMEARG     = $(if $(NAME),name="$(NAME)")
 # trained baseline checkpoint to warm start both parameter sets from
 INIT       ?=
 INITARG     = $(if $(INIT),init=$(INIT))
+# which tensors get a second parameter set: full shallow io dc none.
+# Anything but full also moves the run directory, logs and W&B run to
+# dpi-<scope>, so a variant never lands on the full run's paths.
+SCOPE      ?= full
+SCOPEARG    = $(if $(filter-out full,$(SCOPE)),scope=$(SCOPE))
 # checkpoint for `make resume`
 CKPT       ?=
 ENV_FILE   ?= ../.env
@@ -76,24 +81,27 @@ help:
 	@echo "DPI VarNet (IMAGE=$(IMAGE))"
 	@echo
 	@echo "  LAPTOP (Docker):"
-	@echo "  make test            unit tests: the DPI mechanics (21 checks)"
+	@echo "  make test            unit tests: the DPI mechanics, all scopes"
 	@echo "  make smoke           train_dpi.py on synthetic data, then a rerun that MUST resume"
 	@echo "  make job-smoke       run_train.sh with TRAIN_DRIVER=train_dpi.py, as HTCondor runs it"
 	@echo "  make warm-smoke      warm start from a baseline checkpoint, then train"
-	@echo "  make local-run       test + smoke + job-smoke + warm-smoke"
+	@echo "  make scope-smoke     every dpi_scope end to end through the CLI"
+	@echo "  make divergence CKPT=last.ckpt   how far, and where, the two parameter sets separated (no GPU)"
+	@echo "  make local-run       test + smoke + scope-smoke + job-smoke + warm-smoke"
 	@echo
 	@echo "  ACCESS POINT (ap2001.chtc.wisc.edu, key in ../.env):"
 	@echo "  make submit          brain, 2 4 6 8, from scratch; W&B 'dpi mixed acceleration brain'"
 	@echo "  make submit INIT=../training/runs/brain/model2/<C>/checkpoints/last.ckpt"
+	@echo "  make submit SCOPE=io a variant from the plan.md grid (full shallow io dc none)"
 	@echo "  make submit NAME='dpi mixed acceleration brain v2' ARGS='max_epochs=2'"
-	@echo "  make resume CKPT=runs/brain/dpi/<Cluster>/checkpoints/last.ckpt"
+	@echo "  make resume CKPT=runs/brain/dpi/<Cluster>/checkpoints/last.ckpt [SCOPE=io]"
 	@echo "  make status          condor_q for your jobs"
 	@echo "  make logs            tail the newest job .out"
 	@echo "  make why JOB=<Cluster>   hold reason + log tails for a held job"
 	@echo
 	@echo "  make clean           remove smoke artefacts"
 	@echo
-	@echo "knobs: IMAGE= TEST_IMAGE= NAME= INIT= ARGS= CKPT= GPU= SHM= EXTRA='...'"
+	@echo "knobs: IMAGE= TEST_IMAGE= SCOPE= NAME= INIT= ARGS= CKPT= GPU= SHM= EXTRA='...'"
 
 # --- line endings -----------------------------------------------------------
 # These files execute on Linux; a stray CRLF makes bash fail on "\r" and turns
@@ -116,9 +124,24 @@ check-eol:
 test: check-eol
 	$(TESTRUN) python -m pytest test_dpi.py -q
 
+# --- divergence: did the two parameter sets actually separate? --------------
+# No data, no GPU: reads one checkpoint and reports ||W - Wc|| / ||W|| per
+# layer family, i.e. how much rate conditioning training really produced and
+# in which layers -- the measured version of the scope table. Run it on a
+# finished DPI checkpoint BEFORE queueing a narrow scope; scp the ~700 MB
+# last.ckpt from the access point first.
+#   make divergence CKPT=last.ckpt
+.PHONY: divergence
+divergence:
+	@test -n "$(CKPT)" || { echo "usage: make divergence CKPT=<dpi last.ckpt>" >&2; exit 1; }
+	$(RUN) python divergence.py $(CKPT)
+
 # --- synthetic data ---------------------------------------------------------
+# $(MAKE) is quoted because on Windows it expands to a path containing spaces
+# and parentheses ("C:/Program Files (x86)/GnuWin32/bin/make"), which the shell
+# then fails to parse -- the same reason verification/Makefile quotes it.
 $(SYNTH)/multicoil_val:
-	$(MAKE) -C ../training synthetic IMAGE=$(IMAGE)
+	"$(MAKE)" -C ../training synthetic IMAGE=$(IMAGE)
 
 .PHONY: synthetic
 synthetic: $(SYNTH)/multicoil_val
@@ -140,6 +163,34 @@ smoke: check-eol synthetic
 	  echo "FAILED: second run did not resume from last.ckpt" >&2; exit 1; }
 	@echo
 	@echo "smoke passed: DPI trains, last.ckpt is written, and a rerun resumes from it."
+
+# --- smoke: every scope -----------------------------------------------------
+# test_dpi.py checks the scopes at the model level; this checks the whole path
+# a submission takes -- CLI flag, argparse choices, DPIVarNetModule, the
+# hyper_parameters a checkpoint carries -- once per scope. The grep is the
+# point: it is the model reporting which scope it actually built, so a flag
+# that silently fails to arrive (the 2026-09-13 class of bug) shows up here
+# rather than as a variant that quietly retrained `full`.
+.PHONY: scope-smoke
+scope-smoke: check-eol synthetic
+	@for s in full shallow io dc none; do \
+	  echo "=== dpi_scope $$s ==="; \
+	  rm -rf scopetest/$$s; mkdir -p scopetest; \
+	  $(RUN) python train_dpi.py --data_path $(SYNTH) --default_root_dir scopetest/$$s \
+	      --run_name dpi-scope-$$s --accelerations 2 4 6 8 \
+	      --center_fractions 0.16 0.08 0.0533 0.04 --dpi_scope $$s \
+	      --gpus $(GPUS) --max_epochs 1 $(SMOKE_ARCH) $(SMOKE_RUN) $(EXTRA) \
+	      > scopetest/$$s.log 2>&1 \
+	    || { tail -30 scopetest/$$s.log; echo "FAILED: scope $$s did not train" >&2; exit 1; }; \
+	  grep -q "\[dpi\] scope $$s" scopetest/$$s.log \
+	    || { echo "FAILED: scope $$s never reached the model" >&2; \
+	         grep -m1 "\[dpi\]" scopetest/$$s.log >&2; exit 1; }; \
+	  test -s scopetest/$$s/checkpoints/last.ckpt \
+	    || { echo "FAILED: scope $$s wrote no checkpoint" >&2; exit 1; }; \
+	  grep -m1 "\[dpi\] scope" scopetest/$$s.log; \
+	done
+	@echo
+	@echo "scope-smoke passed: every dpi_scope builds, trains and checkpoints through the CLI."
 
 # --- smoke: warm start ------------------------------------------------------
 # --init_from_baseline is the paper's warm start: both parameter sets begin at
@@ -168,7 +219,7 @@ warm-smoke: check-eol synthetic
 # eviction" and must resume.
 .PHONY: job-smoke
 job-smoke: check-eol synthetic
-	$(MAKE) -C ../training synthetic_multicoil_train.tar IMAGE=$(IMAGE)
+	"$(MAKE)" -C ../training synthetic_multicoil_train.tar IMAGE=$(IMAGE)
 	rm -rf jobtest && mkdir -p jobtest
 	cp ../training/train_wandb.py ../training/run_train.sh train_dpi.py dpi_varnet.py \
 	   dpi_module.py dpi_transforms.py ../training/synthetic_multicoil_*.tar jobtest/
@@ -195,18 +246,18 @@ job-smoke: check-eol synthetic
 	@echo "job-smoke passed: the DPI driver runs under run_train.sh, and resume works."
 
 .PHONY: local-run
-local-run: test smoke job-smoke warm-smoke
+local-run: test smoke scope-smoke job-smoke warm-smoke
 	@echo
 	@echo "local-run passed: mechanics, training, resume, warm start, and the job path."
 
 # --- CHTC access point ------------------------------------------------------
 .PHONY: submit resume status logs why
 submit:
-	./submit.sh $(NAMEARG) $(INITARG) $(ARGS)
+	./submit.sh $(SCOPEARG) $(NAMEARG) $(INITARG) $(ARGS)
 
 resume:
-	@test -n "$(CKPT)" || { echo "usage: make resume CKPT=runs/brain/dpi/<Cluster>/checkpoints/last.ckpt [NAME='...']" >&2; exit 1; }
-	./submit.sh resume=$(CKPT) $(NAMEARG) $(ARGS)
+	@test -n "$(CKPT)" || { echo "usage: make resume CKPT=runs/brain/dpi/<Cluster>/checkpoints/last.ckpt [SCOPE=io] [NAME='...']" >&2; exit 1; }
+	./submit.sh resume=$(CKPT) $(SCOPEARG) $(NAMEARG) $(ARGS)
 
 status:
 	condor_q -nobatch
@@ -227,7 +278,7 @@ why:
 # --- misc -------------------------------------------------------------------
 .PHONY: clean distclean
 clean:
-	rm -rf output jobtest warmtest baseline_init.ckpt
+	rm -rf output jobtest warmtest scopetest baseline_init.ckpt
 
 distclean: clean
 	rm -rf logs runs
