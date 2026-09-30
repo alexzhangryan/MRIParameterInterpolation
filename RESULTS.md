@@ -186,12 +186,29 @@ ON_EXIT_OR_EVICT` did bring `output/` back, so `last.ckpt` and
 nothing restarted it automatically. The eviction-resume contract that was tested
 in 2026-09-12's `b246100` covers eviction, not a runtime-cap SIGTERM.
 
-**Unexplained and worth one check:** `train.sub` already sets
-`+GPUJobLength = "long"` (7 days), so a kill at 11.8 h should not have happened
-on a GPU Lab slot. Get `LastRemoteHost`, `GPUJobLength` and `WantGPULab` off the
-job ad to see whether the attributes reached the ad and which machine it ran on;
-`requirements` does not restrict to GPU Lab nodes, so a slot with its own
-retirement time is one candidate.
+**Resolved 2026-09-29: the slot was preempted.** `GPUJobLength = "long"` and
+`WantGPULab = true` both reached the job ad, and it ran on a genuine GPU Lab node
+(`slot2_1@gpu5000.chtc.wisc.edu`, H200 143 GB), so no runtime class was exceeded -
+`long` grants 7 days of eligibility, not immunity from preemption. As
+`run_train.sh:138` documents, HTCondor vacates by sending SIGTERM to the
+executable; the `on_term` trap fired, output transferred at 06:15:35, and the
+job then exited by signal, so HTCondor recorded event 005 ("Abnormal
+termination, signal 15") rather than 004 ("Job was evicted"). That is what
+masked the vacate and why `on_exit_hold` never matched.
+
+Memory was never the constraint: it grew 10393 -> 39212 MB over the first five
+hours and then stayed flat for the final six, against a 49152 MB request.
+`TimeExecute` was 40694 s (11.30 h) of a 42483 s (11.80 h) slot occupancy, the
+difference being the 29 minutes spent transferring 206 GB of input.
+
+**Cost of each restart:** 20 epochs took 11.3 h, about 34 min/epoch, so the
+remaining 30 epochs need roughly 17 h - longer than this slot survived. Expect
+two or three resubmissions, each paying ~30 min of input transfer, unless
+`train.sub` gains a requeue rule. The candidate is
+`on_exit_remove = (ExitBySignal == False)`, which sends a signal-killed job back
+to the queue where `ON_EXIT_OR_EVICT` plus `run_train.sh`'s `last.ckpt` discovery
+resumes it unattended; pair it with a `periodic_hold` on `NumJobStarts` so a
+genuinely broken job cannot loop, and test it on a short run first.
 
 **To resume,** take the exact argument list off the job ad
 (`condor_history 11380824 -af Args`) rather than reconstructing it: `model1`

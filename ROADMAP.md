@@ -44,9 +44,16 @@ record).
   False) && (ExitCode == 4)` is false for a signal kill, so a runtime-cap
   SIGTERM neither holds nor requeues the job - it just leaves the queue as
   "Completed" with no resubmission. The eviction-resume contract does not cover
-  this case. Needs a policy for signal exits (and note `+GPUJobLength = "long"`
-  is already set, so a 11.8 h kill on a GPU Lab slot is itself unexplained -
-  check `LastRemoteHost` / whether the attribute reached the job ad).
+  this case. Needs a policy for signal exits; candidate
+  `on_exit_remove = (ExitBySignal == False)` plus a `periodic_hold` on
+  `NumJobStarts`, tested on a short run first. **Cause resolved: the slot was
+  preempted.** `GPUJobLength="long"` and `WantGPULab=true` both reached the ad
+  and it ran on `gpu5000.chtc.wisc.edu`, so no runtime class was exceeded -
+  "long" is 7 days of eligibility, not immunity. HTCondor vacates by SIGTERM
+  (`run_train.sh:138`); the trap fired, output transferred, and the exit-by-
+  signal made HTCondor log 005 rather than 004, masking the vacate. At
+  ~34 min/epoch the remaining 30 epochs need ~17 h, so expect 2-3 resubmissions
+  (~30 min input transfer each) until the requeue rule lands.
   When resuming, take the argument list from `condor_history 11380824 -af Args`:
   `model1` defaults to `accelerations=4 center_fractions=0.08`, and the rate
   config comes from arguments, not from the checkpoint. Detail in `RESULTS.md`.
