@@ -10,7 +10,7 @@ Phase A exists to get a working, correctly-instrumented baseline before touching
 
 ---
 
-## Where this actually stands (2026-09-24)
+## Where this actually stands (2026-09-24, updated 2026-09-28)
 
 Supervisor feedback on the first reported result (message of 2026-09-24,
 signed "Chicago") set four items. Two are answers, two are experiment
@@ -20,13 +20,122 @@ blocks; the meeting happens after (3) and (4) are done.
 |---|---|---|
 | 1 | Is the result on the official evaluation data the benchmark relies on? | **Answered by email (draft in Gmail, 2026-09-24).** Short version: yes for the split (NYU's `brain_multicoil_val`, batch 0, scored with `fastmri.evaluate`), no for the leaderboard test split, which has no public leaderboard since 2023. Full wording below, "Answer to item 1" |
 | 2 | Performance per acceleration rate, reported at next week's meeting | **Done 2026-09-29 — `RESULTS.md`.** DPI trades accuracy from high rates to low rates: wins R2/R4, loses R6/R8, all significant except R8 NMSE. Paired Wilcoxon over 460 volumes per `VERIFICATION.md` 6.3. Provisional until block D measures sigma |
-| 3 | Several DPI variants | Variant grid and priority order in `plan.md`, "DPI variant grid (2026-09-24)". Needs `--dpi_scope` re-added to `dpi/` (designed in `plan.md`, dropped at implementation). Plan: Phase C, block B |
+| 3 | Several DPI variants | Variant grid and priority order in `plan.md`, "DPI variant grid (2026-09-24)". `--dpi_scope` re-added 2026-09-28 (`scope=io` etc. in `dpi/submit.sh`); the variants are now submissions, not code. Plan: Phase C, block B |
 | 4 | Add NV-Raw2insights-MRI (SDUM) as a baseline at a matched parameter count, identical input setup, implementation checked against their code | Architecture chosen and parameter-counted: their 12-cascade Restormer narrowed to widths 64/128 lands at **29.93M vs VarNet's 29.94M**. Table, parity checklist and correctness test in `plan.md`, "Matched-parameter SDUM baseline". Plan: Phase C, block C |
 
-Nothing in the repo changed for these items yet: this is planning. The
-experiment state is what the 2026-09-18 block below says, plus whatever has
-been submitted on CHTC since (the repo holds no run outputs; W&B is the
-record).
+**Update 2026-09-28.** Both baseline training runs are finished (model1 and
+model2, brain, 50 epochs). Block A's harness work landed 2026-09-25 and block
+B's `--dpi_scope` landed 2026-09-28, so the remaining items in both blocks are
+submissions and a report, not code. The repo holds no run outputs; W&B and the
+checkpoints under `training/runs/` and `dpi/runs/` on the access point are the
+record, so the exact cluster state is whatever `condor_q` and W&B say.
+
+**What W&B says (read via the API, 2026-09-28).** Both 50-epoch brain runs
+finished, same seed and setup:
+
+| | blind `mixed acceleration brain` | DPI `full`, from scratch |
+|---|---|---|
+| val SSIM (mixed, epoch 49) | 0.95355 | 0.95363 (+0.00009) |
+| val PSNR | 39.734 | 39.784 (+0.05 dB) |
+| val loss | 0.04637 | 0.04629 |
+| train loss | 0.0342 | 0.0224 |
+| lambda(R4), lambda(R6) | — | 0.626 → 0.656, 0.825 → 0.847 (all of it in epoch 0→1, flat after) |
+
+DPI led in 39/50 epochs, but the lead peaked at +0.002 SSIM around epoch 10
+and shrank to +0.0001 after the LR drop at 40. Read plainly: doubling the
+parameters bought a 34% lower **training** loss and no validation gain, and
+lambda barely moved after epoch 1. The first guess, that the two parameter
+sets never separated, is **wrong**: `dpi/divergence.py` on the epoch-49
+checkpoint (cluster 10976827) gives an overall ||W − Wc|| / ||W|| of 0.79,
+with W/Wc cosine 0.2–0.5 in the most-moved tensors. Both sets start
+identical, but λ(2)=0 and λ(8)=1 route R2 gradients only to Wc and R8
+gradients only to W, so they split from the first step. The spread is even:
+0.7–0.84 through the deep U-Net levels and bottleneck, lower only at the
+edges (down L0 0.55, final 1x1 0.32, dc_weight 0.16). `io` covers 0.2% of the
+squared movement, `shallow` 6.5%. So the endpoints are close to two different
+networks that reach the same validation score, and weight-space distance
+alone does not show the network *uses* the rate. Per-rate scores exist
+for the baseline only (`verify-model2-brain`, 460 volumes: SSIM 0.9735 /
+0.9572 / 0.9467 / 0.9377 at R2/4/6/8, mixed 0.9534); the DPI checkpoint has
+not been scored per rate.
+
+**Consequence for block B.** The narrow scopes exist to make a gain cheaper.
+There is no gain yet, so `io`/`dc` queued now would most likely tie the
+baseline and show nothing. Sequence instead (details in the 2026-09-28
+conversation notes, `dpi/README.md`):
+
+1. [x] *No GPU:* `dpi/divergence.py` on the finished `full` checkpoint (done
+   2026-09-28, result above: the sets separated heavily and evenly, so no
+   narrow scope reproduces `full` in weight space). Still open: a
+   **mismatched-rate test**, where the R=8 volumes are scored with λ forced to
+   λ(2), and so on. If quality drops, the network depends on the rate
+   functionally; if it does not, the separation is redundant
+   reparameterisation. Needs a λ-override option in `verify_varnet.py`.
+2. [x] *One verification job:* per-rate scores for the DPI checkpoint (block A,
+   supervisor item 2). Done 2026-09-28, `verify-dpi-brain`, cluster 11380823.
+   Paired per-volume against `verify-model2-brain` (460 identical volumes and
+   masks), DPI − blind:
+
+   | rate | SSIM | PSNR | DPI better on |
+   |---|---|---|---|
+   | R2 | +0.00059 | +0.253 dB | 460/460 (PSNR) |
+   | R4 | +0.00015 | +0.039 dB | 353/460 |
+   | R6 | −0.00019 | −0.047 dB | 146/460 |
+   | R8 | −0.00018 | −0.023 dB | 210/460 |
+   | mixed | +0.00008 | +0.051 dB | 289/460 |
+
+   DPI scores 0.9741 / 0.9573 / 0.9465 / 0.9375 SSIM at R2/4/6/8. So the tie
+   does hide a redistribution: DPI is better at low rates and slightly worse
+   at high rates. The paired t-statistics are large (R2 SSIM t=43), but they
+   only measure volume-to-volume noise. With one training seed per model,
+   seed-to-seed variation is not measured and could be as large (block D).
+3. *One training job, the ceiling:* a blind specialist at R=8 only
+   (`training/make submit-model1 ARGS='accelerations=8 center_fractions=0.04 ...'`).
+   If it does not beat the joint blind model at R=8, no conditioning method
+   can, at this data scale — that is a result, and it reframes block C too.
+4. *One training job:* warm-started `full` (`INIT=`, plan.md priority 1)
+   with `lambda_lr=1e-2`. Its original motive (frozen λ from unseparated
+   sets) is gone per item 1; what remains is that from scratch each endpoint
+   effectively trains on only part of the data, and warm start gives both
+   endpoints the full-data solution first. Lower priority than 2 and 3.
+5. Scopes only after 1 and 3 say there is something to make cheaper.
+
+### 2026-09-30: the repo was split across two clones (resolved by hand)
+
+- Two clones existed: `C:\Users\aryan\fall26research\MRIParameterInterpolation`
+  held the 2026-09-28 `--dpi_scope` work (block B, 13 files) **uncommitted**, and
+  `C:\Users\aryan\OneDrive\Desktop\fall26research\MRIParameterInterpolation`
+  held the 2026-09-29 results commits (`4e58b4c`, `3d5c689`, `f13c0a1`)
+  **unpushed**. Each lacked the other's work; the 2026-09-29 session searched
+  the OneDrive clone and wrongly concluded `--dpi_scope` did not exist. This
+  file is the three-way merge of both. Use the non-OneDrive clone from here on.
+- The CHTC checkout is `~/MRIParameterInterpolation` (not `~/Fall26Research`).
+  It only gets `--dpi_scope` after the scope commit is pushed and pulled there.
+- `--dpi_scope` tests were not re-run on 2026-09-30 (no pytest/Docker on the
+  laptop that day); last green run is the 2026-09-28 local gate. UNVERIFIED on a
+  GPU slot.
+- Given the lambda-saturation finding, a scope variant (`io`, `dc`) is a cost
+  ablation, not a fix for the R6/R8 loss; expect it to tie `full`. It is what
+  supervisor item 3 asked for, so it is being submitted anyway. 50 epochs of a
+  DPI run took 101.7 h for `full`, so nothing submitted on 2026-09-30 finishes
+  before the meeting: report partial W&B curves at matched epochs.
+- State at end of the 2026-09-30 session (UNVERIFIED unless stated): the
+  commands to push the OneDrive commits, commit the scope work, rebase and land
+  this file were handed to the user, not run by Claude (the permission system
+  blocked the commit/push; CHTC rejects Claude's own ssh, since each login needs
+  password + Duo and ControlMaster is broken on Windows). Next on CHTC, after
+  the push: `git stash -u && git pull` in `~/MRIParameterInterpolation`, then
+  `make submit SCOPE=io` and `make submit SCOPE=dc` in `dpi/`, and the
+  `blind r8 brain` resume if it was not resubmitted on 2026-09-29. Whether
+  any of these ran is UNVERIFIED; check `condor_q` and W&B.
+- Parameter framing, confirmed from `plan.md` section 2 on 2026-09-30: selective
+  scopes train fewer parameters than `full` DPI (59.88M), not fewer than the
+  blind baseline (29.94M): `shallow` 30.88M, `io` 29.98M, `dc` 29.94M + 1,012.
+  "+0.14%" means relative to blind VarNet. Open question to the supervisor:
+  does "selective DPI" mean DPI on a subset of layers (the scopes, built), or
+  freezing the finished blind VarNet and training only the DPI copies (fewer
+  trainable parameters than the baseline)? No freeze option exists in `dpi/`
+  as of 2026-09-30; it would be a small addition plus tests.
 
 ### Since 2026-09-24
 
@@ -152,7 +261,7 @@ Your previous CHTC project (`Research/` on your Desktop, the diffusion model col
 - [x] fastMRI knee dataset access requested — approved week of 2026-09-08, presigned URLs in hand
 - [x] CHTC GPU environment set up and reproducible — two Docker images (`verification/Dockerfile`, `training/Dockerfile`, both pinned to fastMRI `91f2df4`, Lightning 1.9.5, torch 2.0.1+cu118, conda h5py, `linux/amd64`), submit files, and runbooks. Not yet exercised on a CHTC slot
 - [x] Training runs end-to-end on a small local subset (smoke test) — `training/make smoke` (the driver) and `training/make job-smoke` (the job executable as HTCondor runs it, twice, to assert resume-after-eviction), both on synthetic phantoms
-- [ ] A real training job is submitted to CHTC and producing checkpoints
+- [x] A real training job is submitted to CHTC and producing checkpoints - both baseline runs (model1, model2) trained to completion on brain, confirmed 2026-09-28
 - [x] Known deviations from the paper's setup are documented — `VERIFICATION.md` sections 1 and 5.4, `training/README.md` "Known deviations from Sriram et al. 2020". The reduced-subset deviation (section 3b) is the biggest one and is new as of 2026-09-11
 
 ## Reusing your proven CHTC recipe
@@ -344,8 +453,42 @@ only `full` plus `--no_dpi_sens`). The unit tests already listed there
 (equivalence at init per scope, parameter counts per scope, gradient flow)
 extend the existing 21.
 
-- [ ] `--dpi_scope` in `dpi_varnet.py` / `dpi_module.py` with per-scope
-  parameter-count tests matching the table in `plan.md` section 2
+- [x] (2026-09-28) `--dpi_scope {full,shallow,io,dc,none}` in
+  `dpi_varnet.py` / `dpi_module.py` / `train_dpi.py`, with per-scope
+  parameter-count tests matching the table in `plan.md` section 2 exactly
+  (checked against hand-derived arithmetic on the real 12-cascade config:
+  `full` 29,937,966, `shallow` 946,094 = 3.16%, `io` 41,086 = 0.137%, `dc`
+  1,012, `none` 0). Also per-scope equivalence-at-init, state-dict
+  compatibility and gradient-flow tests; a `make scope-smoke` target that
+  trains every scope through the CLI and greps the log for the model
+  reporting the scope it actually built; `scope=io` in `dpi/submit.sh`, which
+  routes a variant to its own `runs/brain/dpi-<scope>/`, log files and W&B
+  run, and refuses to submit if `--dpi_scope` did not reach the job ad.
+  `verification/verify_varnet.py` rebuilds a scoped checkpoint and reads
+  `dpi_scope` with a `"full"` default, so the DPI checkpoints written before
+  the flag existed still score; `make smoke-ckpt` now covers a scoped and a
+  pre-flag checkpoint.
+  **Local gate green (2026-09-28):** `dpi` `make local-run` (`test` 49
+  passed, `smoke`, `scope-smoke` — all five scopes train and checkpoint
+  through the CLI — `job-smoke`, `warm-smoke`); `verification`: the four toy
+  checkpoints — baseline, DPI full, DPI io, and one written without a
+  `dpi_scope` hyper-parameter — all load, rebuild with the right scope and
+  pass the determinism invariant. `job-smoke` covers the scope under
+  `training/run_train.sh`, the executable HTCondor runs, fresh and after a
+  simulated eviction. Not yet run on a GPU slot. `full` is the default and is
+  what every existing checkpoint is, so nothing already trained or queued
+  changes. No image rebuild needed — the DPI code is transferred with the job;
+  both `genjigod/fastmri-{train,verify}:2026-09-18` confirmed present on
+  Docker Hub 2026-09-28, so the `.sub` image tags resolve.
+  **Bug fixed on the way through:** the `[dpi] ...` parameter-summary line in
+  `on_fit_start` used `self.print`, which routes through
+  `TQDMProgressBar.print`; that method silently discards the message when no
+  progress bar is active, which is always true at fit start. The line has
+  therefore never appeared in any job log since 2026-09-19, including the DPI
+  runs already on the cluster — so there is no log record of which scope or
+  parameter count those runs used (the checkpoints themselves still say, via
+  `hyper_parameters`). Now `rank_zero_info`, and `make scope-smoke` greps for
+  it. Training behaviour was never affected.
 - [ ] Submit in priority order (each is a 50-epoch model2-sized run, one GPU):
   1. `full`, warm-started from the blind checkpoint (`INIT=...`)
   2. `io` (the light variant, +0.14% parameters)
@@ -417,4 +560,4 @@ its conditioning-off twin is the second row.
 - Your prior CHTC recipe (reference): `Research/Dockerfile`, `Research/diffusion.sub`, `Research/submit.sh` on your Desktop
 
 ---
-*Last updated: 2026-09-29*
+*Last updated: 2026-09-30*
