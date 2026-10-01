@@ -1,8 +1,9 @@
 # Per-rate results: DPI vs blind VarNet on fastMRI brain
 
 **Phase C block A, item 2 of the 2026-09-24 supervisor feedback.**
-Analysis run 2026-09-29. Numbers pulled from W&B, not from this checkout — the
-repo holds no run outputs.
+Analysis run 2026-09-29, updated 2026-10-01 with the R8 specialist and the
+first two `--dpi_scope` variants (see "Update 2026-10-01" below). Numbers
+pulled from W&B, not from this checkout — the repo holds no run outputs.
 
 Reproduce with `verification/paired_from_wandb.py` (needs `WANDB_API_KEY` from
 the repo-root `.env`; no `wandb` package required — it uses the GraphQL API and
@@ -152,10 +153,116 @@ did not work."
 - Baseline competence (section 6.4): beats zero-filled by 8.5-11.1 dB at every
   rate.
 
-## Open: the R8 per-rate ceiling baseline is unfinished
+## Update 2026-10-01: R8 specialist and the first scope variants
+
+Read from W&B (`fastmri-varnet-train`) on 2026-10-01 via the `wandb` SDK.
+**None of the three runs below has been through the per-rate verification
+harness yet**, so every number in this section is Lightning's training-time
+validation, not the paired 460-volume scoring above. Lightning's mixed pass
+draws one rate per volume and is close to, but not the same as, the harness's
+mixed row (blind: 39.734 dB here vs 39.715 dB above).
+
+| W&B run | cluster | state | epochs | wall clock |
+|---|---|---|---|---|
+| `blind r8 brain` | 11442792 (resume of 11380824) | finished 2026-09-30 | 50/50 | 27.9 h total |
+| `dpi dc mixed acceleration brain` | 11442791 | finished 2026-10-01 | 50/50 | 33.0 h |
+| `dpi io mixed acceleration brain` | 11442790 | **running** | 40/50 | 37.4 h so far, ~0.93 h/epoch |
+
+### `dc` ties `full` at a fraction of the cost
+
+`--dpi_scope dc` duplicates only each cascade's data-consistency step size
+(`dc_weight`, 12 scalars) plus phi: **1,012 extra parameters**, against
+`full`'s 29.9M. All 12 U-Nets are shared and rate-blind.
+
+| final epoch (49) | blind | DPI `full` | DPI `dc` |
+|---|---|---|---|
+| val loss | 0.04637 | 0.04629 | 0.04622 |
+| val PSNR (dB) | 39.734 | 39.784 | 39.771 |
+| val SSIM | 0.95355 | 0.95363 | 0.95370 |
+| parameters | 29.94M | 59.88M | 29.94M + 1,012 |
+| wall clock | 26.4 h | 101.7 h | 33.0 h |
+| lambda(R4), lambda(R6) | — | 0.656, 0.847 | **0.492, 0.776** |
+
+- **The claim this supports is "`dc` matches `full`", not "`dc` beats
+  `full`".** The three runs sit within 0.00015 in val loss. Before the LR drop
+  at epoch 40, the same run moves by up to ~0.001 between consecutive epochs
+  (`full` 0.04762 -> 0.04805 at 38 -> 39), and there is one seed per model.
+- The same numbers admit a weaker reading: on the mixed metric **neither DPI
+  variant is distinguishable from blind**, so "dc matches full" may only mean
+  that neither does anything there. The per-rate scoring (below) is what tells
+  these apart: `full`'s effect only became visible per rate.
+- **lambda is less saturated under `dc`**: R4 sits at 0.49 instead of 0.66, so
+  R6 and R8 are less compressed against the omega-1 endpoint. Given the
+  saturation mechanism above, this predicts a smaller R6/R8 loss for `dc`.
+  Untested until `dc` is scored per rate.
+- Wall-clock is confounded by hardware: `full` ran on `patel0000`, `dc` on
+  `gpu4006`, blind on `gpu5001`. Treat 3.9x vs 1.25x as indicative, not as a
+  measured cost ratio.
+- There is no `none` control yet (the DPI code path with nothing duplicated,
+  which must track blind). Without it, a small `dc` edge cannot be separated
+  from a code-path difference.
+
+### R8 specialist: there is headroom at R8 that DPI does not capture
+
+`blind r8 brain` (accelerations [8], center_fractions [0.04]) was resumed from
+its checkpoint after the 2026-09-29 preemption and finished all 50
+epochs. Its validation is R8 only.
+
+| R8 | val PSNR (dB) | val SSIM | source |
+|---|---|---|---|
+| specialist (R8 only) | 36.778 | 0.93858 | Lightning val, epoch 49 |
+| blind joint | 36.557 | 0.937724 | `verify-model2-brain`, R8 pass |
+| DPI `full` joint | 36.534 | 0.937547 | `verify-dpi-brain`, R8 pass |
+
+The specialist leads the joint blind model by **~+0.22 dB / +0.0009 SSIM at
+R8**, while DPI `full` sits at -0.023 dB. So at this data scale joint training
+does leave something on the table at R8, and the conditioning has not
+recovered it — the opposite of the "no conditioning method can win at R8"
+outcome the ceiling run was designed to detect.
+
+**This comparison is not paired.** It sets Lightning's validation loop
+against the verification harness, which may draw different masks, so it is
+directional only. `verify-blind-r8-brain` (below) makes it paired.
+
+### `io`: matched epochs only
+
+`io` is at epoch 40/50 and should finish around 2026-10-02 00:00 CDT. Its W&B
+summary (39.148 dB) is epoch 39, before the LR drop that added +0.1 to +0.3 dB
+to every run, so it must not be read against the others' final numbers.
+
+| epoch | blind loss | `full` loss | `dc` loss | `io` loss |
+|---|---|---|---|---|
+| 30 | 0.04873 | 0.04814 | 0.04901 | 0.04823 |
+| 35 | 0.04819 | 0.04777 | 0.04764 | 0.04788 |
+| 38 | 0.04768 | 0.04762 | 0.04769 | **0.04729** |
+| 39 | 0.04749 | 0.04805 | 0.04810 | 0.04823 |
+
+Tying so far, within epoch-to-epoch noise. lambda at epoch 39: R4 0.557, R6
+0.819 — between `dc` and `full`.
+
+### Next: per-rate scoring of all three
+
+From `verification/` on the access point (confirm checkpoint directories with
+`ls` first — the resumed R8 run may write under 11380824 or 11442792):
+
+```
+make verify MODEL=model2 ARGS='ckpt=../dpi/runs/brain/dpi/11442791/checkpoints/last.ckpt run_name=verify-dpi-dc-brain'
+make verify MODEL=model2 ARGS='ckpt=../training/runs/brain/model1/<r8 cluster>/checkpoints/last.ckpt run_name=verify-blind-r8-brain'
+make verify MODEL=model2 ARGS='ckpt=../dpi/runs/brain/dpi/11442790/checkpoints/last.ckpt run_name=verify-dpi-io-brain'   # after io finishes
+```
+
+Then pair each against `verify-model2-brain` with `paired_from_wandb.py`. For
+the specialist only the R8 row is a fair comparison; its R2/R4/R6 rows measure
+how a single-rate model degrades off its training rate.
+
+## Resolved: the R8 per-rate ceiling baseline was preempted at epoch 20
+
+Resolved 2026-09-30: resumed as cluster 11442792 and finished 50/50 (results
+in "Update 2026-10-01" above). The diagnosis below stands, and so does the
+`train.sub` requeue gap it exposed.
 
 `blind r8 brain` (cluster 11380824, accelerations [8], center_fractions [0.04])
-**stopped at epoch 20 of 50**, so the per-rate ceiling row is not yet available.
+**stopped at epoch 20 of 50**.
 
 **Cause, confirmed 2026-09-29 from the job ad — not a crash and not an
 eviction:**
