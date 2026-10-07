@@ -110,8 +110,18 @@ executable      = run_verify.sh
 # for a DPI checkpoint its lambda settings) from the file itself.
 # ../dpi/dpi_varnet.py travels with the harness (HTCondor drops it flat in
 # the sandbox by basename) so a DPI checkpoint can be rebuilt there.
+#
+# split=train scores the TRAINING batch instead (the overfitting check of
+# 2026-10-05: PSNR/SSIM on training slices, compared with val). run_verify.sh
+# picks the split from the tarball name. Give such a run its own run_name,
+# e.g. run_name=verify-model2-brain-train. The masks are the same seeded
+# per-file draws as for val, not the masks the model saw in training (those
+# were redrawn every epoch).
+if ! defined split
+  split = val
+endif
 if ! defined val_data
-  val_data = file://$(staging)/$(dataset)_multicoil_val_batch_0.tar.xz
+  val_data = file://$(staging)/$(dataset)_multicoil_$(split)_batch_0.tar.xz
 endif
 if ! defined ckpt
   ckpt = file://$(knee_staging)/knee_leaderboard_state_dict.pt
@@ -169,8 +179,10 @@ if ! defined mem
 endif
 request_cpus    = $(cpus)
 request_memory  = $(mem)
+# 360 GB since 2026-10-06: train batch 0 is 106 GB compressed (val 100 GB), and
+# 320 GB would have left no headroom for it.
 if ! defined request_disk
-  request_disk = 320GB
+  request_disk = 360GB
 endif
 if ! defined request_gpus
   request_gpus = 1
@@ -199,6 +211,9 @@ endif
 # failure (a missing staging file also holds with 13) still surfaces as a
 # hold after five tries instead of looping.
 max_retries     = 5
+# A completed run with a "fail" verdict exits 2 (verify_varnet.py): final, no
+# retry. Only crashes (exit 1) and node problems are worth another attempt.
+retry_until     = 2
 periodic_release = (HoldReasonCode == 6 || HoldReasonCode == 13) && (NumSystemHolds < 5) && ((time() - EnteredCurrentStatus) > 300)
 
 # --- logs ------------------------------------------------------------------

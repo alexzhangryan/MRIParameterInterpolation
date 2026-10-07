@@ -361,6 +361,53 @@ and the paired per-volume comparison from the two jobs'
 `per_volume_R<N>.csv` files, which list the same 460 filenames in the same
 order.
 
+### 4.4a Added measurement noise and training-slice scoring (2026-10-06)
+
+Two additions requested by the supervisor on 2026-10-05.
+
+**Noise sweep.** `--noise_levels 0 0.005 0.01 0.02 0.05` scores every rate
+once per level. The noise follows y = Ax + level·n, added in k-space:
+- n is standard normal on each real and imaginary k-space value, added to
+  the full k-space **before** masking, so only measured samples carry it.
+- It is scaled by the volume's target max, i.e. the data treated as [0, 1].
+  Per coil and per real/imaginary component, the added image-domain std is
+  `level × max`, the same unit as the inherent noise measured in `../noise/`
+  (σ/max ≈ 0.005).
+- n is fixed per (file, slice), so every model, rate and level sees
+  byte-identical noisy inputs. Levels only rescale n.
+- The target stays the original image.
+
+How the outputs are filed:
+- Level 0 is the original data and keeps the original labels, CSV names and
+  invariants; it is bit-identical to a run without the flag.
+- A level > 0 is filed as `R<N>_noise<level>`
+  (`per_volume_R4_noise0.05.csv`, W&B `R4_noise0.05/*`), with only the
+  determinism and volume-count invariants.
+- The mixed pass runs at level 0 only.
+- For the visual check, `output/images/<label>_<file>_s<slice>.png` holds,
+  left to right: the noisy fully-sampled RSS, the target, zero-filled, the
+  reconstruction, and |error|×5. These are written for the first
+  `--image_volumes` volumes of every pass.
+
+Cost: one pass per (rate, level), ~15 min each on brain val batch 0, so the
+four rates × five levels take about 6-8 h with transfer. That fits `short`.
+
+**Training slices.** `split=train` stages `brain_multicoil_train_batch_0`
+instead of val, and `run_verify.sh` scores `multicoil_train`. The masks are
+the same seeded per-file draws as for val; they are not the masks the model
+saw (those were redrawn every epoch). The train−val gap per rate is the
+overfitting check.
+
+```bash
+make verify MODEL=model2 ARGS='ckpt=<last.ckpt> run_name=verify-<tag>-brain-noise extra_args="--noise_levels 0 0.005 0.01 0.02 0.05"'
+make verify MODEL=model2 ARGS='ckpt=<last.ckpt> run_name=verify-<tag>-brain-train split=train'
+```
+
+Pairing: `paired_from_wandb.py --noise 0.05 --baseline <...-noise> --treatment <...-noise>`
+compares the passes at one level. Any rate list works (2/6/10 too). Every
+comparison now starts with an input identity check (`zf_ssim`/`zf_mse`
+byte-identical per volume, `CLAUDE.md`) and exits 2 if it fails.
+
 ### 4.5 Overrides
 
 `make verify-model1 ARGS='...'` and `./submit.sh model1 name=value ...` are

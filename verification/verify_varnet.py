@@ -61,6 +61,7 @@ import subprocess
 import sys
 import time
 import traceback
+import zlib
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -462,11 +463,12 @@ ARCH_KEYS = ("num_cascades", "pools", "chans", "sens_pools", "sens_chans")
 # DPIVarNet constructor arguments that cannot be read back from tensor
 # shapes; DPIVarNetModule.save_hyperparameters() puts them in the checkpoint.
 DPI_HPARAMS = ("dpi_sens", "lambda_length", "accel_min", "accel_max", "lambda_spacing")
-# Added to dpi/ after the first DPI runs were launched, so it is read with a
+# Added to dpi/ after the first DPI runs were launched, so they are read with a
 # default rather than required: a checkpoint written before --dpi_scope existed
-# duplicated every learnable tensor, which is exactly what "full" means. Kept
-# out of DPI_HPARAMS so those older checkpoints still score.
-DPI_HPARAM_DEFAULTS = {"dpi_scope": "full"}
+# duplicated every learnable tensor, which is exactly what "full" means, and
+# one written before --lambda_mode (2026-10-06) learned lambda. Kept out of
+# DPI_HPARAMS so those older checkpoints still score.
+DPI_HPARAM_DEFAULTS = {"dpi_scope": "full", "lambda_mode": "learned"}
 
 
 def load_state(sd_path: Path) -> Tuple[Dict, Dict]:
@@ -532,7 +534,8 @@ def build_from_state(state: Dict, hparams: Dict, sd_path: Path):
                           dpi_scope=str(arch["dpi_scope"]),
                           dpi_sens=bool(arch["dpi_sens"]), lambda_length=int(arch["lambda_length"]),
                           accel_min=float(arch["accel_min"]), accel_max=float(arch["accel_max"]),
-                          lambda_spacing=str(arch["lambda_spacing"]))
+                          lambda_spacing=str(arch["lambda_spacing"]),
+                          lambda_mode=str(arch["lambda_mode"]))
     else:
         arch["model"] = "varnet"
         model = VarNet(**{k: arch[k] for k in ARCH_KEYS})
@@ -567,7 +570,91 @@ def load_model(args, device):
     return model.eval().to(device), arch, source
 
 
-def build_dataset(args, mask_func, selected: List[str]):
+# --------------------------------------------------------------------------
+# Added measurement noise (supervisor, 2026-10-05): y = A x + noise_level * n,
+# with n standard normal on every real and imaginary k-space value, added to
+# the FULL k-space before the mask is applied, so only measured samples carry
+# it and y = M(F S x) + M n exactly. Our data is not normalised to [0, 1], so
+# the level is relative to the volume's target max (attrs["max"], the RSS
+# image max): in image units the added noise per coil and per real/imaginary
+# component is then noise_level * max under fastMRI's orthonormal FFT, the same
+# unit as the inherent noise measured in noise/ (sigma / max ~ 0.005).
+#
+# n is a pure function of (file, slice): the same draw for every rate, every
+# model and every level (levels only rescale it). Every model therefore sees
+# byte-identical noisy inputs, which keeps the zero-filled input identity
+# check meaningful (CLAUDE.md). The target stays the original image.
+# --------------------------------------------------------------------------
+def measurement_noise(shape, fname: str, slice_num: int) -> np.ndarray:
+    """Standard complex Gaussian (N(0,1) real and imaginary parts), fixed per (file, slice)."""
+    rng = np.random.default_rng(zlib.crc32(f"{fname}:{int(slice_num)}".encode()))
+    re = rng.standard_normal(shape, dtype=np.float32)
+    im = rng.standard_normal(shape, dtype=np.float32)
+    return (re + 1j * im).astype(np.complex64)
+
+
+def add_measurement_noise(kspace: np.ndarray, target_max: float, fname: str, slice_num: int,
+                          noise_level: float) -> np.ndarray:
+    if not noise_level:
+        return kspace
+    scale = np.float32(noise_level * float(target_max))
+    return (kspace + scale * measurement_noise(kspace.shape, fname, slice_num)).astype(kspace.dtype)
+
+
+class NoisyTransform:
+    """Adds the measurement noise to the raw k-space, then runs the wrapped transform.
+
+    Wrapping rather than subclassing keeps VarNetDataTransform's masking,
+    padding and seeding untouched: the mask is drawn from the filename exactly
+    as at noise level 0, so a noisy pass differs from the clean one only by n.
+    """
+
+    def __init__(self, inner, noise_level: float):
+        self.inner, self.noise_level = inner, float(noise_level)
+
+    def __call__(self, kspace, mask, target, attrs, fname, slice_num):
+        k = add_measurement_noise(kspace, attrs["max"], fname, slice_num, self.noise_level)
+        return self.inner(k, mask, target, attrs, fname, slice_num)
+
+
+def noise_label(label: str, noise_level: float) -> str:
+    """Pass label: unchanged at level 0, so existing CSV names and W&B keys stay valid."""
+    return label if not noise_level else f"{label}_noise{noise_level:g}"
+
+
+def fully_sampled_rss(h5_path: Path, slice_num: int, noise_level: float) -> np.ndarray:
+    """RSS of the full k-space with the same added noise: what the noisy acquisition looks like."""
+    import h5py
+    with h5py.File(h5_path, "r") as f:
+        k = f["kspace"][slice_num]
+        mx = float(f.attrs["max"])
+    k = add_measurement_noise(k, mx, h5_path.name, slice_num, noise_level)
+    ax = (-2, -1)
+    x = np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(k, axes=ax), axes=ax, norm="ortho"), axes=ax)
+    return np.sqrt(np.sum(np.abs(x) ** 2, axis=0)).astype(np.float32)
+
+
+def center_crop_np(x: np.ndarray, shape) -> np.ndarray:
+    """Centre crop the last two axes to `shape`, clipped to what x has."""
+    h, w = min(shape[0], x.shape[-2]), min(shape[1], x.shape[-1])
+    t, l = (x.shape[-2] - h) // 2, (x.shape[-1] - w) // 2
+    return x[..., t:t + h, l:l + w]
+
+
+def save_panel(path: Path, panels: Dict[str, np.ndarray]) -> None:
+    """Side-by-side uint8 PNG of equally sized grayscale images, left to right in dict order."""
+    try:
+        from PIL import Image
+    except ImportError:  # pragma: no cover - the verify image has PIL
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    h = min(p.shape[0] for p in panels.values())
+    w = min(p.shape[1] for p in panels.values())
+    strip = np.hstack([p[:h, :w] for p in panels.values()])
+    Image.fromarray(strip).save(path)
+
+
+def build_dataset(args, mask_func, selected: List[str], noise_level: float = 0.0):
     from fastmri.data import SliceDataset
     from fastmri.data.transforms import VarNetDataTransform
 
@@ -576,6 +663,8 @@ def build_dataset(args, mask_func, selected: List[str]):
     # filename, which is the fastMRI convention for validation and what other
     # groups' reported numbers were produced with.
     transform = VarNetDataTransform(mask_func=mask_func, use_seed=True)
+    if noise_level:
+        transform = NoisyTransform(transform, noise_level)
     ds = SliceDataset(
         root=args.data_path,
         challenge="multicoil",
@@ -779,14 +868,16 @@ def tier1(args) -> int:
         invariants.append(Check(name, status, detail, dict(v)))
         log(f"{status.upper():6s} invariant {name}: {detail}")
 
-    def score_pass(label, ds, by_volume, rate_of):
+    def score_pass(label, ds, by_volume, rate_of, noise_level=0.0):
         """Reconstruct and score every selected volume once under one dataset.
 
         `label` is what the pass is filed under in the log, in W&B and in the
-        CSV name ("R4", "mixed"). `rate_of` returns the (center_fraction,
-        acceleration) to record for a volume: constant for a single-rate pass,
-        and for the mixed pass the pair that volume's own filename seed drew.
-        Returns (rows, det_records, aggregate).
+        CSV name ("R4", "mixed", "R4_noise0.05"). `rate_of` returns the
+        (center_fraction, acceleration) to record for a volume: constant for a
+        single-rate pass, and for the mixed pass the pair that volume's own
+        filename seed drew. `noise_level` is only used for the example images
+        (the dataset already carries the noise). Returns (rows, det_records,
+        aggregate).
         """
         rows: List[Dict] = []
         det_records: List[Dict] = []
@@ -802,7 +893,7 @@ def tier1(args) -> int:
             m = volume_metrics(target, recon)
             mz = volume_metrics(target, zf)
             row = dict(fname=fname, n_slices=int(target.shape[0]), acceleration=R_v, center_fraction=cf_v,
-                       **m, **{f"zf_{k}": v for k, v in mz.items()})
+                       noise_level=float(noise_level), **m, **{f"zf_{k}": v for k, v in mz.items()})
             rows.append(row)
 
             if vi < args.determinism_volumes:
@@ -818,12 +909,20 @@ def tier1(args) -> int:
                 vmax = float(target[s].max())
                 t_, r_ = crop_like_evaluate(target[s], recon[s])
                 _, z_ = crop_like_evaluate(target[s], zf[s])
-                wb.images(f"{label}/{Path(fname).stem}", {
+                # the fully-sampled image with the same added noise: the visual
+                # check that a noise level actually makes the data look noisy
+                s_id = ds.raw_samples[idx[s]].slice_ind
+                fs = fully_sampled_rss(data_path / fname, s_id, noise_level)
+                _, f_ = crop_like_evaluate(target[s], center_crop_np(fs, target[s].shape))
+                images = {
+                    "fully_sampled": to_uint8_image(f_, vmax),
                     "target": to_uint8_image(t_, vmax),
-                    "recon": to_uint8_image(r_, vmax),
                     "zero_filled": to_uint8_image(z_, vmax),
+                    "recon": to_uint8_image(r_, vmax),
                     "abs_error_x5": to_uint8_image(np.abs(t_ - r_) * 5, vmax),
-                })
+                }
+                wb.images(f"{label}/{Path(fname).stem}", images)
+                save_panel(out / "images" / f"{label}_{Path(fname).stem}_s{s_id}.png", images)
 
             if (vi + 1) % args.log_every == 0 or vi + 1 == len(files):
                 elapsed = time.time() - t0
@@ -882,20 +981,46 @@ def tier1(args) -> int:
     # --- one pass per rate: every volume at the SAME rate ----------------------
     # This is what says how the model does at each individual acceleration, and
     # it is the only form the reference values can be compared against.
-    for R, cf in zip(args.accelerations, args.center_fractions):
-        log(f"=== acceleration {R}x, center_fraction {cf}, mask {args.mask_type} ===")
+    #
+    # With --noise_levels, every rate is scored once per level (added k-space
+    # measurement noise, see add_measurement_noise). Level 0 is the original
+    # data and keeps the original labels, CSV names, reference comparison and
+    # invariants; a level > 0 is filed under "R<N>_noise<level>" and only the
+    # determinism and volume-count invariants apply to it (a model need not
+    # beat zero-filled by a fixed SSIM margin on heavily corrupted input).
+    per_noise: Dict[str, Dict[str, Dict]] = {}
+    for R, cf, level in [(R, cf, lv) for lv in args.noise_levels
+                         for R, cf in zip(args.accelerations, args.center_fractions)]:
+        log(f"=== acceleration {R}x, center_fraction {cf}, mask {args.mask_type}, noise level {level:g} ===")
         mask_func = create_mask_for_mask_type(args.mask_type, [cf], [R])
-        ds, by_volume = build_dataset(args, mask_func, files)
+        ds, by_volume = build_dataset(args, mask_func, files, noise_level=level)
+        label = noise_label(f"R{R}", level)
         if set(by_volume) != set(files):
             missing = sorted(set(files) - set(by_volume))
-            inv(f"R{R}_volume_listing", "fail", f"{len(missing)} selected volumes not indexed: {missing[:3]}...")
+            inv(f"{label}_volume_listing", "fail", f"{len(missing)} selected volumes not indexed: {missing[:3]}...")
             all_verdicts.append("fail")
             continue
 
-        label = f"R{R}"
-        rows, det_records, agg = score_pass(label, ds, by_volume, lambda f, cf=cf, R=R: (cf, R))
-        pv_csv = out / f"per_volume_R{R}.csv"
+        rows, det_records, agg = score_pass(label, ds, by_volume, lambda f, cf=cf, R=R: (cf, R), noise_level=level)
+        pv_csv = out / f"per_volume_{label}.csv"
         write_pass(label, rows, agg, pv_csv)
+        per_noise.setdefault(f"{level:g}", {})[f"R{R}"] = agg
+
+        if level:
+            det_invariant(label, det_records)
+            inv(f"{label}_volume_count", "pass" if agg["n_volumes"] == len(files) else "fail",
+                f"{agg['n_volumes']} scored of {len(files)} selected")
+            log(f"    {label}: model SSIM - zero-filled SSIM = {agg['ssim_mean'] - agg['zf_ssim_mean']:+.4f} (recorded only)")
+            append_results_row(out / "results.csv", dict(
+                run_id=run_id, date=time.strftime("%Y-%m-%d"), git_sha=config["fastmri_sha"], tier="tier1",
+                model_source=model_source, checkpoint_path=args.state_dict if model_source == "pretrained" else "",
+                split=data_path.name, n_volumes=agg["n_volumes"], mask_type=args.mask_type,
+                center_fraction=cf, acceleration=R, mask_seed="filename", train_seed="",
+                ssim_mean=f"{agg['ssim_mean']:.6f}", ssim_std=f"{agg['ssim_std']:.6f}",
+                psnr_mean=f"{agg['psnr_mean']:.4f}", nmse_mean=f"{agg['nmse_mean']:.6f}",
+                per_volume_csv=pv_csv.name, notes=f"noise_level={level:g} (added k-space noise, x target max)",
+            ))
+            continue
 
         # reference comparison
         refs = compare_to_reference(args.mask_type, R, agg)
@@ -1035,6 +1160,7 @@ def tier1(args) -> int:
         tier="tier1", overall=overall, run_id=run_id, model_source=model_source, arch=arch,
         data_path=str(data_path), n_volumes=len(files), mask_type=args.mask_type, seed=args.seed,
         device=str(device), thresholds=THRESHOLDS, per_rate=per_rate, mixed=mixed,
+        noise_levels=args.noise_levels, per_noise_level=per_noise,
         invariants=[asdict(c) for c in invariants], config=config,
     )
     (out / "tier1_report.json").write_text(json.dumps(report, indent=2, default=json_safe))
@@ -1044,7 +1170,14 @@ def tier1(args) -> int:
                    for R, v in per_rate.items()},
                 **({f"mixed/{k}": mixed["aggregate"][k]
                     for k in ("ssim_mean", "psnr_mean", "nmse_mean", "ssim_std")} if mixed else {}),
+                **{f"{noise_label(R, float(lv))}/{m}_mean": a[f"{m}_mean"]
+                   for lv, by_R in per_noise.items() for R, a in by_R.items() for m in ("ssim", "psnr")},
                 **{f"invariant/{c.name}": c.status for c in invariants}})
+    if len(per_noise) > 1:
+        log("noise sweep (SSIM / PSNR per rate; level = added k-space noise std / target max):")
+        for lv, by_R in per_noise.items():
+            log(f"    noise {lv:>6}: " + "  ".join(
+                f"{R}={a['ssim_mean']:.4f}/{a['psnr_mean']:.2f}dB" for R, a in by_R.items()))
     wb.table("tier1/reference_comparison",
              ["acceleration", "source", "verdict", "ssim", "ref_ssim", "psnr", "ref_psnr", "nmse", "ref_nmse"],
              [[R, r["source"], r["verdict"], v["aggregate"]["ssim_mean"], r.get("ref_ssim"),
@@ -1060,7 +1193,12 @@ def tier1(args) -> int:
     log(f"tier1 overall: {overall.upper()}  (report: {out / 'tier1_report.json'})")
     if model_source == "random_init":
         log("reminder: --random_init numbers are meaningless, this was a harness smoke test")
-    return 0 if overall in ("pass", "investigate") else 1
+    # 2, not 1: a completed run whose verdict is "fail" (e.g. a single-rate
+    # specialist scored off its rate, where beats-zero-filled and SSIM-monotone
+    # fail by design) is a result, not a crash. verify.sub retries crashes
+    # (exit 1) but stops on 2; before 2026-10-07 such runs were rerun up to
+    # five times (verify-blind-r8-brain ran four).
+    return 0 if overall in ("pass", "investigate") else 2
 
 
 # --------------------------------------------------------------------------
@@ -1103,6 +1241,12 @@ def build_parser() -> argparse.ArgumentParser:
     p1.add_argument("--accelerations", type=int, nargs="+", default=[4])
     p1.add_argument("--center_fractions", type=float, nargs="+", default=[0.08])
     p1.add_argument("--volume_limit", type=int, default=0, help="evaluate only the first N volumes (sorted)")
+    p1.add_argument("--noise_levels", type=float, nargs="+", default=[0.0],
+                    help="added k-space measurement noise, y = Ax + level * n, n standard normal on real "
+                         "and imaginary parts, level relative to the volume's target max (data in [0,1]). "
+                         "Every rate is scored once per level; 0 is the original data. Seeded per "
+                         "(file, slice), so every model sees identical noisy inputs. "
+                         "e.g. --noise_levels 0 0.005 0.01 0.02 0.05")
     p1.add_argument("--no_mixed_pass", dest="mixed_pass", action="store_false",
                     help="skip the extra pass that draws one rate per volume the way training "
                          "validates (mixed/*). That pass is what is comparable to a training run's "

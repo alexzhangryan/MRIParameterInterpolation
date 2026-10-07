@@ -628,3 +628,84 @@ def test_scope_survives_a_checkpoint_round_trip():
         DPIVarNet(**SMALL, dpi_scope="full", lambda_length=64).load_state_dict(
             state, strict=True
         )
+
+
+# ------------------------------------------- fixed lambda (2026-10-01 meeting) --
+FIXED = dict(lambda_mode="fixed", lambda_spacing="linear", accel_min=2.0, accel_max=10.0)
+
+
+def test_fixed_lambda_is_exactly_the_linear_position():
+    """lambda_mode="fixed" over 2..10: lambda(2, 6, 10) = 0, 0.5, 1 exactly, no table rounding."""
+    model = DPIVarNet(**SMALL, lambda_length=1000, **FIXED)
+    lam = model.lambda_table(torch.tensor([2.0, 6.0, 10.0, 4.0, 12.0, 1.0]))
+    assert lam.tolist() == [0.0, 0.5, 1.0, 0.25, 1.0, 0.0]
+    # the learned table at the same spacing rounds to its grid: the reason fixed bypasses it
+    learned = LambdaTable(length=1000, accel_min=2.0, accel_max=10.0, spacing="linear")
+    with torch.no_grad():
+        learned.phi.zero_()  # uniform softmax: the table is i / (S - 1)
+    assert learned(torch.tensor([6.0])).item() != 0.5
+
+
+def test_fixed_lambda_learns_nothing():
+    """No phi parameter, no lambda optimiser group, and the count is full DPI minus phi."""
+    from dpi_module import DPIVarNetModule
+
+    fixed = DPIVarNet(**SMALL, lambda_length=64, **FIXED)
+    learned = DPIVarNet(**SMALL, lambda_length=64)
+    assert "phi" not in dict(fixed.lambda_table.named_parameters())
+    assert "lambda_table.phi" in fixed.state_dict(), "the verifier detects DPI by this key"
+    assert dpi_param_summary(fixed)["phi"] == 0
+    assert dpi_param_summary(fixed)["total"] == dpi_param_summary(learned)["total"] - 64
+
+    module = DPIVarNetModule(
+        num_cascades=2, chans=4, sens_chans=4, pools=2, sens_pools=2,
+        lambda_length=64, lr=3e-4, lambda_lr=1e-3, log_accelerations=(2, 6, 10), **FIXED,
+    )
+    (optim,), _ = module.configure_optimizers()
+    assert len(optim.param_groups) == 1
+    assert module.hparams["lambda_mode"] == "fixed"
+
+
+def test_fixed_lambda_interpolates_the_two_sets():
+    """At R6 (lambda 0.5) the forward equals the network built from the averaged parameters."""
+    torch.manual_seed(0)
+    model = DPIVarNet(**SMALL, lambda_length=64, **FIXED).eval()
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name.endswith("_copy"):
+                p.add_(torch.randn_like(p) * 0.1)
+    mk, mask, nlf = masked_input(accelerations=(6,), center_fractions=(0.0533,))
+    with torch.no_grad():
+        out6 = model(mk, mask, nlf, accel(6))
+        out2 = model(mk, mask, nlf, accel(2))
+        out10 = model(mk, mask, nlf, accel(10))
+    assert not torch.allclose(out6, out2) and not torch.allclose(out6, out10)
+    # rebuild with every pair averaged and lambda pinned to an endpoint: same output
+    avg = DPIVarNet(**SMALL, lambda_length=64, **FIXED).eval()
+    state = model.state_dict()
+    for k in list(state):
+        if k.endswith("_copy"):
+            base = k[: -len("_copy")]
+            mean = 0.5 * (state[base] + state[k])
+            state[base], state[k] = mean.clone(), mean.clone()
+    avg.load_state_dict(state)
+    with torch.no_grad():
+        assert torch.allclose(avg(mk, mask, nlf, accel(2)), out6, atol=1e-5)
+
+
+def test_fixed_lambda_survives_a_checkpoint_round_trip_through_the_module():
+    from dpi_module import DPIVarNetModule
+
+    module = DPIVarNetModule(num_cascades=2, chans=4, sens_chans=4, pools=2, sens_pools=2,
+                             lambda_length=64, **FIXED)
+    hp = dict(module.hparams)
+    rebuilt = DPIVarNet(**SMALL, lambda_length=hp["lambda_length"], accel_min=hp["accel_min"],
+                        accel_max=hp["accel_max"], lambda_spacing=hp["lambda_spacing"],
+                        lambda_mode=hp["lambda_mode"])
+    rebuilt.load_state_dict(module.varnet.state_dict(), strict=True)
+    assert rebuilt.lambda_table(torch.tensor([6.0])).item() == 0.5
+
+
+def test_unknown_lambda_mode_is_rejected():
+    with pytest.raises(ValueError):
+        DPIVarNet(**SMALL, lambda_mode="frozen")

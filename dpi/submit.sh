@@ -154,7 +154,11 @@ condor_submit -dry-run "$DRY" "$SUB" "${PRESET[@]}" "$@" >/dev/null
 ARGS_LINE="$(grep -m1 -E '^(Args|Arguments) *=' "$DRY" || true)"
 echo "job args: ${ARGS_LINE#*=}"
 grep -E '^Request(Cpus|Memory|Disk|GPUs) *=' "$DRY" | tr '\n' ' '; echo
-grep -E '^(Environment|TransferInput) *=' "$DRY" | cut -c1-200
+# Redact secrets before printing: the Environment line carries WANDB_API_KEY
+# (getenv), and terminal scrollback, logs and transcripts must never hold it.
+grep -E '^(Environment|TransferInput) *=' "$DRY" \
+  | sed -E 's/(WANDB_API_KEY=)[^ "]*/\1<redacted>/g; s/((PRESIGNED|URL|TOKEN|SECRET|KEY)[A-Z_]*=)[^ "]*/\1<redacted>/g' \
+  | cut -c1-200
 
 fail=""
 case "$ARGS_LINE" in *"--run_name $WANT_NAME "*) ;; *) fail="$fail --run_name $WANT_NAME" ;; esac

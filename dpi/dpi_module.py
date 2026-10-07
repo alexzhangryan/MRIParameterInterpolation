@@ -64,6 +64,7 @@ class DPIVarNetModule(_BaseModule):
         accel_min: float = 2.0,
         accel_max: float = 8.0,
         lambda_spacing: str = "log",
+        lambda_mode: str = "learned",
         log_accelerations: tuple = (2, 4, 6, 8),
         **kwargs,
     ):
@@ -99,6 +100,7 @@ class DPIVarNetModule(_BaseModule):
             accel_min=accel_min,
             accel_max=accel_max,
             lambda_spacing=lambda_spacing,
+            lambda_mode=lambda_mode,
         )
 
     # -- forward ----------------------------------------------------------
@@ -286,6 +288,14 @@ class DPIVarNetModule(_BaseModule):
             default="log",
             choices=("log", "linear"),
             help="how acceleration maps onto the table index",
+        )
+        parser.add_argument(
+            "--lambda_mode",
+            choices=("learned", "fixed"),
+            default="learned",
+            help="learned: the paper's monotone lambda(R) from phi. fixed: lambda(R) is "
+            "R's position between --accel_min and --accel_max (with --lambda_spacing "
+            "linear over 2..10: 0, 0.5, 1 at R = 2, 6, 10) and nothing is learned",
         )
         parser.add_argument(
             "--init_from_baseline",

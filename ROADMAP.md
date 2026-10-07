@@ -10,7 +10,207 @@ Phase A exists to get a working, correctly-instrumented baseline before touching
 
 ---
 
-## Where this actually stands (2026-09-24, updated 2026-09-28)
+## Where this actually stands (2026-10-05)
+
+The noise / dc email went to Chicago. The reply reordered Phase D: specialists
+without added noise first, a test-time noise sweep, and training-slice
+evaluation. See "Chicago's reply" below; it takes precedence over the order in
+Phase D.
+
+### When to contact Chicago (user's instruction, 2026-10-07)
+
+No update emails mid-stream. Tell the user when one of these is reached:
+
+1. **Interim (optional):** R2/R6/R10 specialists and the mixed 2/6/10 run
+   trained and scored (val, training slices, noise sweep). Gives the upper
+   bound against mixed at 2/6/10. Fixed-λ DPI goes in as partial W&B curves.
+2. **Full stopping point:** all of block D1 done, meaning specialists, mixed
+   and fixed-λ DPI at 2/6/10, each scored on val, training slices and the
+   noise sweep (with the 2026-10-07 results for blind / full / dc / io /
+   R8). This answers every item of the 10-01 meeting and the 10-05 reply.
+   Then ask which noise levels to train with (D2).
+
+Already done and waiting for that update: the noise sweep and the
+overfitting check on the existing models, the visual noise check, the
+`dc` / `io` / R8-specialist per-rate scores (`RESULTS.md`).
+
+## The 2026-10-01 meeting
+
+The 2026-10-01 meeting replaced the 2026-09-24 asks with seven new items.
+The main one is a new experiment grid (Phase D below): rates **2, 6, 10**,
+three model families, with the original noise and then with added noise.
+Phase C blocks B-D are still useful but now rank below Phase D; item 3 is
+where to confirm that.
+
+| # | Meeting item (2026-10-01) | Status |
+|---|---|---|
+| 1 | Make sure the input PSNR/SSIM (zero-filled) are byte-identical to the baseline's, and add this rule to `CLAUDE.md` | **Rule added to `CLAUDE.md` 2026-10-01. Checked by hand for dc 2026-10-01: inputs identical** (byte-identical `zf_ssim`/`zf_mse` against both baseline and `full`; `zf_nmse` differs across node CPUs, see `RESULTS.md`). Still to automate: `paired_from_wandb.py` reads `zf_*` from the baseline run only and never compares it with the treatment's. To do: assert per-volume `zf_ssim`/`zf_psnr`/`zf_nmse` are exactly equal across every run being compared, and fail loudly if not. Run it on the existing pairs (model2 vs DPI full, dc, io, R8 specialist) |
+| 2 | Fresh clone of the E2E VarNet code; ask the agent what the noise level is for training and testing | **Answered 2026-10-01 from the paper itself** (Sriram et al., arXiv:2004.06688v2, the `e2evarnetpaper` PDF, all 13 pages read) and its official code (fastMRI at `91f2df4`). **E2E VarNet adds no measurement noise, in training or testing.** The paper writes the forward model with noise, k_i = F(S_i x) + ε_i (eq. 1-2), but never specifies, measures or simulates ε. It trains on the raw fastMRI multicoil k-space with masks applied (section 4.1: Adam 3e-4, 50 epochs, "without any regularization or data augmentation"). So the noise level is whatever the scanner recorded, the same in train and test, and also in the fully-sampled target. The **only noise the paper adds** is dithering in supplement 6.1: a post-processing step on the *output image* for visual sharpness. The reconstruction is divided by its max; Gaussian noise is added with per-pixel std = σ·sqrt(local median over 11×11), **σ = 0.02 for brain** (and non-fat-suppressed knee), 0.03 for fat-suppressed knee; σ was tuned by eye. It is shown only in figs. 4-7, is not in the reported metric tables as far as the text says, is not measurement noise, and is not in the released fastMRI code. Our setup matches the paper here: we add nothing either. Measuring the inherent σ is item 6a |
+| 3 | Ask Chicago what to do next | Open. Questions to bring: (a) σ for the added-noise run (item 6); (b) whether Phase C blocks B (remaining scopes), C (SDUM) and D (seeds) continue alongside Phase D or wait; (c) the open "selective DPI" question from 2026-09-30; (d) DPI scope for Phase D (assumed `full`) |
+| 4 | Organize the results so far for the midterm presentation | Open. Material: `RESULTS.md` (per-rate table, λ saturation, `dc` ties `full`, R8 specialist headroom), the parameter breakdown (item 7), cost (26.4 h vs 101.7 h vs 33.0 h). **`dc` scored 2026-10-01: beats blind at every rate** (+0.01 to +0.08 dB, all significant) and beats `full` at R6/R8 with 1,012 extra parameters. That is the strongest slide so far (`RESULTS.md` top). Still missing: `io` (training at epoch ~45) and the R8 specialist (cluster 11926921 scored the released knee checkpoint by mistake, no `ckpt=`) |
+| 5 | With the original measurement noise: specialist E2E VarNet, mixed E2E VarNet, and DPI with **fixed** λ (linear, λ(6)=0.5) at rates 2, 6, 10; report validation and training performance | Open. Phase D, block D1 |
+| 6 | The same experiment with added measurement noise | Open. Phase D, block D2. Needs σ (item 3a) and noise-injection code |
+| 7 | Check which modules are learnable apart from DC | **Answered 2026-10-01** (from `plan.md` section 2's measured counts and `dpi/dpi_varnet.py`). Blind VarNet has 29,936,966 learnable parameters in three groups: **the 12 cascade regularizer U-Nets** (`NormUnet`, 18 chans, 4 pools, 2,454,338 each, 29,452,056 total = 98.4%); **the coil-sensitivity estimation U-Net** (`SensitivityModel`, 8 chans, 4 pools, 484,898 = 1.6%); and the **DC step sizes** (`dc_weight`, 1 scalar per cascade, 12). Nothing else learns: the FFTs, masking, coil combination and RSS are fixed. DPI adds a copy of each duplicated tensor plus `phi` (1,000 entries) for λ. `full` duplicates all three groups; `--no_dpi_sens` leaves out the sensitivity net |
+
+## Chicago's reply to the noise / dc email (2026-10-05)
+
+The email (noise table plus dc per-rate result) went out. The reply sets the
+order for Phase D:
+
+| # | Ask | What it means here | Status |
+|---|---|---|---|
+| C1 | **First, train our own specialists without added noise, as the upper bound** | Block D1's three specialists at R2, R6, R10 on the original data. No code needed: `training/` model1 preset with `accelerations=R center_fractions=0.32/R`, as the R8 specialist was run. "Noise-free" here means *no added noise*; the data still carries its inherent σ ≈ 0.5% of max (`RESULTS.md`). Say so when reporting | **Submitted 2026-10-06** (12006400-02), running |
+| C2 | Put the zero-noise row in the table plus several added noise levels; run "whatever evaluation workflow you used" across them; 0.05 as a test value for data in [0,1] or [-1,1]; check visually that the images look noisy; add noise **in measured k-space**: y = Ax + noise_level · noise | A test-time noise sweep in `verification/verify_varnet.py`: new `--noise_level` (one pass per level). Noise = standard normal on each real/imaginary channel of the full k-space, scaled by noise_level × the volume's target max (our data is not normalised; the RSS target max plays the role of the data range, so in image units per coil σ = noise_level, the same unit as the measured inherent 0.005), added **before** masking so y = M(FSx) + M·n. Seeded per volume/slice so every model gets byte-identical noisy inputs (the input identity rule). Target stays the original image. Save example PNGs (fully-sampled RSS and zero-filled, with and without noise) per level for the visual check. Proposed levels: 0, 0.005, 0.01, 0.02, 0.05 (0.05 = 10x the inherent noise). Then score every checkpoint (blind, full, dc, the specialists) at each level | **Code done 2026-10-06; sweep submitted** for 5 existing models (state table below). Specialists get swept when they finish |
+| C3 | Q: "Is the second table the same results as last week? I recall the baseline was the strongest" | **Different model, same baseline run.** Last week's table was DPI `full` vs blind: `full` won R2/R4 and lost R6/R8, so the baseline was stronger at high rates. This week's is the DC-only variant (`dc`), a different checkpoint, which beats blind at every rate. The blind numbers are the identical `verify-model2-brain` scores in both. At R8 the strongest model is the R8 specialist (+0.22 dB over blind, unpaired) | Answered in the user's reply (draft 2026-10-05) |
+| C4 | Evaluate PSNR/SSIM on **training slices** for every method to check overfitting | The meeting note "report performance validation + training" means scored metrics on training data, not just train loss. Needs `run_verify.sh` / `verify.sub` to accept `brain_multicoil_train_batch_0.tar.xz` (they handle `multicoil_val` only today), then a train-split pass per checkpoint and a train−val gap per method and rate. Already suggestive: DPI `full` reached 34% lower train loss than blind with no val gain | **Code done 2026-10-06; submitted** for 5 existing models |
+
+Order: C1 (submit now, ~27 h per specialist), C2 and C4 code in parallel,
+then score everything at all noise levels on val and train, then the rest of
+block D1 (mixed and fixed-λ DPI at 2/6/10), then D2 (training with added noise).
+
+**Update 2026-10-07 (read from W&B; CHTC session had expired):**
+- Done: all 8 scoring jobs for blind / full / dc / io (noise sweep + training
+  slices), plus `verify-dpi-io-brain` and `verify-blind-r8-brain`; the
+  `condor_rm` of those two never ran because the connection had dropped.
+  Results in `RESULTS.md`, "Noise sweep and training-slice scores": the
+  clean-trained models break down under added noise (below zero-filled at
+  0.02), DPI `full` degrades least, and no method overfits (train−val
+  ≤ 0.18 dB, the same for all).
+- **R10 specialist (12006402) failed at epoch 19 after 10.6 h**:
+  `DataLoader worker ... killed by signal: Killed`, most likely the 48 GB
+  memory cap (check `condor_history 12006402 -af MemoryUsage`). Resume from
+  its `last.ckpt` with `mem=64GB`, taking args from
+  `condor_history 12006402 -af Args`.
+- Running at last check: R2 specialist (epoch 32), R6 (epoch 26).
+- Never started (idle since 10-06 17:10): mixed 2/6/10 (12015718), fixed-λ
+  DPI (12015819), R8-specialist noise/train scoring (12015614/15). If they are
+  still idle, check `condor_q -better-analyze`.
+- Not yet looked at: the noise PNG panels (`~/eval_job/.../images/`).
+
+**Update 2026-10-07 10:30 (on CHTC):**
+- R10's hold was the memory cap ("Docker job has gone over memory limit of
+  49152 Mb"; the image jumped 32 → 46 GB around 03:09). **Its checkpoint was
+  lost**: a memory hold does not transfer `output/` back (an eviction would),
+  and nothing was spooled. Removed. Resubmitted from scratch as
+  **`blind r10 brain v2`, cluster 12078790, `mem=64GB`**.
+- Idle 2/6/10 runs 12015718 / 12015819 raised to 64 GB (`condor_qedit`
+  RequestMemory). They match 43 GPU slots and are waiting on cluster demand,
+  not misconfigured. R2 / R6 run at ~30 GB on 48 GB; if either gets
+  memory-held, resubmit with `mem=64GB` (its checkpoint will be lost the same
+  way).
+- **Retry bug found and fixed:** `verify-blind-r8-brain` (12012758) ran 4
+  times. A specialist's expected `fail` verdict exited 1, and `max_retries = 5`
+  reran it. Now a verdict failure exits 2 and `verify.sub` has
+  `retry_until = 2` (dry-run checked on CHTC). 12012758 was removed;
+  12015614/15 were set to `JobMaxRetries 0`. Staged copies updated.
+- Visual check done (`RESULTS.md`): 0.05 is clearly noisy; most of the
+  reconstruction error under noise sits in the background.
+
+**State at end of 2026-10-06 (all submitted by Claude over `ssh chtc`):**
+
+| what | cluster(s) | where | status |
+|---|---|---|---|
+| specialists R2 / R6 / R10, no added noise (C1) | 12006400 / 12006401 / 12006402 | `training/runs/brain/model1/` | running |
+| mixed blind at 2/6/10 (D1) | 12015718 | `training/runs/brain/model2/` | queued |
+| fixed-λ DPI `full`, 2/6/10, λ = 0 / 0.5 / 1 (D1) | 12015819 | **`~/eval_job/dpi/runs/brain/dpi-fixed/`** | queued |
+| `io` per rate (`verify-dpi-io-brain`) | 12012757 | `verification/runs/brain/model2/` | queued |
+| R8 specialist per rate (`verify-blind-r8-brain`) | 12012758 | `verification/runs/brain/model2/` | queued |
+| noise sweep, val, levels 0 / 0.005 / 0.01 / 0.02 / 0.05 (C2): model2, dpi, dpi-dc, dpi-io, blind-r8 | 12015606 / 08 / 10 / 12 / 14 | **`~/eval_job/verification/runs/brain/model2/`** | queued |
+| training-slice scores (C4), same five models | 12015607 / 09 / 11 / 13 / 15 | **`~/eval_job/verification/runs/brain/model2/`** | queued |
+
+W&B run names: `verify-<tag>-brain-noise` and `verify-<tag>-brain-train`,
+with tag ∈ {model2, dpi, dpi-dc, dpi-io, blind-r8}. The baseline checkpoint is
+`training/runs/brain/model2/10833090` (50 epochs; 10826573 is the 50-step
+test). Check: the noise job's level-0 pass must reproduce `verify-model2-brain`
+exactly.
+
+**`~/eval_job` on ap2001 is a staged copy of uncommitted code**, made so that
+CHTC's git checkout stays clean (Claude does not change git state). It
+holds the new `verify_varnet.py` / `run_verify.sh` / `verify.sub` (noise
+sweep, train split) and the new `dpi/` files (`--lambda_mode fixed`), and
+`.env` is a symlink. After the user commits, pushes and pulls these changes
+on CHTC, move `~/eval_job/*/runs` into the checkout's `runs/` trees and delete
+`~/eval_job`. To resume the fixed-λ run after an eviction, use
+`~/eval_job/dpi/submit.sh resume=...` (or the checkout once it is pulled).
+
+Code added 2026-10-06 (uncommitted; tests green locally):
+- `verification/verify_varnet.py --noise_levels`: k-space noise, seeded per
+  (file, slice), scaled by target max, level 0 bit-identical to before. PNG
+  panels in `output/images/`.
+- `run_verify.sh` / `verify.sub split=train`; `request_disk` raised to 360 GB.
+- `paired_from_wandb.py`: any rate list, `--noise`, an automatic input
+  identity check (exit 2), and the macOS SSL fix.
+- `dpi/ --lambda_mode fixed` (+5 tests, 54 pass), wired through `train.sub`.
+- `dpi/submit.sh` no longer prints the W&B key. It did print it on
+  2026-10-06, so it is in that session's transcript: **rotate the key
+  once the running jobs finish** (rotating now would break their W&B logging).
+
+Retroactive check: `paired_from_wandb.py` confirms input identity for last
+week's `full`-vs-blind and this week's `dc`-vs-blind comparisons (all 5
+passes byte-identical in `zf_ssim`/`zf_mse`).
+
+## Phase D (2026-10-01): rates 2/6/10, specialist vs mixed vs fixed-λ DPI
+
+Every run trains and validates on the same brain batch 0 data, with
+`equispaced_fraction` masks, 12 cascades, Adam 3e-4, batch 1, 50 epochs,
+seed 42. Center fractions follow the 0.32/R convention already in use
+(0.16, 0.0533, and **0.032 for R10**, which is new). Inputs must be
+byte-identical across models (item 1). "Report training + validation" means
+the train-loss curve plus Lightning's validation per epoch from W&B, and
+afterwards the per-rate 460-volume scoring with `paired_from_wandb.py`.
+
+### Block D1: original measurement noise (item 5)
+
+- [ ] **Code: a fixed-λ DPI option.** Not in `dpi/` yet. `LambdaTable` with
+  `phi` as a buffer is not enough: `phi` is `randn`, so a frozen λ would be
+  noisy and only roughly linear. Needs an analytic λ(R) = (R − 2) / 8,
+  clamped to [0, 1] (0, 0.5, 1 at R2, R6, R10), with nothing learnable. Use
+  `spacing="linear"`, `accel_min=2`, `accel_max=10`. Proposed flag:
+  `--lambda_mode {learned,linear}`. Tests: λ values exactly 0 / 0.5 / 1, no
+  `phi` gradient or optimizer group, checkpoint rebuilds in
+  `verification/verify_varnet.py`, parameter count = `full` minus 1,000.
+  Run the local gate (`make local-run` in `dpi/`, `make smoke-ckpt` in
+  `verification/`)
+- [ ] **Presets:** a rate-list preset for 2/6/10 in `training/submit.sh`,
+  `dpi/submit.sh` and `verification/submit.sh`, which hard-code 2/4/6/8 today.
+  Pass `accel_max=10` in `dpi/train.sub`
+- [ ] **Submit 5 training jobs:** specialist R2, specialist R6, specialist
+  R10 (model1-style, one rate each); mixed blind at 2/6/10; DPI `full`,
+  fixed linear λ, 2/6/10. The existing R8 specialist and the 2/4/6/8 models
+  do not cover these rates and are not reused
+- [ ] Score all five at R2/R6/R10 plus mixed; pair the mixed and DPI runs
+  against each specialist at its own rate. Training report: train loss and
+  val loss/PSNR/SSIM per epoch, matched epochs
+
+### Block D2: added measurement noise (item 6)
+
+- [x] **6a, measure the existing noise. Done 2026-10-02**, cluster 11927049
+  (run from `~/noise_job` on ap2001, a copy outside the git checkout; the
+  repo's `noise/` is the same code). Result in `RESULTS.md`, "Measurement
+  noise already in the data": σ ≈ 0.5-0.6% of the target max, full-k-space
+  SNR ≈ 12-14 dB, identical in train and val, coils not prewhitened, ground
+  truth floor ~2.9% of max. Original plan: One CPU job per split
+  (train batch 0 and val batch 0, the data every model uses). Each streams
+  its tarball through `xz` without extracting it and measures, per slice:
+  coil σ from the air in the readout-oversampled margin, in image, k-space
+  and target-max-normalised units; measurement SNR in dB, full and for each
+  mask at R2/4/6/8/10; coil noise correlation; the target's background noise
+  floor; and whether any noise data or noise header field exists. Local gate
+  green: `make test` (σ recovered within 3% on synthetic k-space with known
+  noise, zero padding included) and `make job-smoke` (the job script in the
+  verify image). Next: on ap2001, `cd noise && make submit-test`, then
+  `make submit`, then `make summary` into `RESULTS.md`. This is the base σ
+  that any added noise is measured against
+- [ ] **σ from Chicago** (item 3a): an absolute σ, or a multiple of the
+  measured σ, or several levels. Also confirm: is noise added in training
+  and validation both, and is the target still the clean (original) RSS?
+- [ ] **Code: noise injection** in the data transform: complex Gaussian on
+  the full k-space before masking, seeded per volume/slice (as the mask is),
+  so every model sees byte-identical noisy inputs (item 1 extends to this).
+  Same hook for the baseline, specialists and DPI
+- [ ] Rerun block D1's five jobs with noise; score and report the same way
+
+## Previous status (2026-09-24, updated 2026-09-28; superseded by the 2026-10-01 meeting above)
 
 Supervisor feedback on the first reported result (message of 2026-09-24,
 signed "Chicago") set four items. Two are answers, two are experiment
@@ -89,7 +289,9 @@ conversation notes, `dpi/README.md`):
    at high rates. The paired t-statistics are large (R2 SSIM t=43), but they
    only measure volume-to-volume noise. With one training seed per model,
    seed-to-seed variation is not measured and could be as large (block D).
-3. *One training job, the ceiling:* a blind specialist at R=8 only
+3. [x] *(Done 2026-09-30, `blind r8 brain`, 50/50: it leads the joint blind
+   model by ~+0.22 dB at R8, unpaired; see `RESULTS.md`.)*
+   *One training job, the ceiling:* a blind specialist at R=8 only
    (`training/make submit-model1 ARGS='accelerations=8 center_fractions=0.04 ...'`).
    If it does not beat the joint blind model at R=8, no conditioning method
    can, at this data scale — that is a result, and it reframes block C too.
@@ -166,10 +368,12 @@ conversation notes, `dpi/README.md`):
   When resuming, take the argument list from `condor_history 11380824 -af Args`:
   `model1` defaults to `accelerations=4 center_fractions=0.08`, and the rate
   config comes from arguments, not from the checkpoint. Detail in `RESULTS.md`.
-- Claude cannot reach CHTC non-interactively (password + Duo), so cluster-side
-  facts in this file come from W&B or from a human-run shell. `ControlMaster`
-  must not be used for the `chtc` host: mux is broken in Git Bash OpenSSH on
-  Windows and silently breaks logins.
+- Claude cannot log in to CHTC by itself (password + Duo). **On the Mac
+  (since 2026-10-01)** `~/.ssh/config` has a `chtc` host with ControlMaster
+  (8 h persist). The user runs `ssh chtc` once in a terminal, and Claude then
+  runs `ssh -o BatchMode=yes chtc '...'` over that connection
+  (`ssh -O check chtc` tests it). On Windows, ControlMaster must not be used:
+  mux is broken in Git Bash OpenSSH and silently breaks logins.
 
 ### Answer to item 1 (as drafted for the email)
 
@@ -491,8 +695,12 @@ extend the existing 21.
   it. Training behaviour was never affected.
 - [ ] Submit in priority order (each is a 50-epoch model2-sized run, one GPU):
   1. `full`, warm-started from the blind checkpoint (`INIT=...`)
-  2. `io` (the light variant, +0.14% parameters)
-  3. `dc` (one scalar per cascade, the cheapest test of the hypothesis)
+  2. [~] `io` (the light variant, +0.14% parameters): cluster 11442790, at
+     epoch 40/50 on 2026-10-01, due ~2026-10-02
+  3. [x] `dc` (one scalar per cascade, the cheapest test of the hypothesis):
+     cluster 11442791, finished 2026-10-01; ties `full` on mixed val
+     (`RESULTS.md`). Scored per rate 2026-10-01 (`verify-dpi-dc-brain`,
+     cluster 11926920): beats blind at R2/4/6/8 and mixed, no R6/R8 loss
   4. `full --no_dpi_sens`
   5. `shallow`, only if `io` is clearly below `full`
   6. `--accel_min 4 --accel_max 8` on `full` (two independent sets, the
@@ -560,4 +768,4 @@ its conditioning-off twin is the second row.
 - Your prior CHTC recipe (reference): `Research/Dockerfile`, `Research/diffusion.sub`, `Research/submit.sh` on your Desktop
 
 ---
-*Last updated: 2026-09-30*
+*Last updated: 2026-10-05*

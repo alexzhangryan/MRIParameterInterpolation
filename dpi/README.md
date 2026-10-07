@@ -194,6 +194,26 @@ Two details worth knowing before reading a variant's numbers:
 `--no_dpi_sens` is orthogonal and still applies: it sets the sensitivity-map
 U-Net to `none` while the cascades keep the chosen scope.
 
+## `--lambda_mode fixed`: λ not learned (2026-10-01 meeting)
+
+`--lambda_mode fixed` drops the learned table: λ(R) is R's position between
+`--accel_min` and `--accel_max`. That position is computed exactly, without
+the table's rounding, which would turn 0.5 into 0.5005. With
+`--lambda_spacing linear --accel_min 2 --accel_max 10` and rates 2/6/10,
+λ = 0, 0.5, 1.
+
+phi becomes a buffer, as under `none`: no λ parameter, no λ optimiser group,
+and the parameter count is `full`'s minus 1,000. The verifier reads
+`lambda_mode` from the checkpoint and defaults to `learned` for older ones.
+Tests: the five `test_fixed_lambda_*` / `test_unknown_lambda_mode_*` tests in
+`test_dpi.py`. The 2/6/10 run (Phase D1 in `ROADMAP.md`):
+
+```bash
+./submit.sh name='dpi fixed lambda r2 r6 r10 brain' model=dpi-fixed \
+    accelerations="2 6 10" center_fractions="0.16 0.0533 0.032" \
+    accel_max=10 lambda_mode=fixed lambda_spacing=linear
+```
+
 ## Local checks before submitting
 
 ```bash

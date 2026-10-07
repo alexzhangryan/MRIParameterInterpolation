@@ -79,17 +79,26 @@ else
   shopt -s nullglob
   TARBALLS=(*multicoil_*.tar.xz *multicoil_*.tar)
   shopt -u nullglob
-  if [ ${#TARBALLS[@]} -eq 0 ] && [ ! -d data/fastmri/multicoil_val ]; then
-    echo "[run_verify] ERROR: no *multicoil_*.tar(.xz) in cwd and no data/fastmri/multicoil_val" >&2
+  # Which split is scored: multicoil_val unless the staged tarball is a
+  # training batch (verify.sub split=train), which scores the training slices
+  # for the overfitting check (supervisor, 2026-10-05). Exactly one split per job.
+  SPLIT=multicoil_val
+  case " ${TARBALLS[*]-} " in *multicoil_train*) SPLIT=multicoil_train ;; esac
+  case " ${TARBALLS[*]-} " in *multicoil_train*multicoil_val*|*multicoil_val*multicoil_train*)
+    echo "[run_verify] ERROR: both a train and a val tarball staged; score one split per job" >&2; exit 3 ;;
+  esac
+  if [ ${#TARBALLS[@]} -eq 0 ] && [ ! -d "data/fastmri/$SPLIT" ]; then
+    echo "[run_verify] ERROR: no *multicoil_*.tar(.xz) in cwd and no data/fastmri/$SPLIT" >&2
     exit 3
   fi
+  echo "[run_verify] scoring split: $SPLIT"
   for t in "${TARBALLS[@]}"; do extract "$t"; done
   # AppleDouble sidecars (`._<name>.h5`) from a tarball made on macOS would
   # match the harness's *.h5 glob and fail in h5py. NYU's archives have none;
   # a laptop-made test archive might. Cheap to drop, so always do.
   find data -name '._*' -type f -delete 2>/dev/null || true
 
-  for split in multicoil_val; do
+  for split in "$SPLIT"; do
     if [ ! -d "data/fastmri/$split" ]; then
       found="$(find data -mindepth 1 -maxdepth 4 -type d -name "$split" -not -path "data/fastmri/*" | head -n1)"
       if [ -z "$found" ]; then
@@ -116,10 +125,10 @@ else
   shopt -u nullglob
   if [ ${#CKPTS[@]} -eq 0 ]; then
     echo "[run_verify] no *.pt / *.ckpt staged: will download the released checkpoint from dl.fbaipublicfiles.com"
-    TIER_ARGS=(--data_path data/fastmri/multicoil_val --state_dict knee_leaderboard_state_dict.pt --download_state_dict)
+    TIER_ARGS=(--data_path "data/fastmri/$SPLIT" --state_dict knee_leaderboard_state_dict.pt --download_state_dict)
   else
     echo "[run_verify] checkpoint: ${CKPTS[0]} ($(du -h "${CKPTS[0]}" | cut -f1))"
-    TIER_ARGS=(--data_path data/fastmri/multicoil_val --state_dict "${CKPTS[0]}")
+    TIER_ARGS=(--data_path "data/fastmri/$SPLIT" --state_dict "${CKPTS[0]}")
   fi
 fi
 

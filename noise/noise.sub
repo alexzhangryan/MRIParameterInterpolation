@@ -1,0 +1,73 @@
+# noise.sub: measure the measurement noise already in the fastMRI brain data,
+# one CPU job per split, on exactly the two batches every model trains and
+# validates on (brain_multicoil_{train,val}_batch_0). No GPU, no W&B.
+#
+#   cd noise && mkdir -p logs runs && condor_submit noise.sub      (or: make submit)
+#   condor_submit noise.sub volume_limit=3                          short test, 3 volumes per split
+#
+# Output comes back to runs/<split>/<Cluster>/: <split>_slices.csv (one row per
+# slice), <split>_volumes.csv (per-volume medians), <split>_summary.json.
+# Then, on the laptop or the access point:
+#   python measure_noise.py --summarize runs/*/*/
+#
+# Every knob is wrapped in `if ! defined` so a command-line name=value wins
+# (condor_submit parses those first; see ../verification/verify.sub).
+if ! defined staging
+  staging = /staging/groups/kamilov_group/Kamilov-SciAI-datasets/fastMRI_brain
+endif
+if ! defined dataset
+  dataset = brain
+endif
+# The verification image: has numpy, h5py and fastMRI at 91f2df4 (for the
+# exact mask functions training and scoring use). Nothing GPU-specific is used.
+if ! defined image
+  image = docker://genjigod/fastmri-verify:2026-09-18
+endif
+if ! defined volume_limit
+  volume_limit = 0
+endif
+if ! defined extra_args
+  extra_args =
+endif
+
+universe        = container
+container_image = $(image)
+executable      = run_noise.sh
+arguments       = $(split) --volume_limit $(volume_limit) $(extra_args)
+
+# One NYU batch per job, never read from /staging directly and never
+# extracted there (10,000-item cap). file:// because each is ~100 GB.
+transfer_input_files    = measure_noise.py, file://$(staging)/$(dataset)_multicoil_$(split)_batch_0.tar.xz
+should_transfer_files   = YES
+when_to_transfer_output = ON_EXIT_OR_EVICT
+transfer_output_files   = output
+transfer_output_remaps  = "output = runs/$(split)/$(Cluster)"
+
+requirements    = (Target.HasCHTCStaging == true)
+# xz -T0 uses every core it gets; 4 is plenty for a stream this size.
+# request_cpus / request_memory are seeded by condor_submit before this file
+# is read, so overrides go through cpus= / mem= (as in verify.sub).
+if ! defined cpus
+  cpus = 4
+endif
+if ! defined mem
+  mem = 16GB
+endif
+request_cpus    = $(cpus)
+request_memory  = $(mem)
+# The tarball (~100 GB) plus one spooled volume plus output. Streaming, not
+# extracting, is what keeps this far below verify.sub's 320 GB.
+if ! defined request_disk
+  request_disk = 140GB
+endif
+
+max_retries      = 5
+periodic_release = (HoldReasonCode == 13) && (NumSystemHolds < 5) && ((time() - EnteredCurrentStatus) > 300)
+
+log             = logs/noise_$(Cluster).log
+output          = logs/noise_$(split)_$(Cluster).out
+error           = logs/noise_$(split)_$(Cluster).err
+stream_output   = True
+stream_error    = True
+
+queue split in (train, val)

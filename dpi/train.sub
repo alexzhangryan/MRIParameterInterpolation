@@ -70,6 +70,16 @@ endif
 if ! defined lambda_length
   lambda_length = 1000
 endif
+# lambda_mode=fixed (2026-10-01 meeting): lambda is not learned; lambda(R) is
+# R's position between accel_min and accel_max. With lambda_spacing=linear,
+# accel_max=10 and rates 2 6 10 that is exactly 0, 0.5, 1. The defaults
+# (learned, log) are what every DPI run so far used.
+if ! defined lambda_mode
+  lambda_mode = learned
+endif
+if ! defined lambda_spacing
+  lambda_spacing = log
+endif
 # dpi_scope picks which learnable tensors get a second parameter set:
 #   full     every one of them, the paper's own choice (the default)
 #   shallow  the two shallowest U-Net levels, +3.2%
@@ -83,7 +93,7 @@ if ! defined dpi_scope
   dpi_scope = full
 endif
 if ! defined dpi_args
-  dpi_args = --dpi_scope $(dpi_scope) --accel_min $(accel_min) --accel_max $(accel_max) --lambda_lr $(lambda_lr) --lambda_length $(lambda_length)
+  dpi_args = --dpi_scope $(dpi_scope) --accel_min $(accel_min) --accel_max $(accel_max) --lambda_lr $(lambda_lr) --lambda_length $(lambda_length) --lambda_mode $(lambda_mode) --lambda_spacing $(lambda_spacing)
 endif
 # run_name is the W&B run ID (no spaces); wandb_name is the displayed name.
 # submit.sh sets both from name= or from the convention.

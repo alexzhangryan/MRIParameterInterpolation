@@ -50,6 +50,9 @@ from fastmri.data import transforms
 # ---------------------------------------------------------------------------
 # the interpolation function lambda(s)
 # ---------------------------------------------------------------------------
+LAMBDA_MODES = ("learned", "fixed")
+
+
 class LambdaTable(nn.Module):
     """lambda(R): a learnable, strictly monotone map from acceleration to [0, 1].
 
@@ -77,6 +80,7 @@ class LambdaTable(nn.Module):
         accel_max: float = 8.0,
         spacing: str = "log",
         learnable: bool = True,
+        mode: str = "learned",
     ):
         super().__init__()
         if length < 2:
@@ -85,10 +89,20 @@ class LambdaTable(nn.Module):
             raise ValueError("need 0 < accel_min < accel_max")
         if spacing not in ("log", "linear"):
             raise ValueError("spacing must be 'log' or 'linear'")
+        if mode not in LAMBDA_MODES:
+            raise ValueError(f"lambda mode must be one of {LAMBDA_MODES}, got {mode!r}")
         self.length = length
         self.accel_min = float(accel_min)
         self.accel_max = float(accel_max)
         self.spacing = spacing
+        # mode "fixed" (supervisor, 2026-10-01): lambda is not learned at all;
+        # lambda(R) is the position t of R between accel_min and accel_max
+        # (see position), e.g. linear spacing over 2..10 gives exactly 0, 0.5
+        # and 1 at R = 2, 6, 10. phi is then a buffer (as for scope "none"),
+        # kept only so the state dict still identifies a DPI checkpoint.
+        self.mode = mode
+        if mode == "fixed":
+            learnable = False
         # phi: the learnable vector of section 3.2; randn init as in the
         # reference code (NormalizedSoftmaxApprox), which makes softmax(phi)
         # nearly uniform and lambda nearly linear at the start.
@@ -115,8 +129,8 @@ class LambdaTable(nn.Module):
         # pin lambda(s_min) = 0 without an in-place write on a grad tensor
         return torch.cat([lam.new_zeros(1), lam[1:]])
 
-    def index(self, accel: torch.Tensor) -> torch.Tensor:
-        """Table index for each acceleration, clamped to the table range."""
+    def position(self, accel: torch.Tensor) -> torch.Tensor:
+        """t in [0, 1]: where each acceleration sits between accel_min and accel_max."""
         accel = accel.to(dtype=self.phi.dtype)
         if self.spacing == "log":
             t = torch.log2(accel / self.accel_min) / math.log2(
@@ -124,15 +138,21 @@ class LambdaTable(nn.Module):
             )
         else:
             t = (accel - self.accel_min) / (self.accel_max - self.accel_min)
-        t = t.clamp(0.0, 1.0)
-        return torch.round(t * (self.length - 1)).long()
+        return t.clamp(0.0, 1.0)
+
+    def index(self, accel: torch.Tensor) -> torch.Tensor:
+        """Table index for each acceleration, clamped to the table range."""
+        return torch.round(self.position(accel) * (self.length - 1)).long()
 
     def forward(self, accel: torch.Tensor) -> torch.Tensor:
         """lambda(R) for a 1-D tensor of accelerations, shape (B,).
 
-        Differentiable with respect to phi (an index into the table), not
-        with respect to R, which is data.
+        Learned: differentiable with respect to phi (an index into the
+        table), not with respect to R, which is data. Fixed: the position t
+        itself, exactly (no table rounding), with nothing to learn.
         """
+        if self.mode == "fixed":
+            return self.position(accel)
         return self.table()[self.index(accel)]
 
 
@@ -705,6 +725,7 @@ class DPIVarNet(nn.Module):
         accel_min: float = 2.0,
         accel_max: float = 8.0,
         lambda_spacing: str = "log",
+        lambda_mode: str = "learned",
     ):
         super().__init__()
         if dpi_scope not in DPI_SCOPES:
@@ -719,6 +740,7 @@ class DPIVarNet(nn.Module):
             accel_max=accel_max,
             spacing=lambda_spacing,
             learnable=scope_duplicates_anything(dpi_scope),
+            mode=lambda_mode,
         )
         self.sens_net = DPISensitivityModel(
             chans=sens_chans,

@@ -82,6 +82,7 @@ def build_dpi_model(args):
         accel_min=args.accel_min,
         accel_max=args.accel_max,
         lambda_spacing=args.lambda_spacing,
+        lambda_mode=args.lambda_mode,
         log_accelerations=tuple(args.accelerations),
     )
 

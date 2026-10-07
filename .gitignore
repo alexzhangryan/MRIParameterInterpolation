@@ -94,3 +94,6 @@ Thumbs.db
 verification/ckpttest/
 verification/.brainpack/
 verification/evicttest/
+
+# noise/ job-smoke sandbox (make job-smoke)
+noise/.smoke/

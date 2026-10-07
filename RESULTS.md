@@ -7,7 +7,198 @@ pulled from W&B, not from this checkout — the repo holds no run outputs.
 
 Reproduce with `verification/paired_from_wandb.py` (needs `WANDB_API_KEY` from
 the repo-root `.env`; no `wandb` package required — it uses the GraphQL API and
-numpy only).
+numpy only). On macOS with python.org Python, export
+`SSL_CERT_FILE=/etc/ssl/cert.pem` first, or the HTTPS call fails certificate
+verification.
+
+## Noise sweep and training-slice scores (2026-10-07)
+
+Supervisor asks C2 and C4 of 2026-10-05. W&B runs `verify-<tag>-brain-noise`
+and `verify-<tag>-brain-train`, with tag ∈ {model2 = blind, dpi = full, dpi-dc,
+dpi-io}. These ran from `~/eval_job` on CHTC (staged uncommitted harness, see
+`ROADMAP.md`). Every run passed its invariants. Level 0 reproduces the earlier
+val scores to ≤ 1.1e-6 SSIM; the residue is GPU-type float noise, since dc,
+scored on the same GPU type, matches exactly.
+
+**Added noise.** y = Ax + level·n in k-space, with n standard normal on each
+real and imaginary part and the data scaled to target max = 1. The inherent
+noise is ≈ 0.005 on this scale, so 0.005 roughly doubles the noise σ. Models
+were trained on the original data and tested on noisy data. Val PSNR (dB),
+460 volumes:
+
+| level | R2 zf / blind / full / dc / io | R4 zf / blind / full / dc / io | R6 zf / blind / full / dc / io | R8 zf / blind / full / dc / io |
+|---|---|---|---|---|
+| 0 | 35.5 / 44.0 / 44.3 / 44.1 / 44.2 | 29.5 / 40.4 / 40.4 / 40.4 / 40.4 | 27.0 / 38.2 / 38.1 / 38.2 / 38.1 | 25.9 / 36.6 / 36.5 / 36.6 / 36.6 |
+| 0.005 | 35.8 / 39.8 / 40.7 / 39.6 / 40.2 | 29.6 / 37.8 / 38.5 / 37.7 / 38.3 | 27.1 / 36.4 / 36.9 / 36.4 / 36.8 | 25.9 / 35.3 / 35.6 / 35.3 / 35.6 |
+| 0.01 | 34.1 / 33.1 / 34.6 / 32.9 / 34.1 | 29.7 / 32.2 / 33.9 / 32.2 / 33.5 | 27.2 / 31.5 / 33.3 / 31.8 / 32.9 | 26.1 / 31.1 / 32.7 / 31.3 / 32.3 |
+| 0.02 | 28.4 / 25.7 / 27.0 / 25.4 / 26.5 | 28.3 / 25.3 / 27.2 / 25.2 / 26.1 | 26.8 / 24.8 / 27.3 / 25.1 / 25.7 | 25.9 / 24.6 / 27.2 / 25.0 / 25.4 |
+| 0.05 | 18.8 / 16.6 / 17.1 / 16.0 / 16.7 | 21.7 / 16.9 / 17.9 / 16.1 / 15.4 | 22.7 / 16.5 / 18.5 / 16.2 / 14.8 | 23.1 / 16.2 / 18.8 / 16.3 / 14.6 |
+
+(SSIM shows the same pattern; full tables are in the W&B summaries,
+`R<N>_noise<level>/ssim_mean`.)
+
+- **Models trained on clean data break down under added noise.** Doubling
+  the noise (0.005) already costs 1.3-4.3 dB. At 0.02 every model is *below
+  zero-filled* at every rate. They reproduce or amplify the noise instead of
+  removing it, which is expected for a network that never saw this noise
+  level. Chicago's 0.05 is far outside what these models can handle. It is
+  the regime for the noise-trained runs (D2), not for these.
+- **DPI `full` degrades least**: +1.5 to +2.6 dB over blind at 0.01-0.02
+  across R4-R8. That is the first large difference between the models, but
+  it is robustness to a shift the models were never trained for, not the
+  conditioning working as designed, and the reason is untested. dc tracks
+  blind. io holds up at low noise and is worst at 0.05.
+- Odd but explained: zero-filled PSNR/SSIM *rises* slightly at 0.005. The
+  target has its own noise floor (~2.9% of max, measured above), so a noisier
+  zero-filled background sits closer to it. The metrics partly reward
+  reproducing the target's noise.
+- **Visual check** (blind, R4, FLAIR volume 6002471 slice 8; panels on CHTC
+  in `~/eval_job/verification/runs/brain/model2/12015606/images/`). Not copied
+  into the repo: they are images of DUA-covered data.
+  - In the noisy fully-sampled image, 0.005 is invisible, 0.01 slightly
+    grainy, 0.02 clearly grainy, and 0.05 obviously noisy with the anatomy
+    still readable. So 0.05 passes the "noticeably noisy" check.
+  - The reconstruction keeps the anatomy at 0.05, but **the background is
+    lifted to grey**, and the |error| map is brightest in the background, not
+    in the brain. Much of the PSNR collapse is the background noise floor (RSS
+    of noise is biased upward), not destroyed anatomy. Worth adding a
+    foreground-masked metric before drawing conclusions from the sweep.
+
+**Training slices (overfitting check).** The same models scored on train
+batch 0 (455 volumes) with the val masking scheme:
+
+| rate | train − val PSNR, blind / full / dc / io | train − val SSIM (all four) |
+|---|---|---|
+| R2 | +0.01 / +0.00 / +0.01 / +0.01 dB | −0.0011 |
+| R4 | +0.03 / +0.03 / +0.03 / +0.03 dB | −0.0015 to −0.0016 |
+| R6 | +0.14 / +0.13 / +0.15 / +0.15 dB | −0.0010 to −0.0012 |
+| R8 | +0.17 / +0.16 / +0.18 / +0.17 dB | −0.0006 to −0.0008 |
+| mixed | +0.03 / +0.03 / +0.03 / +0.03 dB | −0.0005 to −0.0006 |
+
+- **No overfitting, and no difference between methods.** The train−val gap
+  is ≤ 0.18 dB, and SSIM is actually *lower* on train (the train batch is
+  slightly harder). The gaps agree across methods to 0.02 dB.
+- So DPI `full`'s 34% lower *training loss* (W&B `train_loss`) does not
+  appear as better reconstruction of training slices. Whatever the logged
+  loss is picking up, it is not memorisation. Open: compare how
+  `train_loss` is logged for the two modules.
+
+**R8 specialist, paired per rate** (`verify-blind-r8-brain`): R8 SSIM
+0.93834 / PSNR 36.756 dB vs blind 0.937724 / 36.557 (+0.20 dB). Off its rate
+it collapses (R2 31.98 dB, below zero-filled 35.5). Its `fail` verdict is
+those expected off-rate invariants, not a bug.
+
+## Measurement noise already in the data (measured 2026-10-02)
+
+Nothing in our pipeline or in the E2E VarNet paper adds measurement noise
+(`ROADMAP.md`, 2026-10-01 item 2), so this is the noise every experiment so far
+has trained and tested with. `noise/measure_noise.py`, CHTC cluster 11927049,
+run from `~/noise_job` on ap2001. Coverage: train batch 0 = 455 volumes /
+7,216 slices, val batch 0 = 460 / 7,270, no errors. Method is in
+`noise/README.md`. Cells: median over volumes [5th, 95th percentile].
+
+| quantity | train | val |
+|---|---|---|
+| σ / target max (images normalised to max = 1) | 4.77e-3 [3.16e-3, 8.49e-3] | 4.89e-3 [3.21e-3, 8.46e-3] |
+| measurement SNR, full k-space | 13.5 dB [8.9, 18.2] | 13.7 dB [9.2, 17.9] |
+| measurement SNR, R2 / R4 / R6 / R8 / R10 mask | 16.4 / 19.2 / 20.8 / 21.9 / 22.7 dB | 16.5 / 19.3 / 20.8 / 21.9 / 22.7 dB |
+| noise RMS / k-space RMS (amplitude) | 0.203 | 0.200 |
+| mean abs. coil-to-coil noise correlation | 0.160 | 0.156 |
+| ground-truth background floor / target max | 2.89e-2 | 2.85e-2 |
+| σ per coil, image units (ortho ifft) | 3.97e-6 | 4.00e-6 |
+
+By field strength (val; train within 0.3 dB): 1.5 T (203 volumes) σ/max
+5.8e-3, SNR 14.1 dB; 3 T (257 volumes) σ/max 4.3e-3, SNR 13.4 dB. By
+contrast, FLAIR is the noisiest (σ/max ~6.3e-3, SNR ~10.6 dB) and T1POST the
+cleanest (~4.6e-3, ~15.4 dB).
+
+What this says:
+
+- **Train and val have the same noise level**, to within 2.5% in σ and
+  0.2 dB in SNR, overall, per contrast and per field strength.
+- **The noise per sample is the same at every rate.** The masked SNR rises
+  with R (16.5 → 22.7 dB) only because the masks keep the energetic k-space
+  centre and drop the noise-dominated periphery.
+- **The data is not prewhitened.** The coil noise correlation is 0.16, where
+  0 would mean prewhitened.
+- **The ground truth is noisy.** Its background sits at ~2.9% of the image
+  max. That is the RSS noise floor, which every model is trained to reproduce.
+- **There is no noise prescan.** The h5 files hold only `kspace`,
+  `reconstruction_rss` and `ismrmrd_header`. The only noise-related header
+  field is `relativeReceiverNoiseBandwidth`, a filter constant, not a
+  measurement.
+
+Validity checks:
+
+- RSS(ifft2c(k)) reproduces `reconstruction_rss` to 2.5e-8 relative error, so
+  the scale convention is exact.
+- The band is clean: plain std / robust σ = 1.03 (≤ 1.17 on any slice).
+- **Calibration caveat:** the target's background floor is 1.26x the floor
+  predicted from the band σ, on every volume (1.24-1.30). The receiver's
+  anti-aliasing filter attenuates noise toward the edge of the oversampled
+  FOV: the outermost rows read 0.55x the band. So the band probably reads
+  ~20% low compared with the image centre. **Quote σ as a range: σ/max ≈
+  0.5-0.6%, full-k-space SNR ≈ 11.7-13.7 dB**, with the band estimate as the
+  lower bound on σ.
+
+## Update 2026-10-01 (evening): `dc` scored per rate, and it wins at every rate
+
+`verify-dpi-dc-brain` (cluster 11926920, L40, 460 volumes / 7270 slices, all
+invariants PASS). `--dpi_scope dc` duplicates only the 12 data-consistency
+step sizes: **1,012 extra parameters**, against `full`'s 29.9M.
+
+**dc vs blind baseline** (`verify-model2-brain`), paired per volume:
+
+| rate | SSIM diff | PSNR diff | NMSE diff | dc wins (PSNR) | p |
+|---|---|---|---|---|---|
+| R2 | +0.000177 | +0.076 dB | −0.000028 | 413/460 | ~0 |
+| R4 | +0.000130 | +0.024 dB | −0.000027 | 310/460 | ~0 |
+| R6 | +0.000121 | +0.010 dB | −0.000022 | 262/460 | 2.0e-03 |
+| R8 | +0.000124 | +0.033 dB | −0.000061 | 311/460 | ~0 |
+| mixed | +0.000149 | +0.037 dB | −0.000042 | 333/460 | ~0 |
+
+dc absolute SSIM: 0.973707 / 0.957310 / 0.946795 / 0.937848 at R2/4/6/8
+(monotone). **Unlike `full`, dc does not lose at R6/R8.** Every cell in every
+metric favours dc and is significant at 0.01.
+
+**dc vs DPI `full`** (`verify-dpi-brain`):
+
+| rate | PSNR diff (dc − full) | dc wins | p |
+|---|---|---|---|
+| R2 | −0.177 dB | 6/460 | ~0 |
+| R4 | −0.015 dB | 181/460 | 2.7e-08 |
+| R6 | **+0.057 dB** | 326/460 | ~0 |
+| R8 | **+0.056 dB** | 300/460 | ~0 |
+| mixed | −0.013 dB | 209/460 | 0.066 (n.s.) |
+
+Reading:
+
+- `full` buys a large R2 gain with 29.9M extra parameters and pays for it at
+  R6/R8. dc gives a smaller, uniform gain at every rate for 1,012 parameters
+  and 1.25x the wall clock (hardware-confounded, see above) instead of 3.9x.
+- This matches the lambda-saturation prediction made before scoring: dc's
+  learned lambda is less compressed (R4 0.49, R6 0.78 vs `full`'s 0.66, 0.85),
+  and its R6/R8 loss disappeared.
+- Magnitudes are still tiny: +0.01 to +0.08 dB, against +8.5 to +11.1 dB from
+  zero-filled to baseline. **The same caveat applies as above: one seed per
+  model**, so block D's seed sigma could absorb effects this small.
+- The R8 specialist still leads at R8 (+0.22 dB, unpaired, Lightning
+  validation) by far more than dc's +0.033 dB. The specialist has not been
+  scored per rate yet (see below).
+
+**Input identity (2026-10-01 rule) checked on the per-volume CSVs on CHTC.**
+dc vs `full`: all four `zf_*` columns are byte-identical on all 460 volumes in
+all five passes. dc vs baseline: `zf_ssim` and `zf_mse` are byte-identical
+everywhere, so the inputs are the same. `zf_psnr` differs in the last float64
+bit (~2e-16 relative) on ~25 volumes, and `zf_nmse` by up to 2.8e-5 relative
+on every volume. Cause: the baseline was scored on an A100 node and dc on an
+L40 node, and `fastmri.evaluate.nmse` uses `np.linalg.norm`, whose BLAS
+reduction differs by CPU. Metric arithmetic, not inputs.
+
+**Not the R8 specialist:** cluster 11926921 (`verify-model1`, 4x only)
+scored the *released fastMRI knee checkpoint* on brain val, because no `ckpt=`
+was passed. It is not part of any comparison. `verify-blind-r8-brain` is
+still to be submitted, with `ckpt=` pointing at the R8 run's `last.ckpt`.
 
 ## Headline
 
@@ -246,9 +437,9 @@ From `verification/` on the access point (confirm checkpoint directories with
 `ls` first — the resumed R8 run may write under 11380824 or 11442792):
 
 ```
-make verify MODEL=model2 ARGS='ckpt=../dpi/runs/brain/dpi/11442791/checkpoints/last.ckpt run_name=verify-dpi-dc-brain'
+make verify MODEL=model2 ARGS='ckpt=../dpi/runs/brain/dpi-dc/11442791/checkpoints/last.ckpt run_name=verify-dpi-dc-brain'
 make verify MODEL=model2 ARGS='ckpt=../training/runs/brain/model1/<r8 cluster>/checkpoints/last.ckpt run_name=verify-blind-r8-brain'
-make verify MODEL=model2 ARGS='ckpt=../dpi/runs/brain/dpi/11442790/checkpoints/last.ckpt run_name=verify-dpi-io-brain'   # after io finishes
+make verify MODEL=model2 ARGS='ckpt=../dpi/runs/brain/dpi-io/11442790/checkpoints/last.ckpt run_name=verify-dpi-io-brain'   # after io finishes
 ```
 
 Then pair each against `verify-model2-brain` with `paired_from_wandb.py`. For
